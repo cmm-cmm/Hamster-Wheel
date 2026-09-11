@@ -1,0 +1,42 @@
+[package]
+name = "hamster-wheel"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP server with static files, routing, configuration, and a persistent PHP worker prototype"
+
+[features]
+profiling = []
+
+[dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+
+[[bench]]
+name = "static_pipeline"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "blocking_pool"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "windows_filesystem"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "routing"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "configuration"
+harness = false
+required-features = ["profiling"]

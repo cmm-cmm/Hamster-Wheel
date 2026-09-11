@@ -1,0 +1,10 @@
+[server]
+listen = "127.0.0.1:8080"
+
+[[hosts]]
+name = "localhost"
+aliases = ["127.0.0.1"]
+
+[[hosts.locations]]
+path = "/"
+handler = "not_found"

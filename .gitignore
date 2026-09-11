@@ -1,0 +1,8 @@
+/target/
+# Locally supplied PHP runtime; do not vendor binaries in Git.
+/php/
+.env
+.env.*
+!.env.example
+Thumbs.db
+Desktop.ini

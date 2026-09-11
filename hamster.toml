@@ -1,0 +1,23 @@
+[server]
+listen = "127.0.0.1:8080"
+
+[[hosts]]
+name = "localhost"
+aliases = ["127.0.0.1"]
+
+[[hosts.locations]]
+path = "/api"
+handler = "not_found"
+
+[[hosts.locations]]
+path = "/php"
+handler = "php_worker"
+
+[hosts.locations.php]
+executable = "php/8.5/php.exe"
+script = "fixtures/php-worker/worker.php"
+
+[[hosts.locations]]
+path = "/"
+handler = "static"
+root = "public"
