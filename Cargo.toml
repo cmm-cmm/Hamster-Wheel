@@ -40,3 +40,8 @@ required-features = ["profiling"]
 name = "configuration"
 harness = false
 required-features = ["profiling"]
+
+[[bench]]
+name = "php_ipc"
+harness = false
+required-features = ["profiling"]

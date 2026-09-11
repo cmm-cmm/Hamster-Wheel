@@ -616,3 +616,148 @@ between requests. No FastCGI, PHP-FPM, Laravel, shell command, automatic PATH
 lookup, static optimization, router replacement, or production pooling was
 introduced. A future milestone should first profile the Windows pipe round-trip
 and define state-reset semantics before choosing a worker-pool design.
+
+## 0.1.1 Windows PHP Worker IPC Investigation
+
+This additive investigation does not replace the immutable 0.1.0 baseline and
+does not modify production architecture or protocol. It used the same local PHP
+8.5.10 CLI NTS, an optimized MSVC profiling bench, concurrency one, and three
+runs per reported field. The direct child-process suites exclude HTTP, Hyper,
+router, application bootstrap, and the production worker mutex. Parent and
+child CPU values use separate `GetProcessTimes` snapshots over the same window.
+
+### End-to-End Timeline
+
+The default timeline uses a real production-format request/response. Rust and
+PHP clocks provide durations only within their own process; absolute timestamps
+are never subtracted across clock domains.
+
+| Stage | Default pipe P50 | Profiling `pipe.blocking` P50 |
+|---|---:|---:|
+| Rust request encode (T0-T1) | 2.5 us | 0.8 us |
+| Rust write + flush completion (T1-T2) | 57.0 us | 40.6 us |
+| Combined transfer/wakeup residual | 14,976.0 us | 16.6 us |
+| PHP decode (T3-T4) | 23.9 us | 5.4 us |
+| PHP fixture handler (T4-T5) | 1.3 us | 0.2 us |
+| PHP response encode (T5-T6) | 10.4 us | 2.1 us |
+| PHP write + flush (T6-T7) | 17.9 us | 1.7 us |
+| Rust decode + validation (T8-T9) | 2.8 us | 0.4 us |
+| Total transaction P50 | 15,136.8 us | 67.9 us |
+
+The residual is `Rust T2-T8 - PHP T3-T7`. It combines both transfer directions,
+pipe polling/wakeup, and task resumption; the protocol has no synchronized
+one-way marker with which to split Rust-to-PHP from PHP-to-Rust safely. PHP
+diagnostics travel on stderr after stdout completion and never enter protocol
+stdout.
+
+### Pipe Round-Trip Payload Matrix
+
+Minimal child loops read one length-prefixed frame and echo it without HTTP
+metadata or application logic. The table reports three-run medians using the
+current Rust split-prefix/payload write shape.
+
+| Payload | Rust child P50 | Rust RPS | PHP child P50 | PHP RPS |
+|---:|---:|---:|---:|---:|
+| 0 B | 39.4 us | 24,969 | 15,128.3 us | 69.6 |
+| 16 B | 58.8 us | 16,524 | 15,159.1 us | 66.1 |
+| 128 B | 72.6 us | 13,433 | 15,147.2 us | 67.3 |
+| 1 KiB | 49.2 us | 18,306 | 15,123.5 us | 65.7 |
+| 16 KiB | 71.2 us | 13,806 | 15,147.8 us | 65.9 |
+| 64 KiB | 113.7 us | 7,729 | 15,166.0 us | 65.5 |
+| 1 MiB | 1,160.3 us | 764 | 15,446.6 us | 64.0 |
+
+PHP latency is almost payload-independent through 64 KiB, then rises only
+about 0.3 ms at 1 MiB. That shape is a fixed wait, not serialization or memory
+bandwidth cost. PHP `fread` counters were two reads/request at 16-1,024 B,
+three at 16 KiB, nine at 64 KiB, and 129 at 1 MiB, consistent with an
+approximately 8 KiB read chunk after the four-byte prefix.
+
+### Rust-Rust, Synchronous, and Tokio Controls
+
+At 128 B, a completely synchronous parent using ordinary process pipe handles
+recorded Rust-child P50 18.9 us, P99 51.7 us, and 46,709 RPS. The same parent
+and framing recorded PHP-child P50 15,090.5 us, P99 16,029.8 us, and 75.3 RPS.
+Thus PHP retains the delay without Tokio, Hyper, or async scheduling.
+
+The Tokio parent/Rust child control recorded 72.6 us P50. Tokio child stdio is
+therefore a measurable tens-of-microseconds cost on this host, but it is more
+than two orders of magnitude below the PHP default and is not the primary
+bottleneck.
+
+### Frame, Flush, and Buffering Experiments
+
+All values below use a 128-byte PHP echo at concurrency one:
+
+| Experiment | P50 |
+|---|---:|
+| Current: Rust split, PHP contiguous + flush | 15,142.4 us |
+| Rust single contiguous request | 15,204.2 us |
+| Rust `BufWriter` around split request | 15,314.0 us |
+| PHP split response (two `fwrite`) | 15,198.9 us |
+| PHP read buffer set to zero | 15,175.3 us |
+| PHP response without `fflush` | 15,187.1 us |
+| PHP requested 8 KiB write buffer + one flush | 15,179.7 us |
+| `stream_set_blocking(stdin, true)` | 15,179.2 us |
+| `pipe.blocking` stream context (profiling only) | 68.7 us |
+
+For 920 small requests, the default PHP loop performed 1,841 `fread`, 920
+`fwrite`, and 920 `fflush` calls. Splitting the response doubled `fwrite` to
+1,840 without a meaningful latency change. `ob_get_level()` was zero;
+`stream_set_write_buffer` returned `-1` (unsupported), read-buffer zero returned
+`0`, and `stream_set_blocking` returned `false`. Omitting flush still delivered
+responses and did not remove the delay.
+
+### First, Warm, and Timer Distribution
+
+| Window | Default P50/P95/P99 | Default min/max | Near 15.625 ms quantum | Blocking P50/P95/P99 |
+|---|---:|---:|---:|---:|
+| First request | 14,240/14,240/14,240 us | 14,240/14,240 us | 0% | 86.5/86.5/86.5 us |
+| Requests 2-10 | 15,418/15,519/15,519 us | 14,755/15,539 us | 100% | 76.8/109.9/109.9 us |
+| Requests 100-999 | 15,112/15,715/16,076 us | 119.6/16,442 us | 94.8% | 67.7/95.2/133.6 us |
+| Requests 1000+ | 15,283/15,770/16,051 us | 156.3/16,119 us | 95.5% | 68.9/102.8/147.2 us |
+
+The first value is the median of three separately identified first requests.
+Default steady-state samples overwhelmingly cluster within 1 ms of a 15.625 ms
+multiple, with occasional sub-millisecond samples when PHP reaches its read at
+the favorable time. The blocking-context distribution has no quantum cluster.
+
+### CPU versus Wall Time
+
+For the production-format timeline, default median CPU/request was 234.375 us
+in Rust and 117.188 us in PHP (351.562 us combined) versus 15,136.8 us wall
+P50. The profiling blocking context used 91.146 us Rust and 26.042 us PHP
+(117.188 us combined) versus 67.9 us wall P50; CPU can exceed wall because the
+two processes execute on different cores and per-trial CPU accounting is
+coarsely quantized. The default wall/combined-CPU gap confirms waiting rather
+than CPU saturation.
+
+### Root Cause and Scope
+
+**Conclusion A: PHP buffering/Windows pipe polling is the primary cause.** PHP
+8.5's Windows stdio stream path treats `php://stdin` as a non-blocking anonymous
+pipe, polls availability with `PeekNamedPipe`, and calls `usleep(10)` when empty.
+On this host that wait aligns with the approximately 15.625 ms timer quantum.
+Opening the profiling stream with context option
+`['pipe' => ['blocking' => true]]` bypassed the poll and reduced the same
+production-format P50 by roughly 223x. A generic Windows pipe, protocol/frame
+handoff, and Tokio child stdio are secondary or rejected as main causes by the
+Rust and synchronous controls.
+
+No timer resolution API, production `pipe.blocking`, socket/named-pipe
+transport, worker pool, protocol change, state reset, respawn, FastCGI, or
+Laravel work was added. The production worker and all 0.1.0 security/validation
+semantics remain unchanged.
+
+### Measurement Limits and Recommendation
+
+Timeline stderr diagnostics add work after each response. Tiny-trial process
+CPU has 15.625 ms accounting granularity, and medians of independent fields do
+not necessarily add exactly. The PHP internal timer and Rust `Instant` are used
+only for within-process durations. `read_exact`/`write_all` are API-call counts,
+not guaranteed one-to-one kernel syscall counts.
+
+The next step should be a single-variable production candidate review of
+opening PHP stdin with the supported blocking-pipe stream context, including
+request timeout, Ctrl+C, malformed/truncated frame, dead-worker, and shutdown
+tests. Re-run both 0.1.0 HTTP and IPC baselines before accepting it. Do not add a
+pool to mask the default polling delay.

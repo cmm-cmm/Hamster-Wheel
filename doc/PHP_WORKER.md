@@ -123,3 +123,73 @@ frame, no streaming, no respawn, and no state reset. It is a protocol/lifecycle
 proof, not a throughput architecture or a claim against Node.js. Milestone 0.2.0
 may introduce a measured worker pool, queue policy, health and respawn behavior;
 FastCGI and Laravel integration remain separate later work.
+
+## 0.1.1 Windows IPC Investigation
+
+The investigation is isolated in `benches/php_ipc.rs` and the
+`ipc_echo.php`/`ipc_timeline.php` fixtures. It does not change the production
+worker, protocol, router, configuration, or timeout behavior. Run individual
+release suites with:
+
+```powershell
+cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- raw
+cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- variants
+cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- sync
+cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- timeline
+cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- timeline_blocking
+```
+
+### Current Handoff Shape
+
+For a small request, Rust's production `write_frame` makes two `write_all`
+calls (four-byte prefix and payload) and one `flush`. PHP normally completes
+two `fread` calls (prefix and payload), constructs one contiguous response
+frame, performs one `fwrite`, and calls `fflush` once. Rust consumes the
+response through two `read_exact` calls. PHP counters observed 1,841 `fread`
+calls for 920 128-byte requests: exactly two per request plus the final EOF
+probe. Larger payloads require more PHP reads (normally 8 KiB chunks).
+
+On Windows, Tokio 1.53.1 implements child stdio by wrapping ordinary blocking
+file handles in its blocking-I/O adapter. Each underlying read/write is handed
+to a blocking task; `ChildStdin`/`ChildStdout` are not native overlapped named
+pipes. The Rust-child control nevertheless completes in tens of microseconds,
+so this adapter is measurable but cannot explain the PHP-only 15 ms plateau.
+
+### PHP Windows Pipe Behavior
+
+PHP 8.5.10 opens `php://stdin` as a non-blocking Windows pipe by default. Its
+stdio stream implementation uses `PeekNamedPipe`; when no bytes are available,
+it calls `usleep(10)` and polls again. The observed sleep is quantized near the
+Windows 15.625 ms timer interval. This behavior is distinct from PHP output
+buffering: `ob_get_level()` was zero, omitting `fflush` did not help, and the
+write-buffer setting was unsupported.
+
+`stream_set_blocking($stdin, true)` returned `false` and did not change latency.
+A profiling-only open using a stream context with
+`['pipe' => ['blocking' => true]]` bypassed the polling path and reduced the
+production-format median from 15.137 ms to 67.9 us. This is causal experiment
+evidence, not an accepted production change.
+
+### Timing Semantics and Limits
+
+Rust records encode, write completion, complete response receipt, and response
+decode with one `Instant` domain. PHP reports only internal durations from
+`hrtime`: decode, fixture handler, response encode, and response write/flush.
+No absolute timestamp is subtracted across processes. The residual after
+subtracting PHP internal duration from Rust's external wait is the combined
+Rust-to-PHP and PHP-to-Rust transfer/wakeup time; the two directions cannot be
+safely separated with this protocol.
+
+The timeline fixture writes one diagnostic stderr line after each response.
+That adds profiling overhead before the next request and is excluded from
+production. Process CPU accounting is coarse on this Windows host, especially
+for short high-throughput trials. Full results and ranges are recorded in
+`Doc/BENCHMARKS.md`.
+
+### Decision
+
+Conclusion A applies: PHP's default Windows anonymous-pipe polling/buffering
+behavior is the primary cause. Before any production edit, separately review a
+minimal `pipe.blocking` fixture change for shutdown/timeout implications and
+rerun every 0.1.0 failure and HTTP integration test plus the same benchmark.
+Do not begin a worker pool to hide this latency.
