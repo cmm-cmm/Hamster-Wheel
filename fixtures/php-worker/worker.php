@@ -6,9 +6,9 @@ require __DIR__ . '/protocol.php';
 
 /** @var FixtureApplication $application */
 $application = require __DIR__ . '/bootstrap.php';
-$stdin = fopen('php://stdin', 'rb');
+$stdin = hamster_open_worker_stdin();
 $stdout = fopen('php://stdout', 'wb');
-if ($stdin === false || $stdout === false) {
+if ($stdout === false) {
     fwrite(STDERR, "cannot open standard streams\n");
     exit(2);
 }

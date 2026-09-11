@@ -768,6 +768,23 @@ mod tests {
         assert_eq!(worker.state().await, WorkerState::Unavailable);
         worker.shutdown().await.unwrap();
 
+        let worker = PhpWorker::with_timeouts(
+            fixture("exit_mid_request.php"),
+            WorkerTimeouts {
+                request: Duration::from_secs(1),
+                ..WorkerTimeouts::default()
+            },
+        );
+        worker.start().await.unwrap();
+        assert!(
+            worker
+                .execute(request("POST", "/large", "", vec![b'x'; MAX_REQUEST_BODY]))
+                .await
+                .is_err()
+        );
+        assert_eq!(worker.state().await, WorkerState::Unavailable);
+        worker.shutdown().await.unwrap();
+
         let worker = PhpWorker::new(fixture("worker.php"));
         worker.start().await.unwrap();
         let response = worker
@@ -812,5 +829,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         worker.shutdown().await.unwrap();
         assert_eq!(worker.state().await, WorkerState::Stopped);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires repository php/8.5/php.exe"]
+    async fn shutdown_waits_for_busy_request_then_stops_worker() {
+        let worker = Arc::new(PhpWorker::new(fixture("worker.php")));
+        worker.start().await.unwrap();
+
+        let request_worker = Arc::clone(&worker);
+        let request_task = tokio::spawn(async move {
+            request_worker
+                .execute(request("GET", "/delay", "ms=200", Vec::new()))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let shutdown_started = Instant::now();
+        worker.shutdown().await.unwrap();
+        let response = request_task.await.unwrap().unwrap();
+        assert_eq!(response.body, b"delayed");
+        assert!(shutdown_started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(worker.state().await, WorkerState::Stopped);
+        assert_eq!(worker.pid().await, None);
     }
 }

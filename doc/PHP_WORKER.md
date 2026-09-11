@@ -193,3 +193,39 @@ behavior is the primary cause. Before any production edit, separately review a
 minimal `pipe.blocking` fixture change for shutdown/timeout implications and
 rerun every 0.1.0 failure and HTTP integration test plus the same benchmark.
 Do not begin a worker pool to hide this latency.
+
+## 0.1.2 Production Blocking Pipe
+
+The canonical production fixture now opens `php://stdin` on Windows with the
+supported stream context `['pipe' => ['blocking' => true]]`. The context is
+created and the stream is opened before `READY`; context creation, open, or
+STDIO metadata failure throws and therefore fails Rust's startup handshake.
+There is deliberately no fallback to the default polling stream. Non-Windows
+workers retain the ordinary `php://stdin` open because the Windows pipe option
+does not apply there.
+
+PHP does not expose the internal Windows `pipe.blocking` flag through
+`stream_context_get_options`, and `stream_get_meta_data()['blocked']` is `true`
+for both the default and context paths. Startup can consequently verify a
+successfully opened blocking STDIO stream but cannot query the internal flag
+directly. The actual Windows behavior is guarded by the production HTTP
+latency test: the accepted run has no samples clustered around 15.625 ms and
+reduces P50 from about 15.2 ms to 0.13-0.14 ms. A return of that quantum is a
+release blocker, not a condition for silent degradation.
+
+The wire protocol remains version 1 and is byte-for-byte unchanged: one binary
+length-prefixed frame per message, repeated headers, binary bodies, `READY`,
+`SHUTDOWN`, and `SHUTDOWN_ACK`. The 8 MiB frame, 1 MiB request-body, and 128
+header limits are unchanged. No profiling fixture is called by production.
+
+Blocking read changes only how PHP waits while READY. Closing stdin, sending
+`SHUTDOWN`, or process termination still wakes the read. Programmatic shutdown
+waits for the transaction mutex, drains the current BUSY request, then performs
+the existing two-second graceful handshake/kill fallback. On Windows, console
+Ctrl+C may terminate the child while BUSY; Rust detects EOF, returns a
+controlled 502 for that request, and completes cleanup. READY and BUSY Ctrl+C
+checks left no orphan `php.exe`.
+
+The default polling loop, timer-resolution changes, busy waiting, named pipes,
+protocol redesign, respawn, and worker pooling were rejected for this
+milestone. The single async mutex and one-worker state model remain intact.

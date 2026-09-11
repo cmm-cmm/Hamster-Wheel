@@ -49,19 +49,7 @@ impl TestServer {
     }
 
     async fn request(&self, request: &[u8]) -> Vec<u8> {
-        let mut stream = TcpStream::connect(self.address)
-            .await
-            .expect("client should connect");
-        stream
-            .write_all(request)
-            .await
-            .expect("request should be written");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("response should be read");
-        response
+        request_at(self.address, request).await
     }
 
     async fn stop(mut self) {
@@ -79,6 +67,22 @@ impl TestServer {
             .await
             .expect("PHP worker should stop cleanly");
     }
+}
+
+async fn request_at(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("client should connect");
+    stream
+        .write_all(request)
+        .await
+        .expect("request should be written");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("response should be read");
+    response
 }
 
 fn php_runtime() -> config::RuntimeConfig {
@@ -210,5 +214,39 @@ async fn worker_protocol_failure_returns_controlled_bad_gateway() {
             .await;
         assert!(response.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
     }
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn concurrent_http_requests_are_serialized_without_protocol_corruption() {
+    let server = TestServer::start().await;
+    let mut tasks = Vec::new();
+    for value in 0_u8..16 {
+        let address = server.address;
+        tasks.push(tokio::spawn(async move {
+            let body = [value, 0, 255, value];
+            let mut request = format!(
+                "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            request.extend_from_slice(&body);
+            (body, request_at(address, &request).await)
+        }));
+    }
+
+    for task in tasks {
+        let (expected, response) = task.await.unwrap();
+        let (headers, body) = split_response(&response);
+        assert!(headers.starts_with(b"HTTP/1.1 201 Created\r\n"));
+        assert_eq!(body, expected);
+    }
+
+    let response = server
+        .request(b"GET /state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await;
+    let (_, body) = split_response(&response);
+    assert_eq!(json_number(body, "request"), 17);
     server.stop().await;
 }

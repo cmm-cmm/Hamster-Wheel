@@ -761,3 +761,119 @@ opening PHP stdin with the supported blocking-pipe stream context, including
 request timeout, Ctrl+C, malformed/truncated frame, dead-worker, and shutdown
 tests. Re-run both 0.1.0 HTTP and IPC baselines before accepting it. Do not add a
 pool to mask the default polling delay.
+
+## 0.1.2 Production Blocking Pipe
+
+This section is additive. It preserves the 0.1.0 approximately 66 RPS
+prototype baseline and every 0.1.1 investigation result above. The only
+production behavior change is opening Windows `php://stdin` with
+`['pipe' => ['blocking' => true]]` before the worker sends `READY`; the protocol,
+Rust child stdio, router, configuration, and single-worker mutex are unchanged.
+
+### Methodology
+
+- PHP 8.5.10 CLI NTS VS17 x64 and MSVC release server on the same Windows host
+- Loopback HTTP/1.1 keep-alive, concurrency one, 100 warm-up requests
+- 20,000 measured requests per run, three fresh processes, per-field medians
+- Process CPU deltas cover the measured requests only; memory is sampled after
+  each run
+- A latency sample is quantum-adjacent when it is within 1 ms of a positive
+  15.625 ms multiple
+
+Reproduce with:
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+./benchmarks/php_worker.ps1 -Runs 3 -Requests 20000 -WarmupRequests 100
+```
+
+### Production Before and After
+
+| Scenario | RPS before / after | P50 before / after | P95 before / after | P99 before / after |
+|---|---:|---:|---:|---:|
+| Simple control | 9,371 / 19,774 | 0.102 / 0.046 ms | 0.169 / 0.076 ms | 0.231 / 0.128 ms |
+| PHP Hello | 66 / 7,004 | 15.191 / 0.138 ms | 15.756 / 0.184 ms | 16.076 / 0.252 ms |
+| PHP JSON | 66 / 7,204 | 15.171 / 0.132 ms | 15.765 / 0.188 ms | 16.077 / 0.260 ms |
+
+Hello throughput improved about 106x and P50 fell about 110x; JSON improved
+about 109x and 115x respectively. The simple control varies strongly at this
+short sequential workload and is not a replacement for 0.0.1. The production
+HTTP medians are above the 0.1.1 direct-pipe 67.9 us because they include the
+client, TCP, Hyper, router, mutex, request mapping, and response construction.
+
+### Cold, Warm, Distribution, and Variance
+
+| Scenario | READY median | First request median | Min | P50 | P95 | P99 | Max | Quantum-adjacent |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PHP Hello | 27.811 ms | 1.167 ms | 0.095 ms | 0.138 ms | 0.184 ms | 0.252 ms | 2.323 ms | 0.0% |
+| PHP JSON | 26.312 ms | 5.637 ms | 0.085 ms | 0.132 ms | 0.188 ms | 0.260 ms | 2.658 ms | 0.0% |
+
+Hello RPS ranged 6,788-7,241, P50 0.134-0.140 ms, and P99
+0.243-0.270 ms. JSON RPS ranged 6,374-7,425, P50 0.129-0.144 ms, and P99
+0.258-0.308 ms. Reported max ranges were 0.782-2.566 ms and 1.425-4.260 ms.
+No measured request in any production run was quantum-adjacent, so the default
+15.625/31.25 ms modes have disappeared. First request includes client
+connection setup and is intentionally reported separately from READY and warm
+latency. READY remains near the 0.1.0 31-34 ms range rather than being folded
+into request throughput.
+
+### CPU and Memory
+
+| Scenario | Hamster CPU/request | PHP CPU/request | Combined | Hamster WS/peak | PHP WS/peak |
+|---|---:|---:|---:|---:|---:|
+| Simple | 25.781 us | 0 | 25.781 us | 6.5/6.5 MiB | n/a |
+| PHP Hello | 146.094 us | 26.562 us | 170.312 us | 7.0/7.0 MiB | 16.6/16.6 MiB |
+| PHP JSON | 144.531 us | 29.688 us | 178.125 us | 7.0/7.0 MiB | 16.6/16.6 MiB |
+
+Hello wall time averages about 143 us/request and JSON about 139 us/request.
+Combined process CPU can exceed wall because Rust and PHP may execute on
+different cores and Windows process accounting remains quantized. The result
+primarily proves removal of waiting latency; it is not presented as a CPU
+optimization. Memory stays near the 0.1.0 6.9 MiB Hamster and 16.6-16.7 MiB PHP
+measurements.
+
+### Soak and Concurrency Smoke
+
+The production soak command
+`./benchmarks/php_worker_soak.ps1 -Requests 100000` completed 100,000/100,000
+requests in 14.713 s (6,797 RPS). PID stayed constant, bootstrap remained one,
+and the request counter advanced exactly 1 to 100,000. Hamster working set was
+6.7 MiB before and 7.2 MiB after; PHP was 16.5 and 16.7 MiB. There was no
+timeout, crash, deadlock, or protocol corruption.
+
+The correctness-only concurrency smoke used 100 warm-up plus 2,000 measured
+Hello requests at each level against the same one-worker process:
+
+| HTTP concurrency | Successes | RPS | P50 | P95 | P99 | Max |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2,000 | 4,808 | 0.194 ms | 0.284 ms | 0.380 ms | 2.747 ms |
+| 2 | 2,000 | 9,241 | 0.203 ms | 0.300 ms | 0.393 ms | 2.847 ms |
+| 4 | 2,000 | 8,047 | 0.474 ms | 0.643 ms | 0.758 ms | 5.775 ms |
+| 8 | 2,000 | 8,233 | 0.955 ms | 1.209 ms | 1.332 ms | 1.839 ms |
+| 16 | 2,000 | 8,957 | 1.721 ms | 2.267 ms | 2.511 ms | 2.731 ms |
+
+All 10,000 measured requests succeeded; the same PID retained `bootstrap=1`
+and the final counter matched 10,502 including warm-up and state probes.
+Latency grows as requests queue before one serialized worker. These figures are
+not a scalability benchmark and do not hide the single-worker constraint.
+
+### Lifecycle, Correctness, and Decision
+
+Tests cover READY-blocked shutdown, shutdown after use, BUSY drain, request
+timeout, EOF, malformed and truncated response, child exit after reading only
+the request prefix, unavailable-state behavior, binary payloads, repeated
+headers, GET/POST/query, custom response status/headers, keep-alive, and
+concurrent HTTP connections. Manual Ctrl+C checks in READY and BUSY states
+left no orphan PHP process; the BUSY console case returned a controlled 502
+after PHP received the console interrupt.
+
+PHP cannot query the internal `pipe.blocking` option after `fopen`: context
+options are not reflected by `stream_context_get_options`, while generic stream
+metadata reports `blocked=true` for both paths. Production therefore fails
+before `READY` if context creation, stream open, or STDIO validation fails, and
+the zero-quantum production distribution supplies behavioral verification.
+There is no silent polling fallback.
+
+The measured bottleneck is fixed without a protocol or architecture redesign.
+The evidence supports proceeding to a separate 0.2.0 worker-pool design; this
+milestone does not implement it.
