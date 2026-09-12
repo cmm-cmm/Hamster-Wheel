@@ -16,7 +16,7 @@ Architecture and milestones live in `doc/HAMSTER_WHEEL_SERVER_PLAN.md`; `README.
 
 `docker compose run --rm dev ./scripts/check.sh` runs the same checks in a container that already has the toolchain and a PHP CLI, and `docker compose up server` runs the release image. See `doc/DEPLOYMENT.md`.
 
-The PHP worker integration tests need a PHP CLI. They use `HAMSTER_PHP`, then the repository's `php/8.5/php.exe`, then the first `php` on `PATH`, and report themselves skipped on stderr when none exists. Never let a skipped worker test pass for a verified one.
+The PHP worker targets PHP 8.5, non-thread-safe, 64-bit. Its tests use `HAMSTER_PHP`, then the repository's `php/8.5/php.exe`, then `php8.5` and `php` on `PATH`, and report themselves skipped on stderr when none exists. Never let a skipped worker test pass for a verified one. CI and both container stages assert the version, thread safety, and word size; the local scripts only warn, so keep that assertion in step when the targeted version changes (`scripts/_common.sh`, `scripts/check.ps1`, `.github/workflows/ci.yml`, `Dockerfile`, `.claude/hooks/session-start.sh`).
 
 Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and test conditions.
 

@@ -564,10 +564,12 @@ mod tests {
         if vendored.is_file() {
             return Some(vendored);
         }
+        // The targeted version first: a distribution's generic `php` is often
+        // an older branch than the one this project ships against.
         let names: &[&str] = if cfg!(windows) {
-            &["php.exe"]
+            &["php8.5.exe", "php.exe"]
         } else {
-            &["php"]
+            &["php8.5", "php"]
         };
         std::env::split_paths(&std::env::var_os("PATH")?).find_map(|directory| {
             names

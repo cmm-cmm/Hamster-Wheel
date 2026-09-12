@@ -6,6 +6,18 @@ request. A configuration error therefore fails the process at boot instead of
 degrading service later, which makes deployment a matter of shipping three
 things: the binary, the document root, and one TOML file.
 
+## PHP runtime
+
+The worker targets **PHP 8.5, non-thread-safe, 64-bit**. One PHP process serves
+a location's requests in a loop over a pipe, so the thread-safe build adds
+locking overhead for concurrency the design does not use. The container stages
+and CI assert the version, thread safety, and word size; the local scripts warn
+instead, so an older PHP still runs the server during development.
+
+Point `HAMSTER_PHP` at a specific binary to override discovery, which otherwise
+prefers `php/8.5/php.exe` in the repository (the Windows convention), then
+`php8.5`, then `php` on `PATH`.
+
 ## Deployment targets
 
 | Target | Artifact | Configuration | Suited to |
@@ -44,8 +56,9 @@ The image:
 
 - builds the release binary in a `rust:1-bookworm` stage that never reaches the
   runtime layer,
-- runs on `php:8.4-cli`, so the PHP worker has a real PHP CLI at
-  `/usr/local/bin/php`,
+- runs on `php:8.5-cli`, so the PHP worker has the targeted runtime at
+  `/usr/local/bin/php` — the official images are non-thread-safe 64-bit builds,
+  and the stage asserts exactly that before the image is assembled,
 - installs the server under `/srv/hamster` and runs as the unprivileged
   `hamster` user,
 - declares a `HEALTHCHECK` that requests `/` every 30 seconds.

@@ -12,7 +12,9 @@ cd "${root}"
 
 listen="${HAMSTER_LISTEN:-127.0.0.1:8080}"
 php="$(hamster_php "${root}")"
-if [ -z "${php}" ]; then
+if [ -n "${php}" ]; then
+    printf 'PHP: %s\n' "$(hamster_php_report "${php}")"
+else
     printf 'no PHP CLI found; starting without the /php location\n' >&2
 fi
 

@@ -5,20 +5,54 @@ repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
 }
 
+# The runtime this project targets. PHP 8.5, non-thread-safe, 64-bit: the
+# worker is one process per location, so the thread-safe build buys nothing and
+# costs throughput.
+HAMSTER_PHP_VERSION="8.5"
+
 # Prints an absolute path to a PHP CLI binary, or nothing when none is found.
 # Resolution order matches tests/php_worker.rs: HAMSTER_PHP, the vendored
-# Windows runtime, then PATH.
+# Windows runtime, then PATH, preferring the targeted version over a
+# distribution's generic `php`.
 hamster_php() {
-    local root="$1"
+    local root="$1" candidate
     if [ -n "${HAMSTER_PHP:-}" ] && [ -f "${HAMSTER_PHP}" ]; then
         printf '%s\n' "${HAMSTER_PHP}"
         return 0
     fi
-    if [ -f "${root}/php/8.5/php.exe" ]; then
-        printf '%s\n' "${root}/php/8.5/php.exe"
+    if [ -f "${root}/php/${HAMSTER_PHP_VERSION}/php.exe" ]; then
+        printf '%s\n' "${root}/php/${HAMSTER_PHP_VERSION}/php.exe"
         return 0
     fi
-    command -v php 2>/dev/null || true
+    for candidate in "php${HAMSTER_PHP_VERSION}" php; do
+        if command -v "${candidate}" > /dev/null 2>&1; then
+            command -v "${candidate}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Prints what the given PHP CLI actually is, and warns when it is not the
+# targeted runtime. Never fails: an older PHP still runs the worker, it just
+# is not what this project ships against.
+hamster_php_report() {
+    local php="$1" description
+    description="$("${php}" -r 'printf("PHP %s %s %d-bit", PHP_VERSION, PHP_ZTS ? "ZTS" : "NTS", PHP_INT_SIZE * 8);' 2>/dev/null)" \
+        || description="unknown build"
+    printf '%s (%s)\n' "${description}" "${php}"
+    if ! hamster_php_is_supported "${php}"; then
+        printf 'warning: this project targets PHP %s NTS 64-bit; found %s\n' \
+            "${HAMSTER_PHP_VERSION}" "${description}" >&2
+    fi
+}
+
+# Succeeds only for a PHP at or above the targeted version, non-thread-safe,
+# on a 64-bit build. CI asserts this; local scripts only warn.
+hamster_php_is_supported() {
+    HAMSTER_PHP_VERSION="${HAMSTER_PHP_VERSION}" "$1" -r \
+        'exit((version_compare(PHP_VERSION, getenv("HAMSTER_PHP_VERSION"), ">=") && !PHP_ZTS && PHP_INT_SIZE === 8) ? 0 : 1);' \
+        2>/dev/null
 }
 
 # Writes a development configuration to stdout. The PHP location is emitted

@@ -19,6 +19,7 @@ path = "/php"
 handler = "php_worker"
 
 [hosts.locations.php]
+# The php:8.5-cli base image; non-thread-safe and 64-bit, asserted at build time.
 executable = "/usr/local/bin/php"
 script = "/srv/hamster/fixtures/php-worker/worker.php"
 

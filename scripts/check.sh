@@ -9,7 +9,7 @@ cd "${root}"
 php="$(hamster_php "${root}")"
 if [ -n "${php}" ]; then
     export HAMSTER_PHP="${php}"
-    printf 'PHP worker tests will run against %s\n' "${php}"
+    printf 'PHP worker tests will run against %s\n' "$(hamster_php_report "${php}")"
 else
     printf 'no PHP CLI found; PHP worker tests will report themselves skipped\n' >&2
 fi

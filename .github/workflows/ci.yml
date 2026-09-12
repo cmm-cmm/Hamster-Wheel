@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "dev"]
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +12,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # The PHP worker targets this runtime everywhere: CI, containers, and the
+  # runtime Windows developers vendor under php/8.5/.
+  HAMSTER_PHP_VERSION: "8.5"
 
 jobs:
   check:
@@ -33,13 +36,17 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Ensure a PHP CLI is available
+      - name: Install PHP ${{ env.HAMSTER_PHP_VERSION }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.HAMSTER_PHP_VERSION }}
+
+      # A silently older or thread-safe PHP would still pass the test suite
+      # while testing a runtime the project does not ship against.
+      - name: Verify PHP is ${{ env.HAMSTER_PHP_VERSION }} NTS 64-bit
         run: |
-          if ! command -v php > /dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends --yes php-cli
-          fi
-          php --version
+          php -r 'printf("PHP %s %s %d-bit\n", PHP_VERSION, PHP_ZTS ? "ZTS" : "NTS", PHP_INT_SIZE * 8);'
+          php -r 'exit((version_compare(PHP_VERSION, getenv("HAMSTER_PHP_VERSION"), ">=") && !PHP_ZTS && PHP_INT_SIZE === 8) ? 0 : 1);'
 
       - name: Format, lint, test
         run: ./scripts/check.sh
@@ -63,8 +70,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # The PHP worker tests report themselves skipped when no PHP CLI exists;
-      # the runner image ships one, so they exercise the worker here too.
+      # Windows is the project's primary platform, so the worker tests must run
+      # against the same non-thread-safe 64-bit build developers vendor locally.
+      # setup-php installs the non-thread-safe x64 build on Windows by default;
+      # the verification step below is what actually enforces it.
+      - name: Install PHP ${{ env.HAMSTER_PHP_VERSION }} (NTS, x64)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.HAMSTER_PHP_VERSION }}
+
+      - name: Verify PHP is ${{ env.HAMSTER_PHP_VERSION }} NTS 64-bit
+        run: |
+          php -r 'printf("PHP %s %s %d-bit\n", PHP_VERSION, PHP_ZTS ? "ZTS" : "NTS", PHP_INT_SIZE * 8);'
+          php -r 'exit((version_compare(PHP_VERSION, getenv("HAMSTER_PHP_VERSION"), ">=") && !PHP_ZTS && PHP_INT_SIZE === 8) ? 0 : 1);'
+
       - name: Build and test
         run: |
           cargo build --all-targets
@@ -76,6 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Each stage asserts PHP 8.5 NTS 64-bit, so a wrong base image fails here.
       - name: Build image
         run: docker build --tag hamster-wheel:ci .
 
@@ -84,6 +104,7 @@ jobs:
           docker run --detach --name hamster-ci --publish 8080:8080 hamster-wheel:ci
           HAMSTER_SMOKE_PHP=yes timeout 120 ./scripts/smoke.sh http://127.0.0.1:8080 \
             || { docker logs hamster-ci; exit 1; }
+          docker exec hamster-ci php -r 'printf("container PHP %s %s %d-bit\n", PHP_VERSION, PHP_ZTS ? "ZTS" : "NTS", PHP_INT_SIZE * 8);'
 
       - name: Stop container
         if: always()

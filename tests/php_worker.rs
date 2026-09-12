@@ -105,10 +105,12 @@ fn locate_php() -> Option<PathBuf> {
 }
 
 fn php_on_path() -> Option<PathBuf> {
+    // The targeted version first: a distribution's generic `php` is often an
+    // older branch than the one this project ships against.
     let names: &[&str] = if cfg!(windows) {
-        &["php.exe"]
+        &["php8.5.exe", "php.exe"]
     } else {
-        &["php"]
+        &["php8.5", "php"]
     };
     env::split_paths(&env::var_os("PATH")?).find_map(|directory| {
         names
