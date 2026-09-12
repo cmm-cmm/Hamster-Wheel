@@ -1,0 +1,36 @@
+services:
+  # Production-shaped image: release binary, PHP CLI, non-root user.
+  server:
+    build:
+      context: .
+      target: runtime
+    image: hamster-wheel:local
+    ports:
+      - "${HAMSTER_HOST_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # Development toolchain. Sources are bind-mounted, build artifacts and the
+  # registry live in named volumes so rebuilds stay warm between runs.
+  #   docker compose run --rm dev cargo test
+  #   docker compose run --rm dev ./scripts/check.sh
+  #   docker compose run --rm --service-ports dev ./scripts/dev.sh
+  dev:
+    build:
+      context: .
+      target: dev
+    image: hamster-wheel-dev:local
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    ports:
+      - "${HAMSTER_DEV_PORT:-8081}:8080"
+    environment:
+      HAMSTER_LISTEN: "0.0.0.0:8080"
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  cargo-target:

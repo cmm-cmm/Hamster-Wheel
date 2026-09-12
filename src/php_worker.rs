@@ -552,12 +552,45 @@ mod tests {
 
     use super::*;
 
-    fn fixture(script: &str) -> PhpWorkerConfig {
-        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
-        assert!(
-            executable.is_file(),
-            "PHP-dependent test requires repository php/8.5/php.exe"
+    /// Locates a PHP CLI binary: the `HAMSTER_PHP` override, the vendored
+    /// Windows development runtime, then the first `php` on `PATH`. Mirrors the
+    /// resolution used by `tests/php_worker.rs` and `scripts/`.
+    fn locate_php() -> Option<PathBuf> {
+        if let Some(value) = std::env::var_os("HAMSTER_PHP") {
+            let candidate = PathBuf::from(value);
+            return candidate.is_file().then_some(candidate);
+        }
+        let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+        if vendored.is_file() {
+            return Some(vendored);
+        }
+        let names: &[&str] = if cfg!(windows) {
+            &["php.exe"]
+        } else {
+            &["php"]
+        };
+        std::env::split_paths(&std::env::var_os("PATH")?).find_map(|directory| {
+            names
+                .iter()
+                .map(|name| directory.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+    }
+
+    /// Reports a skipped test on stderr so a missing PHP runtime never looks
+    /// like a pass.
+    fn php_available(test: &str) -> bool {
+        if locate_php().is_some() {
+            return true;
+        }
+        eprintln!(
+            "skipping {test}: no PHP CLI found; set HAMSTER_PHP, install php, or vendor php/8.5/php.exe"
         );
+        false
+    }
+
+    fn fixture(script: &str) -> PhpWorkerConfig {
+        let executable = locate_php().expect("PHP-dependent test requires a PHP CLI");
         PhpWorkerConfig {
             executable,
             script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -611,8 +644,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires repository php/8.5/php.exe"]
     async fn persistent_worker_preserves_request_data_and_binary_payloads() {
+        if !php_available("persistent_worker_preserves_request_data_and_binary_payloads") {
+            return;
+        }
         let worker = PhpWorker::new(fixture("worker.php"));
         let started = worker.start().await.unwrap();
         assert_eq!(worker.pid().await, Some(started.pid));
@@ -671,8 +706,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires repository php/8.5/php.exe"]
     async fn concurrent_transactions_are_serialized_without_protocol_corruption() {
+        if !php_available("concurrent_transactions_are_serialized_without_protocol_corruption") {
+            return;
+        }
         let worker = Arc::new(PhpWorker::new(fixture("worker.php")));
         worker.start().await.unwrap();
         let mut tasks = Vec::new();
@@ -701,8 +738,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires repository php/8.5/php.exe"]
     async fn startup_failures_are_detected_before_ready() {
+        if !php_available("startup_failures_are_detected_before_ready") {
+            return;
+        }
         for script in ["exit_before_ready.php", "malformed_ready.php"] {
             let worker = PhpWorker::with_timeouts(
                 fixture(script),
@@ -731,8 +770,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires repository php/8.5/php.exe"]
     async fn malformed_truncated_timeout_and_exit_fail_closed() {
+        if !php_available("malformed_truncated_timeout_and_exit_fail_closed") {
+            return;
+        }
         for path in ["/malformed", "/truncated"] {
             let worker = PhpWorker::new(fixture("worker.php"));
             worker.start().await.unwrap();
@@ -787,8 +828,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires repository php/8.5/php.exe"]
     async fn shutdown_cleans_up_ready_and_used_workers() {
+        if !php_available("shutdown_cleans_up_ready_and_used_workers") {
+            return;
+        }
         for send_request in [false, true] {
             let worker = PhpWorker::new(fixture("worker.php"));
             worker.start().await.unwrap();

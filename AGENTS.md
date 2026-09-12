@@ -2,17 +2,21 @@
 
 ## Project Structure & Module Organization
 
-This repository is in the planning phase. Architecture and milestones live in `Doc/HAMSTER_WHEEL_SERVER_PLAN.md`. The planned Phase 0 layout is one Rust package with `Cargo.toml` and `src/{main,server,config}.rs`. Keep it small until a subsystem has a concrete reason to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`). Put integration tests in `tests/`, unit tests beside their modules, and benchmarks in `benches/`.
+Architecture and milestones live in `doc/HAMSTER_WHEEL_SERVER_PLAN.md`; `README.md` covers the day-to-day workflow. The repository is one Rust package: `src/` holds the server, router, configuration, static files, and PHP worker; `tests/` holds integration tests; unit tests sit beside their modules; `benches/` holds benchmarks. Supporting directories are `fixtures/` (PHP worker fixtures), `public/` (default document root), `deploy/` (configuration shipped with the container image), and `scripts/` (development entry points). Keep the single package until a subsystem has a concrete reason to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`).
 
 ## Build, Test, and Development Commands
 
-There is no Cargo project yet, so these commands become applicable after Phase 0 is scaffolded:
+`./scripts/check.sh` (PowerShell: `./scripts/check.ps1`) runs format, lint, and test in one pass, which is exactly what CI enforces. `./scripts/dev.sh` starts the server against a generated development configuration, and `./scripts/smoke.sh` verifies that a release build serves traffic. The individual commands:
 
 - `cargo run` starts the development server (the baseline target is `127.0.0.1:8080`).
 - `cargo build --release` creates the only build suitable for performance comparisons.
 - `cargo test` runs unit and integration tests.
 - `cargo fmt --all -- --check` verifies standard Rust formatting.
 - `cargo clippy --all-targets --all-features -- -D warnings` rejects lint warnings.
+
+`docker compose run --rm dev ./scripts/check.sh` runs the same checks in a container that already has the toolchain and a PHP CLI, and `docker compose up server` runs the release image. See `doc/DEPLOYMENT.md`.
+
+The PHP worker integration tests need a PHP CLI. They use `HAMSTER_PHP`, then the repository's `php/8.5/php.exe`, then the first `php` on `PATH`, and report themselves skipped on stderr when none exists. Never let a skipped worker test pass for a verified one.
 
 Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and test conditions.
 
@@ -26,7 +30,7 @@ Use Rust's built-in test harness unless another framework is formally adopted. N
 
 ## Commit & Pull Request Guidelines
 
-No Git history is present, so no existing commit convention can be inferred. Use short, imperative subjects, optionally scoped, such as `http: reject invalid host headers`. Keep commits focused. Pull requests should explain the problem and approach, list verification commands, link relevant issues or ADRs, and include benchmark evidence for hot-path changes. Add screenshots only for manager/UI changes, and call out platform-specific behavior on Windows or Linux.
+Use short, imperative subjects, optionally scoped, such as `http: reject invalid host headers`. Keep commits focused. Pull requests should explain the problem and approach, list verification commands, link relevant issues or ADRs, and include benchmark evidence for hot-path changes. Add screenshots only for manager/UI changes, and call out platform-specific behavior on Windows or Linux.
 
 ## Security & Configuration
 

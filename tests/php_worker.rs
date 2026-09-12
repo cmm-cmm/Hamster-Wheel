@@ -1,4 +1,5 @@
 use std::{
+    env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,8 +21,8 @@ struct TestServer {
 }
 
 impl TestServer {
-    async fn start() -> Self {
-        let runtime = Arc::new(php_runtime());
+    async fn start(executable: &Path) -> Self {
+        let runtime = Arc::new(php_runtime(executable));
         runtime
             .start_workers()
             .await
@@ -81,16 +82,50 @@ impl TestServer {
     }
 }
 
-fn php_runtime() -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
-    assert!(
-        executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+/// Locates a PHP CLI binary for the integration tests.
+///
+/// Resolution order keeps every supported environment working without editing
+/// the tests: an explicit `HAMSTER_PHP` override, the Windows development
+/// runtime vendored under `php/`, then the first `php` on `PATH` (Linux,
+/// macOS, and the container images built from `Dockerfile`).
+fn locate_php() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("HAMSTER_PHP") {
+        let candidate = PathBuf::from(value);
+        return candidate.is_file().then_some(candidate);
+    }
+    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    if vendored.is_file() {
+        return Some(vendored);
+    }
+    php_on_path()
+}
+
+fn php_on_path() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["php.exe"]
+    } else {
+        &["php"]
+    };
+    env::split_paths(&env::var_os("PATH")?).find_map(|directory| {
+        names
+            .iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// Reports a skipped test so a missing PHP runtime never looks like a pass.
+fn skipped(test: &str) {
+    eprintln!(
+        "skipping {test}: no PHP CLI found; set HAMSTER_PHP, install php, or vendor php/8.5/php.exe"
     );
+}
+
+fn php_runtime(executable: &Path) -> config::RuntimeConfig {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\n",
-        toml_literal(&executable),
+        toml_literal(executable),
         toml_literal(&script)
     );
     config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
@@ -122,9 +157,11 @@ fn json_number(body: &[u8], field: &str) -> u64 {
 }
 
 #[tokio::test]
-#[ignore = "requires repository php/8.5/php.exe"]
 async fn one_php_process_bootstraps_once_across_one_hundred_http_requests() {
-    let server = TestServer::start().await;
+    let Some(php) = locate_php() else {
+        return skipped("one_php_process_bootstraps_once_across_one_hundred_http_requests");
+    };
+    let server = TestServer::start(&php).await;
     let mut pid = None;
     for expected_request in 1..=100 {
         let response = server
@@ -145,9 +182,11 @@ async fn one_php_process_bootstraps_once_across_one_hundred_http_requests() {
 }
 
 #[tokio::test]
-#[ignore = "requires repository php/8.5/php.exe"]
 async fn http_mapping_preserves_query_headers_body_and_custom_response() {
-    let server = TestServer::start().await;
+    let Some(php) = locate_php() else {
+        return skipped("http_mapping_preserves_query_headers_body_and_custom_response");
+    };
+    let server = TestServer::start(&php).await;
     let inspect = server
         .request(
             b"POST /inspect?name=hamster HTTP/1.1\r\nHost: localhost\r\nX-Repeat: one\r\nX-Repeat: two\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
@@ -182,9 +221,11 @@ async fn http_mapping_preserves_query_headers_body_and_custom_response() {
 }
 
 #[tokio::test]
-#[ignore = "requires repository php/8.5/php.exe"]
 async fn php_handler_preserves_keep_alive() {
-    let server = TestServer::start().await;
+    let Some(php) = locate_php() else {
+        return skipped("php_handler_preserves_keep_alive");
+    };
+    let server = TestServer::start(&php).await;
     let response = server
         .request(
             b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\nGET /json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -198,9 +239,11 @@ async fn php_handler_preserves_keep_alive() {
 }
 
 #[tokio::test]
-#[ignore = "requires repository php/8.5/php.exe"]
 async fn worker_protocol_failure_returns_controlled_bad_gateway() {
-    let server = TestServer::start().await;
+    let Some(php) = locate_php() else {
+        return skipped("worker_protocol_failure_returns_controlled_bad_gateway");
+    };
+    let server = TestServer::start(&php).await;
     for path in ["/malformed", "/hello"] {
         let response = server
             .request(

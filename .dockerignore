@@ -1,0 +1,15 @@
+.git
+.github
+target
+php
+doc
+icon
+benchmarks
+*.md
+.env
+.env.*
+!.env.example
+.claude
+scripts
+docker-compose.yml
+Dockerfile
