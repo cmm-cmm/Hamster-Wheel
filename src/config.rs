@@ -16,7 +16,7 @@ use crate::router::{
     valid_hostname,
 };
 
-pub const SERVER_NAME: &str = "HamsterWheel/0.1.0";
+pub const SERVER_NAME: &str = "HamsterWheel/0.1.2";
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_DOCUMENT_ROOT: &str = "public";

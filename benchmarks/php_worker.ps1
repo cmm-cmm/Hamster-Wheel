@@ -1,7 +1,9 @@
 param(
     [int]$Runs = 3,
     [int]$Requests = 20000,
-    [int]$WarmupRequests = 1000
+    [int]$WarmupRequests = 1000,
+    [ValidateSet('all', 'simple', 'php_hello', 'php_json')]
+    [string]$ScenarioFilter = 'all'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,6 +94,17 @@ function Get-Median($Values) {
     return $sorted[[Math]::Floor($sorted.Count / 2)]
 }
 
+function Get-QuantumPercent([double[]]$Values) {
+    $near = 0
+    foreach ($value in $Values) {
+        $multiple = [Math]::Round($value / 15.625)
+        if ($multiple -ge 1 -and [Math]::Abs($value - ($multiple * 15.625)) -le 1.0) {
+            $near++
+        }
+    }
+    return 100.0 * $near / $Values.Length
+}
+
 function Find-PhpChild([int]$ParentId) {
     $processInfo = Get-CimInstance Win32_Process -Filter "ParentProcessId = $ParentId AND Name = 'php.exe'" |
         Select-Object -First 1
@@ -113,6 +126,9 @@ $scenarios = @(
     [PSCustomObject]@{ Name = 'php_hello'; Config = '.\benchmarks\php_worker.toml'; Path = '/hello'; Status = [Net.HttpStatusCode]::OK; Php = $true },
     [PSCustomObject]@{ Name = 'php_json'; Config = '.\benchmarks\php_worker.toml'; Path = '/json'; Status = [Net.HttpStatusCode]::OK; Php = $true }
 )
+if ($ScenarioFilter -ne 'all') {
+    $scenarios = @($scenarios | Where-Object Name -eq $ScenarioFilter)
+}
 
 foreach ($scenario in $scenarios) {
     $results = @()
@@ -179,9 +195,12 @@ foreach ($scenario in $scenarios) {
                 FirstMs = $firstMs
                 WallSeconds = $result.Seconds
                 Rps = $Requests / $result.Seconds
+                MinMs = $result.Milliseconds[0]
                 P50Ms = Get-Percentile $result.Milliseconds 0.50
                 P95Ms = Get-Percentile $result.Milliseconds 0.95
                 P99Ms = Get-Percentile $result.Milliseconds 0.99
+                MaxMs = $result.Milliseconds[$result.Milliseconds.Length - 1]
+                QuantumPct = Get-QuantumPercent $result.Milliseconds
                 ServerCpuUs = $serverCpu * 1000000 / $Requests
                 PhpCpuUs = $phpCpu * 1000000 / $Requests
                 CombinedCpuUs = ($serverCpu + $phpCpu) * 1000000 / $Requests
@@ -191,10 +210,11 @@ foreach ($scenario in $scenarios) {
                 PhpPeakMiB = if ($null -eq $phpProcess) { 0.0 } else { $phpProcess.PeakWorkingSet64 / 1MB }
             }
             $results += $measurement
-            Write-Output ("PHP_BENCH scenario={0} run={1} listener_ms={2:F3} bootstrap_ms={3:F3} first_ms={4:F3} wall_s={5:F3} rps={6:F0} p50_ms={7:F3} p95_ms={8:F3} p99_ms={9:F3} server_cpu_us={10:F3} php_cpu_us={11:F3} combined_cpu_us={12:F3} server_ws_mib={13:F1} server_peak_mib={14:F1} php_ws_mib={15:F1} php_peak_mib={16:F1}" -f
+            Write-Output ("PHP_BENCH scenario={0} run={1} listener_ms={2:F3} bootstrap_ms={3:F3} first_ms={4:F3} wall_s={5:F3} rps={6:F0} min_ms={7:F3} p50_ms={8:F3} p95_ms={9:F3} p99_ms={10:F3} max_ms={11:F3} quantum_pct={12:F1} server_cpu_us={13:F3} php_cpu_us={14:F3} combined_cpu_us={15:F3} server_ws_mib={16:F1} server_peak_mib={17:F1} php_ws_mib={18:F1} php_peak_mib={19:F1}" -f
                 $scenario.Name, $run, $measurement.StartupMs, $measurement.WorkerBootstrapMs,
                 $measurement.FirstMs, $measurement.WallSeconds, $measurement.Rps,
-                $measurement.P50Ms, $measurement.P95Ms, $measurement.P99Ms,
+                $measurement.MinMs, $measurement.P50Ms, $measurement.P95Ms,
+                $measurement.P99Ms, $measurement.MaxMs, $measurement.QuantumPct,
                 $measurement.ServerCpuUs, $measurement.PhpCpuUs, $measurement.CombinedCpuUs,
                 $measurement.ServerWorkingMiB, $measurement.ServerPeakMiB,
                 $measurement.PhpWorkingMiB, $measurement.PhpPeakMiB)
@@ -220,12 +240,14 @@ foreach ($scenario in $scenarios) {
         }
     }
 
-    Write-Output ("PHP_MEDIAN scenario={0} requests={1} concurrency=1 listener_ms={2:F3} bootstrap_ms={3:F3} first_ms={4:F3} wall_s={5:F3} rps={6:F0} p50_ms={7:F3} p95_ms={8:F3} p99_ms={9:F3} server_cpu_us={10:F3} php_cpu_us={11:F3} combined_cpu_us={12:F3} server_ws_mib={13:F1} server_peak_mib={14:F1} php_ws_mib={15:F1} php_peak_mib={16:F1}" -f
+    Write-Output ("PHP_MEDIAN scenario={0} requests={1} concurrency=1 listener_ms={2:F3} bootstrap_ms={3:F3} first_ms={4:F3} wall_s={5:F3} rps={6:F0} min_ms={7:F3} p50_ms={8:F3} p95_ms={9:F3} p99_ms={10:F3} max_ms={11:F3} quantum_pct={12:F1} server_cpu_us={13:F3} php_cpu_us={14:F3} combined_cpu_us={15:F3} server_ws_mib={16:F1} server_peak_mib={17:F1} php_ws_mib={18:F1} php_peak_mib={19:F1}" -f
         $scenario.Name, $Requests, (Get-Median $results.StartupMs),
         (Get-Median $results.WorkerBootstrapMs), (Get-Median $results.FirstMs),
         (Get-Median $results.WallSeconds), (Get-Median $results.Rps),
-        (Get-Median $results.P50Ms), (Get-Median $results.P95Ms),
-        (Get-Median $results.P99Ms), (Get-Median $results.ServerCpuUs),
+        (Get-Median $results.MinMs), (Get-Median $results.P50Ms),
+        (Get-Median $results.P95Ms), (Get-Median $results.P99Ms),
+        (Get-Median $results.MaxMs), (Get-Median $results.QuantumPct),
+        (Get-Median $results.ServerCpuUs),
         (Get-Median $results.PhpCpuUs), (Get-Median $results.CombinedCpuUs),
         (Get-Median $results.ServerWorkingMiB), (Get-Median $results.ServerPeakMiB),
         (Get-Median $results.PhpWorkingMiB), (Get-Median $results.PhpPeakMiB))

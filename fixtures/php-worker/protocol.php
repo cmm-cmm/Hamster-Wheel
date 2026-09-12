@@ -11,6 +11,41 @@ const HAMSTER_RESPONSE = 3;
 const HAMSTER_SHUTDOWN = 4;
 const HAMSTER_SHUTDOWN_ACK = 5;
 
+/** @return resource */
+function hamster_open_worker_stdin()
+{
+    if (PHP_OS_FAMILY !== 'Windows') {
+        $stream = fopen('php://stdin', 'rb');
+        if ($stream === false) {
+            throw new RuntimeException('cannot open php://stdin');
+        }
+        return $stream;
+    }
+
+    $context = stream_context_create(['pipe' => ['blocking' => true]]);
+    if (!is_resource($context)) {
+        throw new RuntimeException('cannot create blocking stdin pipe context');
+    }
+
+    error_clear_last();
+    $stream = @fopen('php://stdin', 'rb', false, $context);
+    if ($stream === false) {
+        $error = error_get_last();
+        $detail = is_array($error) && isset($error['message'])
+            ? ': ' . $error['message']
+            : '';
+        throw new RuntimeException('cannot open php://stdin with blocking pipe context' . $detail);
+    }
+
+    $metadata = stream_get_meta_data($stream);
+    if (($metadata['stream_type'] ?? null) !== 'STDIO' || ($metadata['blocked'] ?? false) !== true) {
+        fclose($stream);
+        throw new RuntimeException('php://stdin did not initialize as a blocking STDIO stream');
+    }
+
+    return $stream;
+}
+
 function hamster_read_exact($stream, int $length): ?string
 {
     $result = '';

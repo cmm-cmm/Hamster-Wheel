@@ -616,3 +616,264 @@ between requests. No FastCGI, PHP-FPM, Laravel, shell command, automatic PATH
 lookup, static optimization, router replacement, or production pooling was
 introduced. A future milestone should first profile the Windows pipe round-trip
 and define state-reset semantics before choosing a worker-pool design.
+
+## 0.1.1 Windows PHP Worker IPC Investigation
+
+This additive investigation does not replace the immutable 0.1.0 baseline and
+does not modify production architecture or protocol. It used the same local PHP
+8.5.10 CLI NTS, an optimized MSVC profiling bench, concurrency one, and three
+runs per reported field. The direct child-process suites exclude HTTP, Hyper,
+router, application bootstrap, and the production worker mutex. Parent and
+child CPU values use separate `GetProcessTimes` snapshots over the same window.
+
+### End-to-End Timeline
+
+The default timeline uses a real production-format request/response. Rust and
+PHP clocks provide durations only within their own process; absolute timestamps
+are never subtracted across clock domains.
+
+| Stage | Default pipe P50 | Profiling `pipe.blocking` P50 |
+|---|---:|---:|
+| Rust request encode (T0-T1) | 2.5 us | 0.8 us |
+| Rust write + flush completion (T1-T2) | 57.0 us | 40.6 us |
+| Combined transfer/wakeup residual | 14,976.0 us | 16.6 us |
+| PHP decode (T3-T4) | 23.9 us | 5.4 us |
+| PHP fixture handler (T4-T5) | 1.3 us | 0.2 us |
+| PHP response encode (T5-T6) | 10.4 us | 2.1 us |
+| PHP write + flush (T6-T7) | 17.9 us | 1.7 us |
+| Rust decode + validation (T8-T9) | 2.8 us | 0.4 us |
+| Total transaction P50 | 15,136.8 us | 67.9 us |
+
+The residual is `Rust T2-T8 - PHP T3-T7`. It combines both transfer directions,
+pipe polling/wakeup, and task resumption; the protocol has no synchronized
+one-way marker with which to split Rust-to-PHP from PHP-to-Rust safely. PHP
+diagnostics travel on stderr after stdout completion and never enter protocol
+stdout.
+
+### Pipe Round-Trip Payload Matrix
+
+Minimal child loops read one length-prefixed frame and echo it without HTTP
+metadata or application logic. The table reports three-run medians using the
+current Rust split-prefix/payload write shape.
+
+| Payload | Rust child P50 | Rust RPS | PHP child P50 | PHP RPS |
+|---:|---:|---:|---:|---:|
+| 0 B | 39.4 us | 24,969 | 15,128.3 us | 69.6 |
+| 16 B | 58.8 us | 16,524 | 15,159.1 us | 66.1 |
+| 128 B | 72.6 us | 13,433 | 15,147.2 us | 67.3 |
+| 1 KiB | 49.2 us | 18,306 | 15,123.5 us | 65.7 |
+| 16 KiB | 71.2 us | 13,806 | 15,147.8 us | 65.9 |
+| 64 KiB | 113.7 us | 7,729 | 15,166.0 us | 65.5 |
+| 1 MiB | 1,160.3 us | 764 | 15,446.6 us | 64.0 |
+
+PHP latency is almost payload-independent through 64 KiB, then rises only
+about 0.3 ms at 1 MiB. That shape is a fixed wait, not serialization or memory
+bandwidth cost. PHP `fread` counters were two reads/request at 16-1,024 B,
+three at 16 KiB, nine at 64 KiB, and 129 at 1 MiB, consistent with an
+approximately 8 KiB read chunk after the four-byte prefix.
+
+### Rust-Rust, Synchronous, and Tokio Controls
+
+At 128 B, a completely synchronous parent using ordinary process pipe handles
+recorded Rust-child P50 18.9 us, P99 51.7 us, and 46,709 RPS. The same parent
+and framing recorded PHP-child P50 15,090.5 us, P99 16,029.8 us, and 75.3 RPS.
+Thus PHP retains the delay without Tokio, Hyper, or async scheduling.
+
+The Tokio parent/Rust child control recorded 72.6 us P50. Tokio child stdio is
+therefore a measurable tens-of-microseconds cost on this host, but it is more
+than two orders of magnitude below the PHP default and is not the primary
+bottleneck.
+
+### Frame, Flush, and Buffering Experiments
+
+All values below use a 128-byte PHP echo at concurrency one:
+
+| Experiment | P50 |
+|---|---:|
+| Current: Rust split, PHP contiguous + flush | 15,142.4 us |
+| Rust single contiguous request | 15,204.2 us |
+| Rust `BufWriter` around split request | 15,314.0 us |
+| PHP split response (two `fwrite`) | 15,198.9 us |
+| PHP read buffer set to zero | 15,175.3 us |
+| PHP response without `fflush` | 15,187.1 us |
+| PHP requested 8 KiB write buffer + one flush | 15,179.7 us |
+| `stream_set_blocking(stdin, true)` | 15,179.2 us |
+| `pipe.blocking` stream context (profiling only) | 68.7 us |
+
+For 920 small requests, the default PHP loop performed 1,841 `fread`, 920
+`fwrite`, and 920 `fflush` calls. Splitting the response doubled `fwrite` to
+1,840 without a meaningful latency change. `ob_get_level()` was zero;
+`stream_set_write_buffer` returned `-1` (unsupported), read-buffer zero returned
+`0`, and `stream_set_blocking` returned `false`. Omitting flush still delivered
+responses and did not remove the delay.
+
+### First, Warm, and Timer Distribution
+
+| Window | Default P50/P95/P99 | Default min/max | Near 15.625 ms quantum | Blocking P50/P95/P99 |
+|---|---:|---:|---:|---:|
+| First request | 14,240/14,240/14,240 us | 14,240/14,240 us | 0% | 86.5/86.5/86.5 us |
+| Requests 2-10 | 15,418/15,519/15,519 us | 14,755/15,539 us | 100% | 76.8/109.9/109.9 us |
+| Requests 100-999 | 15,112/15,715/16,076 us | 119.6/16,442 us | 94.8% | 67.7/95.2/133.6 us |
+| Requests 1000+ | 15,283/15,770/16,051 us | 156.3/16,119 us | 95.5% | 68.9/102.8/147.2 us |
+
+The first value is the median of three separately identified first requests.
+Default steady-state samples overwhelmingly cluster within 1 ms of a 15.625 ms
+multiple, with occasional sub-millisecond samples when PHP reaches its read at
+the favorable time. The blocking-context distribution has no quantum cluster.
+
+### CPU versus Wall Time
+
+For the production-format timeline, default median CPU/request was 234.375 us
+in Rust and 117.188 us in PHP (351.562 us combined) versus 15,136.8 us wall
+P50. The profiling blocking context used 91.146 us Rust and 26.042 us PHP
+(117.188 us combined) versus 67.9 us wall P50; CPU can exceed wall because the
+two processes execute on different cores and per-trial CPU accounting is
+coarsely quantized. The default wall/combined-CPU gap confirms waiting rather
+than CPU saturation.
+
+### Root Cause and Scope
+
+**Conclusion A: PHP buffering/Windows pipe polling is the primary cause.** PHP
+8.5's Windows stdio stream path treats `php://stdin` as a non-blocking anonymous
+pipe, polls availability with `PeekNamedPipe`, and calls `usleep(10)` when empty.
+On this host that wait aligns with the approximately 15.625 ms timer quantum.
+Opening the profiling stream with context option
+`['pipe' => ['blocking' => true]]` bypassed the poll and reduced the same
+production-format P50 by roughly 223x. A generic Windows pipe, protocol/frame
+handoff, and Tokio child stdio are secondary or rejected as main causes by the
+Rust and synchronous controls.
+
+No timer resolution API, production `pipe.blocking`, socket/named-pipe
+transport, worker pool, protocol change, state reset, respawn, FastCGI, or
+Laravel work was added. The production worker and all 0.1.0 security/validation
+semantics remain unchanged.
+
+### Measurement Limits and Recommendation
+
+Timeline stderr diagnostics add work after each response. Tiny-trial process
+CPU has 15.625 ms accounting granularity, and medians of independent fields do
+not necessarily add exactly. The PHP internal timer and Rust `Instant` are used
+only for within-process durations. `read_exact`/`write_all` are API-call counts,
+not guaranteed one-to-one kernel syscall counts.
+
+The next step should be a single-variable production candidate review of
+opening PHP stdin with the supported blocking-pipe stream context, including
+request timeout, Ctrl+C, malformed/truncated frame, dead-worker, and shutdown
+tests. Re-run both 0.1.0 HTTP and IPC baselines before accepting it. Do not add a
+pool to mask the default polling delay.
+
+## 0.1.2 Production Blocking Pipe
+
+This section is additive. It preserves the 0.1.0 approximately 66 RPS
+prototype baseline and every 0.1.1 investigation result above. The only
+production behavior change is opening Windows `php://stdin` with
+`['pipe' => ['blocking' => true]]` before the worker sends `READY`; the protocol,
+Rust child stdio, router, configuration, and single-worker mutex are unchanged.
+
+### Methodology
+
+- PHP 8.5.10 CLI NTS VS17 x64 and MSVC release server on the same Windows host
+- Loopback HTTP/1.1 keep-alive, concurrency one, 100 warm-up requests
+- 20,000 measured requests per run, three fresh processes, per-field medians
+- Process CPU deltas cover the measured requests only; memory is sampled after
+  each run
+- A latency sample is quantum-adjacent when it is within 1 ms of a positive
+  15.625 ms multiple
+
+Reproduce with:
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+./benchmarks/php_worker.ps1 -Runs 3 -Requests 20000 -WarmupRequests 100
+```
+
+### Production Before and After
+
+| Scenario | RPS before / after | P50 before / after | P95 before / after | P99 before / after |
+|---|---:|---:|---:|---:|
+| Simple control | 9,371 / 19,774 | 0.102 / 0.046 ms | 0.169 / 0.076 ms | 0.231 / 0.128 ms |
+| PHP Hello | 66 / 7,004 | 15.191 / 0.138 ms | 15.756 / 0.184 ms | 16.076 / 0.252 ms |
+| PHP JSON | 66 / 7,204 | 15.171 / 0.132 ms | 15.765 / 0.188 ms | 16.077 / 0.260 ms |
+
+Hello throughput improved about 106x and P50 fell about 110x; JSON improved
+about 109x and 115x respectively. The simple control varies strongly at this
+short sequential workload and is not a replacement for 0.0.1. The production
+HTTP medians are above the 0.1.1 direct-pipe 67.9 us because they include the
+client, TCP, Hyper, router, mutex, request mapping, and response construction.
+
+### Cold, Warm, Distribution, and Variance
+
+| Scenario | READY median | First request median | Min | P50 | P95 | P99 | Max | Quantum-adjacent |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PHP Hello | 27.811 ms | 1.167 ms | 0.095 ms | 0.138 ms | 0.184 ms | 0.252 ms | 2.323 ms | 0.0% |
+| PHP JSON | 26.312 ms | 5.637 ms | 0.085 ms | 0.132 ms | 0.188 ms | 0.260 ms | 2.658 ms | 0.0% |
+
+Hello RPS ranged 6,788-7,241, P50 0.134-0.140 ms, and P99
+0.243-0.270 ms. JSON RPS ranged 6,374-7,425, P50 0.129-0.144 ms, and P99
+0.258-0.308 ms. Reported max ranges were 0.782-2.566 ms and 1.425-4.260 ms.
+No measured request in any production run was quantum-adjacent, so the default
+15.625/31.25 ms modes have disappeared. First request includes client
+connection setup and is intentionally reported separately from READY and warm
+latency. READY remains near the 0.1.0 31-34 ms range rather than being folded
+into request throughput.
+
+### CPU and Memory
+
+| Scenario | Hamster CPU/request | PHP CPU/request | Combined | Hamster WS/peak | PHP WS/peak |
+|---|---:|---:|---:|---:|---:|
+| Simple | 25.781 us | 0 | 25.781 us | 6.5/6.5 MiB | n/a |
+| PHP Hello | 146.094 us | 26.562 us | 170.312 us | 7.0/7.0 MiB | 16.6/16.6 MiB |
+| PHP JSON | 144.531 us | 29.688 us | 178.125 us | 7.0/7.0 MiB | 16.6/16.6 MiB |
+
+Hello wall time averages about 143 us/request and JSON about 139 us/request.
+Combined process CPU can exceed wall because Rust and PHP may execute on
+different cores and Windows process accounting remains quantized. The result
+primarily proves removal of waiting latency; it is not presented as a CPU
+optimization. Memory stays near the 0.1.0 6.9 MiB Hamster and 16.6-16.7 MiB PHP
+measurements.
+
+### Soak and Concurrency Smoke
+
+The production soak command
+`./benchmarks/php_worker_soak.ps1 -Requests 100000` completed 100,000/100,000
+requests in 14.713 s (6,797 RPS). PID stayed constant, bootstrap remained one,
+and the request counter advanced exactly 1 to 100,000. Hamster working set was
+6.7 MiB before and 7.2 MiB after; PHP was 16.5 and 16.7 MiB. There was no
+timeout, crash, deadlock, or protocol corruption.
+
+The correctness-only concurrency smoke used 100 warm-up plus 2,000 measured
+Hello requests at each level against the same one-worker process:
+
+| HTTP concurrency | Successes | RPS | P50 | P95 | P99 | Max |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2,000 | 4,808 | 0.194 ms | 0.284 ms | 0.380 ms | 2.747 ms |
+| 2 | 2,000 | 9,241 | 0.203 ms | 0.300 ms | 0.393 ms | 2.847 ms |
+| 4 | 2,000 | 8,047 | 0.474 ms | 0.643 ms | 0.758 ms | 5.775 ms |
+| 8 | 2,000 | 8,233 | 0.955 ms | 1.209 ms | 1.332 ms | 1.839 ms |
+| 16 | 2,000 | 8,957 | 1.721 ms | 2.267 ms | 2.511 ms | 2.731 ms |
+
+All 10,000 measured requests succeeded; the same PID retained `bootstrap=1`
+and the final counter matched 10,502 including warm-up and state probes.
+Latency grows as requests queue before one serialized worker. These figures are
+not a scalability benchmark and do not hide the single-worker constraint.
+
+### Lifecycle, Correctness, and Decision
+
+Tests cover READY-blocked shutdown, shutdown after use, BUSY drain, request
+timeout, EOF, malformed and truncated response, child exit after reading only
+the request prefix, unavailable-state behavior, binary payloads, repeated
+headers, GET/POST/query, custom response status/headers, keep-alive, and
+concurrent HTTP connections. Manual Ctrl+C checks in READY and BUSY states
+left no orphan PHP process; the BUSY console case returned a controlled 502
+after PHP received the console interrupt.
+
+PHP cannot query the internal `pipe.blocking` option after `fopen`: context
+options are not reflected by `stream_context_get_options`, while generic stream
+metadata reports `blocked=true` for both paths. Production therefore fails
+before `READY` if context creation, stream open, or STDIO validation fails, and
+the zero-quantum production distribution supplies behavioral verification.
+There is no silent polling fallback.
+
+The measured bottleneck is fixed without a protocol or architecture redesign.
+The evidence supports proceeding to a separate 0.2.0 worker-pool design; this
+milestone does not implement it.

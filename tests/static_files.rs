@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use hamster_wheel::{router::HostRouter, server};
+use hamster_wheel::{config::SERVER_NAME, router::HostRouter, server};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -119,7 +119,8 @@ async fn serves_index_mime_and_head() {
         .request("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await;
     assert!(index.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(index.contains("server: HamsterWheel/0.1.0\r\n"));
+    // Asserting the constant keeps a version bump from silently breaking this.
+    assert!(index.contains(&format!("server: {SERVER_NAME}\r\n")));
     assert!(index.contains("content-type: text/html; charset=utf-8\r\n"));
     assert!(index.ends_with("\r\n\r\nHello, Hamster Wheel!"));
 

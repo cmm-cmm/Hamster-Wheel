@@ -1,6 +1,6 @@
 [package]
 name = "hamster-wheel"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "HTTP server with static files, routing, configuration, and a persistent PHP worker prototype"
 
@@ -38,5 +38,10 @@ required-features = ["profiling"]
 
 [[bench]]
 name = "configuration"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "php_ipc"
 harness = false
 required-features = ["profiling"]
