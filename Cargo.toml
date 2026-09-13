@@ -1,6 +1,6 @@
 [package]
 name = "hamster-wheel"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "HTTP server with static files, routing, configuration, and a fixed persistent PHP worker pool"
 

@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -68,6 +69,8 @@ struct RawPhpWorker {
     #[serde(default = "default_php_workers")]
     workers: usize,
     queue_capacity: Option<usize>,
+    max_requests: Option<u64>,
+    max_worker_age: Option<u64>,
 }
 
 const fn default_php_workers() -> usize {
@@ -304,6 +307,8 @@ enum ValidatedHandler {
         script: PathBuf,
         workers: usize,
         queue_capacity: usize,
+        max_requests: Option<u64>,
+        max_worker_age: Option<Duration>,
     },
 }
 
@@ -450,10 +455,20 @@ pub(crate) fn validate_raw(
                             "{context}.php.queue_capacity must be between 1 and {MAX_QUEUE_CAPACITY}"
                         )));
                     }
+                    if php.max_requests == Some(0) {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php.max_requests must be at least 1 when configured"
+                        )));
+                    }
+                    if php.max_worker_age == Some(0) {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php.max_worker_age must be at least 1 second when configured"
+                        )));
+                    }
                     php_worker_count += 1;
                     if php_worker_count > 1 {
                         return Err(ConfigError::Validation(format!(
-                            "{context}: milestone 0.2.0 permits exactly one php_worker location"
+                            "{context}: milestone 0.3.0 permits exactly one php_worker location"
                         )));
                     }
                     ValidatedHandler::PhpWorker {
@@ -461,6 +476,8 @@ pub(crate) fn validate_raw(
                         script: resolve_path(base_directory, php.script),
                         workers: php.workers,
                         queue_capacity,
+                        max_requests: php.max_requests,
+                        max_worker_age: php.max_worker_age.map(Duration::from_secs),
                     }
                 }
                 handler => {
@@ -561,6 +578,8 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     script,
                     workers,
                     queue_capacity,
+                    max_requests,
+                    max_worker_age,
                 } => {
                     let executable = canonical_file(
                         &executable,
@@ -580,6 +599,8 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         worker: PhpWorkerConfig { executable, script },
                         workers,
                         queue_capacity,
+                        max_requests,
+                        max_worker_age,
                     }));
                     php_pools.push(Arc::clone(&pool));
                     Handler::php_worker(pool)

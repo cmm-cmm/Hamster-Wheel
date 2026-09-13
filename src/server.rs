@@ -2,7 +2,7 @@ use std::{fmt, future::Future, io, sync::Arc};
 
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
-use tokio::{net::TcpListener, signal, sync::watch, task::JoinSet};
+use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{config::RuntimeConfig, php_worker::PhpWorkerError, router::HostRouter};
 
@@ -58,10 +58,17 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             return Err(ServerError::Io(error));
         }
     };
+    let shutdown = match shutdown_signal() {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            let _ = config.shutdown_workers().await;
+            return Err(ServerError::Io(error));
+        }
+    };
     println!("Hamster Wheel listening on http://{address}");
 
     let router = config.router_arc();
-    let serve_result = serve_with_router(listener, router, shutdown_signal()).await;
+    let serve_result = serve_with_router(listener, router, shutdown).await;
     let shutdown_result = config.shutdown_workers().await;
     serve_result?;
     shutdown_result?;
@@ -143,8 +150,18 @@ async fn serve_connection(
     }
 }
 
-async fn shutdown_signal() {
-    if let Err(error) = signal::ctrl_c().await {
-        eprintln!("failed to listen for Ctrl+C: {error}");
-    }
+#[cfg(windows)]
+fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
+    let mut signal = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        let _ = signal.recv().await;
+    })
+}
+
+#[cfg(not(windows))]
+fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(async move {
+        let _ = signal.recv().await;
+    })
 }

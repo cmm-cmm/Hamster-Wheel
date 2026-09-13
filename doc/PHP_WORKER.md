@@ -1,5 +1,72 @@
 # PHP Worker Pool
 
+## 0.3.0 Lifecycle Supervisor
+
+Milestone 0.3.0 keeps the 0.2 actor-owned transaction path and adds permanent
+worker slots managed by a lifecycle supervisor. A slot is stable pool capacity;
+its generation increments whenever the process is replaced, while PID remains
+only a process property. Each idle capability carries
+`{ slot, generation, mailbox }`, and the mailbox belongs to that exact
+generation. The dispatcher has no worker lookup table.
+
+Unexpected process, pipe, timeout, or protocol failure fails the affected
+request once and schedules a replacement. A possibly-started request is never
+retried. The first replacement is immediate; subsequent failures back off for
+100, 200, 400, 800, 1600, 3200, then at most 5000 ms. A slot is retired after
+the tenth replacement also fails. Failure history resets only after a
+generation has lived for 60 seconds and completed a request successfully.
+Idle process death is detected passively when its generation is next selected;
+there is no proactive stdout probe in this milestone.
+
+Only live generation tasks or pending backoff/bootstrap tasks own `idle_tx`.
+The supervisor never keeps a permanent clone. Zero READY workers is therefore
+transient while a replacement is possible; `idle_rx` closes only when no live
+or pending generation can restore service. New requests receive controlled 503
+while no process is live, and service resumes after replacement READY.
+
+Optional `max_requests` and `max_worker_age` policies default OFF. Recycling is
+stop-then-spawn, happens only at a transaction boundary, and is serialized to
+one voluntary recycle across the pool. A recycling worker closes its mailbox,
+drains an already-buffered job, and does not publish another idle token.
+Planned recycle does not increment failure history.
+
+### Known 0.3.0 recycling defects
+
+Both are recorded from the independent 0.3.0 review. Neither violates a
+correctness invariant, and both only affect the optional policies that default
+OFF.
+
+`max_worker_age` stops making progress on a pool with no traffic. A generation
+publishes its idle token with a blocking send, and the dispatcher only reads
+idle tokens while it holds a job, so an idle pool never consumes them. The idle
+channel holds `workers * 2` tokens, so after two recycled generations per slot
+the next generation blocks inside the publish, never enters its command loop,
+and therefore never arms its age deadline. Measured: `workers = 1`,
+`max_worker_age = 1`, six idle seconds produced generation 3 rather than about
+seven. The next request drains the stale tokens and recycling resumes, so the
+effect is a stalled age policy on an idle pool, not a deadlock. The intended
+fix is for the dispatcher to drain idle tokens continuously and discard tokens
+whose mailbox is closed.
+
+`max_requests` is a soft threshold, not a cap. Voluntary recycling holds a
+single pool-wide permit; a generation that cannot take the permit keeps serving
+and retries at the next transaction boundary. Measured: `workers = 2`,
+`max_requests = 1`, 200 requests produced 8 recycles. Overshoot is bounded by
+permit contention and replacement bootstrap time, not by the configured value.
+
+Shutdown changes the global phase before signalling tasks, permanently closing
+spawn authorization. Admission stops, backoff/bootstrap work is cancelled, the
+dispatcher converges, in-flight and accepted work resolves, then live workers
+receive SHUTDOWN. ACK validation, the two-second kill fallback, child reaping,
+and task joins remain mandatory. Application Reset is deferred to the 0.4.0
+Laravel Worker milestone. The full contract is in
+`doc/WORKER_LIFECYCLE_0_3.md`.
+
+`PoolSnapshot` reports target and READY counts, total respawns, and per-slot
+`WorkerSnapshot` values: slot, generation, PID, lifecycle state, spawn reason,
+request count, spawn time, consecutive failures, and last exit reason. These
+values are observational; correctness does not poll them.
+
 ## 0.2.0 Architecture
 
 Milestone 0.2.0 replaces the HTTP-owned single-worker transaction with a fixed

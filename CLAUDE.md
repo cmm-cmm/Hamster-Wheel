@@ -8,9 +8,9 @@ the long-form roadmap and is written in Vietnamese.
 ## What this is
 
 Hamster Wheel is a Rust HTTP server (hyper 1 + Tokio, edition 2024) built milestone by milestone.
-Current version is 0.2.0 (Fixed PHP Worker Pool + Cancellation Safety), accepted on the Windows
-target. It serves static files, routes by host/location, loads configuration from TOML, and runs a
-fixed pool of persistent PHP CLI workers over a custom binary stdio protocol. Windows
+Current version is 0.3.0 (PHP Worker Lifecycle), implemented on the Windows target. It serves
+static files, routes by host/location, loads configuration from TOML, and runs a fixed pool of
+persistent PHP CLI workers with automatic replacement over a custom binary stdio protocol. Windows
 (`x86_64-pc-windows-msvc`) is the primary development and measurement platform.
 
 ## Commands
@@ -80,26 +80,27 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
   (append `index.html` for a directory) -> canonicalize -> `starts_with(root)` containment ->
   metadata -> read. HEAD deliberately skips the body read. Per-request canonicalization is what
   rejects symlink/junction escapes; do not remove it for speed.
-- `php_worker.rs` + `php_protocol.rs`: a fixed pool of `php.exe` children spawned directly (no shell,
-  no FastCGI), stdio carries only frames, stderr is drained per child. Each worker moves through
-  `STARTING -> BOOTSTRAPPING -> READY -> BUSY -> READY`. The pool topology is a bounded FIFO job
-  queue (`queue_capacity`, 1-128, default `min(workers * 8, 128)`) -> one dispatcher task -> N
-  dedicated worker tasks, each with a capacity-1 mailbox. A worker task exclusively owns one
-  `PhpWorker` and therefore its child, stdin, stdout, and request-ID sequence for the task's whole
-  lifetime; there is no `Arc<Mutex<PhpWorker>>` and no global PHP execution lock. HTTP tasks only
-  `try_send` a job and await a `oneshot`: a full queue or a closed pool is a controlled 503, never a
-  wait.
+- `php_worker.rs` + `php_protocol.rs`: a fixed target of `php.exe` children spawned directly (no
+  shell, no FastCGI), stdio carries only frames, and stderr is drained per child. Stable slots own
+  monotonically increasing generations; PID is not identity. The topology is a bounded FIFO job
+  queue (`queue_capacity`, 1-128, default `min(workers * 8, 128)`) -> dispatcher -> generation-specific
+  capacity-1 mailboxes -> exclusive worker tasks. `IdleWorker` carries slot, generation, and that
+  generation's mailbox; the dispatcher has no lookup table. There is no `Arc<Mutex<PhpWorker>>` or
+  global PHP execution lock. HTTP admission uses `try_send`; full or unavailable is controlled 503.
 - Transaction ownership is cancellation-safe and this is a correctness requirement, not a
   refinement. Once a REQUEST frame starts, the owning worker task always consumes the RESPONSE (or
   fails the worker), so a disconnected HTTP client can never desynchronize the protocol stream. A job
   whose receiver is already gone is skipped before execution begins; a job is re-dispatched only when
   the mailbox send proves PHP never started, so a possibly-started request is never retried. Any I/O,
   protocol, request-ID mismatch, or timeout marks that worker `Unavailable`, kills it, and ends its
-  task; surviving workers keep serving in degraded mode and their callers still get responses. Only
-  worker tasks hold `idle_tx`, so the last worker's exit closes `idle_rx`, and that closure is the
-  zero-healthy-worker signal: held and queued jobs are resolved with 503 instead of hanging. Startup
-  is all-or-nothing. No respawn, no adaptive sizing, no state reset in this milestone. Timeouts: 5 s
-  startup, 5 s request, 2 s shutdown.
+  task. The lifecycle supervisor replaces failed generations without retrying their request;
+  surviving workers serve degraded until replacement READY. Only live generations or pending
+  replacement/backoff tasks hold `idle_tx`; the supervisor never keeps a clone. Thus zero READY can
+  be transient, while `idle_rx` closure means terminal unavailability. Startup remains
+  all-or-nothing. Backoff is per slot (immediate, then 100 ms doubling to 5 s), with retirement after
+  more than 10 consecutive failures and stability reset after 60 s plus one success. Optional
+  `max_requests` and `max_worker_age` recycle policies default OFF and use serialized
+  stop-then-spawn. No adaptive sizing, proactive idle probe, or application Reset exists in 0.3.0.
 - `queue_capacity` bounds admitted job count, not bytes. Request bodies are buffered before pool
   admission, so a full queue can retain roughly 128 MiB at the 1 MiB body limit. A total-byte
   admission budget and body streaming are deferred, not implemented.
@@ -117,7 +118,7 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
 
 ## Working rules specific to this repo
 
-- Platform status for 0.2.0: Windows `x86_64-pc-windows-msvc` is verified; Linux is compile-checked
+- Platform status for 0.3.0: Windows `x86_64-pc-windows-msvc` is the verified target; Linux is compile-checked
   only (cross-target `cargo check`/`clippy` from Windows) with native verification deferred. Do not
   describe Linux as supported, and do not report a cross-target check as a native run.
 - Every milestone's behavior, measurements, and explicitly rejected alternatives are written down in

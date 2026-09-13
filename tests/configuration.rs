@@ -358,6 +358,8 @@ fn validates_php_pool_worker_and_queue_bounds() {
         "workers = 65",
         "queue_capacity = 0",
         "queue_capacity = 129",
+        "max_requests = 0",
+        "max_worker_age = 0",
     ] {
         let source = not_found_config(&format!("{base}{field}\n"));
         assert!(matches!(
@@ -371,6 +373,19 @@ fn validates_php_pool_worker_and_queue_bounds() {
     let pool = runtime.php_worker().unwrap();
     assert_eq!(pool.worker_count(), 4);
     assert_eq!(pool.queue_capacity(), 32);
+    assert_eq!(pool.max_requests(), None);
+    assert_eq!(pool.max_worker_age(), None);
+
+    let source = not_found_config(&format!(
+        "{base}max_requests = 1000\nmax_worker_age = 3600\n"
+    ));
+    let runtime = config::compile_str(&source, &temporary.path).unwrap();
+    let pool = runtime.php_worker().unwrap();
+    assert_eq!(pool.max_requests(), Some(1000));
+    assert_eq!(
+        pool.max_worker_age(),
+        Some(std::time::Duration::from_secs(3600))
+    );
 
     let source = not_found_config(&format!("{base}workers = 64\n"));
     let runtime = config::compile_str(&source, &temporary.path).unwrap();

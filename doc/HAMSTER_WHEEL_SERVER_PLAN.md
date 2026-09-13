@@ -1226,18 +1226,24 @@ work của 0.3.0 nếu chưa có design review.
 
 ### 0.3.0 - Worker Lifecycle
 
+Status: implemented on the current `dev` worktree; Windows qualification and
+limited regression benchmarks must pass before review.
+
 ``` text
-Worker health management
+Permanent worker slots + generation identity
 Automatic respawn
-Recycle policy
-Repeated-failure backoff
-Reset
-Drain
-Max requests
-Memory limit
-Timeout
+Per-slot repeated-failure backoff and retirement
+Optional max-requests/max-age recycle (default OFF)
+Lifecycle telemetry
+Coordinated drain and shutdown
 Crash recovery
 ```
+
+0.3.0 owns process lifecycle only. Idle crashes use passive/lazy detection;
+there is no proactive stdout probe. Application Reset moved to the 0.4.0
+Laravel Worker milestone. Memory-threshold recycling, adaptive sizing, and
+protocol changes remain out of scope. The accepted contract is persisted in
+`doc/WORKER_LIFECYCLE_0_3.md`.
 
 ### 0.4.0 - Laravel Worker Mode
 

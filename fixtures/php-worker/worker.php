@@ -28,6 +28,15 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
     $request = hamster_decode_request($frame);
     $application->requestCount++;
 
+    parse_str($request['query'], $query);
+    if (isset($query['execution_marker'], $query['execution_id'])) {
+        file_put_contents(
+            (string) $query['execution_marker'],
+            (string) $query['execution_id'] . "\n",
+            FILE_APPEND | LOCK_EX
+        );
+    }
+
     if ($request['path'] === '/malformed') {
         hamster_write_frame($stdout, chr(99));
         continue;
@@ -37,7 +46,6 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
         exit(31);
     }
 
-    parse_str($request['query'], $query);
     if (isset($query['start_marker'])) {
         file_put_contents((string) $query['start_marker'], (string) getmypid(), LOCK_EX);
     }

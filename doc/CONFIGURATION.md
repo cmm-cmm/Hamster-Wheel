@@ -41,6 +41,9 @@ executable = "php/8.5/php.exe"
 script = "fixtures/php-worker/worker.php"
 workers = 4
 queue_capacity = 32
+# Optional lifecycle policies; omitted means OFF.
+max_requests = 10000
+max_worker_age = 3600
 ```
 
 `server.listen` must be a numeric IP socket address. Host names and aliases use
@@ -50,8 +53,16 @@ only `static`, `not_found`, and `php_worker` are supported. A static location
 requires `root`; a PHP worker location requires `php.executable` and
 `php.script`. `workers` defaults to 1 and must be 1-64. `queue_capacity`
 defaults to `min(workers * 8, 128)` and must be 1-128. Handler-specific fields
-on another handler are errors. Milestone 0.2.0 permits one PHP worker pool
-location. Unknown fields are errors.
+on another handler are errors. `max_requests` is an optional positive request
+count. `max_worker_age` is an optional integer number of seconds and must be at
+least 1. Both default OFF. Milestone 0.3.0 permits one PHP worker pool location.
+Unknown fields are errors.
+
+Both recycle policies are thresholds, not hard caps. Voluntary recycling holds
+one pool-wide permit, so a generation that reaches `max_requests` while another
+slot is recycling keeps serving and retries at its next transaction boundary.
+`max_worker_age` additionally does not advance on a pool with no traffic; see
+the known-defect section in `doc/PHP_WORKER.md`.
 
 The queue bound limits the number of jobs admitted to the PHP pool, not total
 HTTP request memory. PHP request bodies are currently buffered before pool

@@ -1,10 +1,12 @@
 use std::{
-    fmt, io,
+    fmt,
+    future::pending,
+    io,
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc, OnceLock, RwLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -19,7 +21,7 @@ use hyper::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
@@ -40,6 +42,9 @@ pub const MAX_QUEUE_CAPACITY: usize = 128;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const STABILITY_RESET_PERIOD: Duration = Duration::from_secs(60);
+const MAX_CONSECUTIVE_FAILURES: usize = 10;
+const RECYCLE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct PhpWorkerConfig {
@@ -52,6 +57,84 @@ pub struct PhpWorkerPoolConfig {
     pub worker: PhpWorkerConfig,
     pub workers: usize,
     pub queue_capacity: usize,
+    pub max_requests: Option<u64>,
+    pub max_worker_age: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerLifecycleState {
+    Starting,
+    Backoff,
+    Bootstrapping,
+    Ready,
+    Busy,
+    Recycling,
+    Unavailable,
+    Retired,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerSpawnReason {
+    Initial,
+    Respawn,
+    MaxRequests,
+    MaxAge,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerSnapshot {
+    pub slot: usize,
+    pub generation: u64,
+    pub pid: Option<u32>,
+    pub state: WorkerLifecycleState,
+    pub spawn_reason: WorkerSpawnReason,
+    pub request_count: u64,
+    pub spawned_at: Option<Instant>,
+    pub consecutive_failures: usize,
+    pub last_exit_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoolSnapshot {
+    pub target_workers: usize,
+    pub ready_workers: usize,
+    pub total_respawns: u64,
+    pub workers: Vec<WorkerSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServingPhase {
+    Serving,
+    ShuttingDown,
+}
+
+struct SpawnGate {
+    phase: StdMutex<ServingPhase>,
+}
+
+impl SpawnGate {
+    fn new() -> Self {
+        Self {
+            phase: StdMutex::new(ServingPhase::Serving),
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        *self.phase.lock().unwrap_or_else(|error| error.into_inner()) = ServingPhase::ShuttingDown;
+    }
+
+    fn is_serving(&self) -> bool {
+        *self.phase.lock().unwrap_or_else(|error| error.into_inner()) == ServingPhase::Serving
+    }
+}
+
+async fn wait_for_shutdown_phase(phase: &mut watch::Receiver<ServingPhase>) {
+    loop {
+        if *phase.borrow() == ServingPhase::ShuttingDown || phase.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +245,22 @@ impl PhpWorker {
     }
 
     pub async fn start(&mut self) -> Result<WorkerStart, PhpWorkerError> {
+        self.start_inner(None, None).await
+    }
+
+    async fn start_guarded(
+        &mut self,
+        spawn_gate: &SpawnGate,
+        shutdown_phase: Option<&mut watch::Receiver<ServingPhase>>,
+    ) -> Result<WorkerStart, PhpWorkerError> {
+        self.start_inner(Some(spawn_gate), shutdown_phase).await
+    }
+
+    async fn start_inner(
+        &mut self,
+        spawn_gate: Option<&SpawnGate>,
+        shutdown_phase: Option<&mut watch::Receiver<ServingPhase>>,
+    ) -> Result<WorkerStart, PhpWorkerError> {
         if !matches!(self.inner, WorkerSlot::Starting) {
             return Err(PhpWorkerError::Startup(
                 "worker start was requested more than once".to_owned(),
@@ -176,7 +275,21 @@ impl PhpWorker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|source| PhpWorkerError::Spawn {
+        let mut child = if let Some(spawn_gate) = spawn_gate {
+            let phase = spawn_gate
+                .phase
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *phase == ServingPhase::ShuttingDown {
+                return Err(PhpWorkerError::Startup(
+                    "pool shutdown started before process spawn".to_owned(),
+                ));
+            }
+            command.spawn()
+        } else {
+            command.spawn()
+        }
+        .map_err(|source| PhpWorkerError::Spawn {
             executable: self.config.executable.clone(),
             source,
         })?;
@@ -197,7 +310,21 @@ impl PhpWorker {
             .ok_or_else(|| PhpWorkerError::Startup("PHP worker stderr was not piped".to_owned()))?;
         let stderr_task = spawn_stderr_drain(stderr);
 
-        let handshake = timeout(self.timeouts.startup, read_frame(&mut stdout)).await;
+        let handshake = match shutdown_phase {
+            Some(shutdown_phase) => {
+                tokio::select! {
+                    handshake = timeout(self.timeouts.startup, read_frame(&mut stdout)) => handshake,
+                    _ = wait_for_shutdown_phase(shutdown_phase) => {
+                        terminate_child(&mut child).await;
+                        let _ = stderr_task.await;
+                        let message = "pool shutdown interrupted replacement bootstrap".to_owned();
+                        self.inner = WorkerSlot::Unavailable(message.clone());
+                        return Err(PhpWorkerError::Startup(message));
+                    }
+                }
+            }
+            None => timeout(self.timeouts.startup, read_frame(&mut stdout)).await,
+        };
         let ready = match handshake {
             Ok(Ok(payload)) => decode_ready(&payload).map_err(|error| error.to_string()),
             Ok(Err(error)) => Err(startup_io_context(&mut child, error).await),
@@ -417,19 +544,24 @@ struct PoolShared {
     jobs_tx: OnceLock<mpsc::Sender<PhpJob>>,
     accepting: AtomicBool,
     lifecycle: Mutex<PoolLifecycle>,
-    pids: RwLock<Vec<Option<u32>>>,
+    spawn_gate: SpawnGate,
+    slots: Vec<RwLock<WorkerSnapshot>>,
+    live_workers: AtomicUsize,
+    ready_workers: AtomicUsize,
+    total_respawns: AtomicU64,
+    recycle_owner: AtomicUsize,
 }
 
 enum PoolLifecycle {
     New,
+    Starting,
     Running(PoolRuntime),
     Stopped,
 }
 
 struct PoolRuntime {
     shutdown_tx: Option<oneshot::Sender<()>>,
-    dispatcher: JoinHandle<()>,
-    workers: JoinSet<Result<(), PhpWorkerError>>,
+    supervisor: JoinHandle<Result<(), PhpWorkerError>>,
 }
 
 struct PhpJob {
@@ -451,13 +583,61 @@ enum PoolExecuteError {
 
 enum WorkerCommand {
     Job(PhpJob),
-    Shutdown,
+}
+
+#[derive(Clone)]
+struct IdleWorker {
+    slot: usize,
+    generation: u64,
+    mailbox: mpsc::Sender<WorkerCommand>,
+}
+
+enum GenerationOutcome {
+    Failed(String),
+    Recycle(WorkerSpawnReason),
+    Stopped(Result<(), PhpWorkerError>),
+    BootstrapFailed(String),
+    CancelledBeforeSpawn,
+}
+
+struct GenerationExit {
+    slot: usize,
+    generation: u64,
+    idle_tx: mpsc::Sender<IdleWorker>,
+    outcome: GenerationOutcome,
+}
+
+struct GenerationSpec {
+    slot: usize,
+    generation: u64,
+    spawn_reason: WorkerSpawnReason,
+    delay: Duration,
+    idle_tx: mpsc::Sender<IdleWorker>,
+    phase_rx: watch::Receiver<ServingPhase>,
+    worker_shutdown_rx: watch::Receiver<bool>,
+    shared: Arc<PoolShared>,
+}
+
+struct InitialGenerationSpec {
+    slot: usize,
+    generation: u64,
+    spawn_reason: WorkerSpawnReason,
+    worker: PhpWorker,
+    worker_tx: mpsc::Sender<WorkerCommand>,
+    worker_rx: mpsc::Receiver<WorkerCommand>,
+    idle_tx: mpsc::Sender<IdleWorker>,
+    worker_shutdown_rx: watch::Receiver<bool>,
+    shared: Arc<PoolShared>,
+    spawned_at: Instant,
 }
 
 impl PhpWorkerPool {
     pub fn new(config: PhpWorkerPoolConfig) -> Self {
         let workers = config.workers;
         let worker_configs = vec![config.worker.clone(); workers];
+        let slots = (0..workers)
+            .map(|slot| RwLock::new(initial_worker_snapshot(slot)))
+            .collect();
         Self {
             shared: Arc::new(PoolShared {
                 config,
@@ -465,7 +645,12 @@ impl PhpWorkerPool {
                 jobs_tx: OnceLock::new(),
                 accepting: AtomicBool::new(false),
                 lifecycle: Mutex::new(PoolLifecycle::New),
-                pids: RwLock::new(vec![None; workers]),
+                spawn_gate: SpawnGate::new(),
+                slots,
+                live_workers: AtomicUsize::new(0),
+                ready_workers: AtomicUsize::new(0),
+                total_respawns: AtomicU64::new(0),
+                recycle_owner: AtomicUsize::new(0),
             }),
         }
     }
@@ -477,7 +662,12 @@ impl PhpWorkerPool {
             worker: worker_configs[0].clone(),
             workers,
             queue_capacity,
+            max_requests: None,
+            max_worker_age: None,
         };
+        let slots = (0..workers)
+            .map(|slot| RwLock::new(initial_worker_snapshot(slot)))
+            .collect();
         Self {
             shared: Arc::new(PoolShared {
                 config,
@@ -485,7 +675,12 @@ impl PhpWorkerPool {
                 jobs_tx: OnceLock::new(),
                 accepting: AtomicBool::new(false),
                 lifecycle: Mutex::new(PoolLifecycle::New),
-                pids: RwLock::new(vec![None; workers]),
+                spawn_gate: SpawnGate::new(),
+                slots,
+                live_workers: AtomicUsize::new(0),
+                ready_workers: AtomicUsize::new(0),
+                total_respawns: AtomicU64::new(0),
+                recycle_owner: AtomicUsize::new(0),
             }),
         }
     }
@@ -498,30 +693,57 @@ impl PhpWorkerPool {
         self.shared.config.queue_capacity
     }
 
+    pub fn max_requests(&self) -> Option<u64> {
+        self.shared.config.max_requests
+    }
+
+    pub fn max_worker_age(&self) -> Option<Duration> {
+        self.shared.config.max_worker_age
+    }
+
     pub fn pids(&self) -> Vec<u32> {
-        self.shared
-            .pids
-            .read()
-            .expect("PHP worker PID lock poisoned")
-            .iter()
-            .flatten()
-            .copied()
+        self.snapshot()
+            .workers
+            .into_iter()
+            .filter_map(|worker| worker.pid)
             .collect()
     }
 
+    pub fn snapshot(&self) -> PoolSnapshot {
+        PoolSnapshot {
+            target_workers: self.shared.config.workers,
+            ready_workers: self.shared.ready_workers.load(Ordering::Acquire),
+            total_respawns: self.shared.total_respawns.load(Ordering::Acquire),
+            workers: self
+                .shared
+                .slots
+                .iter()
+                .map(|slot| {
+                    slot.read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone()
+                })
+                .collect(),
+        }
+    }
+
     pub async fn start(&self) -> Result<Vec<WorkerStart>, PhpWorkerError> {
-        let mut lifecycle = self.shared.lifecycle.lock().await;
-        if !matches!(*lifecycle, PoolLifecycle::New) {
-            return Err(PhpWorkerError::Startup(
-                "worker pool start was requested more than once".to_owned(),
-            ));
+        {
+            let mut lifecycle = self.shared.lifecycle.lock().await;
+            if !matches!(*lifecycle, PoolLifecycle::New) {
+                return Err(PhpWorkerError::Startup(
+                    "worker pool start was requested more than once".to_owned(),
+                ));
+            }
+            *lifecycle = PoolLifecycle::Starting;
         }
 
         let mut startup = JoinSet::new();
         for (index, config) in self.shared.worker_configs.iter().cloned().enumerate() {
+            let shared = Arc::clone(&self.shared);
             startup.spawn(async move {
                 let mut worker = PhpWorker::new(config);
-                let result = worker.start().await;
+                let result = worker.start_guarded(&shared.spawn_gate, None).await;
                 (index, worker, result)
             });
         }
@@ -551,65 +773,106 @@ impl PhpWorkerPool {
                 cleanup.spawn(async move { worker.shutdown().await });
             }
             while cleanup.join_next().await.is_some() {}
-            *lifecycle = PoolLifecycle::Stopped;
+            *self.shared.lifecycle.lock().await = PoolLifecycle::Stopped;
             return Err(error);
         }
 
-        let (jobs_tx, jobs_rx) = mpsc::channel(self.shared.config.queue_capacity);
-        let (idle_tx, idle_rx) = mpsc::channel(self.shared.config.workers);
-        let mut worker_txs = Vec::with_capacity(self.shared.config.workers);
-        let mut worker_tasks = JoinSet::new();
-        let mut reports = Vec::with_capacity(self.shared.config.workers);
-
-        for (index, entry) in workers.into_iter().enumerate() {
-            let (worker, report) = entry.expect("all PHP workers reached READY");
-            reports.push(report);
-            self.shared
-                .pids
-                .write()
-                .expect("PHP worker PID lock poisoned")[index] = Some(report.pid);
-            let (worker_tx, worker_rx) = mpsc::channel(1);
-            worker_txs.push(worker_tx);
-            worker_tasks.spawn(worker_task(
-                index,
-                worker,
-                worker_rx,
-                idle_tx.clone(),
-                Arc::clone(&self.shared),
+        if !self.shared.spawn_gate.is_serving() {
+            let mut cleanup = JoinSet::new();
+            for (mut worker, _) in workers.into_iter().flatten() {
+                cleanup.spawn(async move { worker.shutdown().await });
+            }
+            while cleanup.join_next().await.is_some() {}
+            *self.shared.lifecycle.lock().await = PoolLifecycle::Stopped;
+            return Err(PhpWorkerError::Startup(
+                "worker pool shutdown started during startup".to_owned(),
             ));
         }
-        // Only worker tasks may own idle senders. Channel closure is the
-        // correctness signal that no healthy worker remains.
+
+        let (jobs_tx, jobs_rx) = mpsc::channel(self.shared.config.queue_capacity);
+        let idle_capacity = self.shared.config.workers.saturating_mul(2).max(1);
+        let (idle_tx, idle_rx) = mpsc::channel(idle_capacity);
+        let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+        let (phase_tx, phase_rx) = watch::channel(ServingPhase::Serving);
+        let mut generation_tasks = JoinSet::new();
+        let mut reports = Vec::with_capacity(self.shared.config.workers);
+
+        for (slot, entry) in workers.into_iter().enumerate() {
+            let (worker, report) = entry.expect("all PHP workers reached READY");
+            let spawned_at = Instant::now();
+            self.shared
+                .mark_ready(slot, 1, report.pid, WorkerSpawnReason::Initial, spawned_at);
+            reports.push(report);
+            let (worker_tx, worker_rx) = mpsc::channel(1);
+            spawn_initial_generation(
+                &mut generation_tasks,
+                InitialGenerationSpec {
+                    slot,
+                    generation: 1,
+                    spawn_reason: WorkerSpawnReason::Initial,
+                    worker,
+                    worker_tx,
+                    worker_rx,
+                    idle_tx: idle_tx.clone(),
+                    worker_shutdown_rx: worker_shutdown_rx.clone(),
+                    shared: Arc::clone(&self.shared),
+                    spawned_at,
+                },
+            );
+        }
+        // No supervisor keeper exists. Each sender is owned by a live
+        // generation and later transferred to its replacement task.
         drop(idle_tx);
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (dispatcher_shutdown_tx, dispatcher_shutdown_rx) = oneshot::channel();
         let shared = Arc::clone(&self.shared);
         let dispatcher = tokio::spawn(dispatcher_task(
             jobs_rx,
             idle_rx,
-            worker_txs,
-            shutdown_rx,
+            dispatcher_shutdown_rx,
             shared,
+        ));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let supervisor = tokio::spawn(supervisor_task(
+            generation_tasks,
+            dispatcher,
+            dispatcher_shutdown_tx,
+            worker_shutdown_tx,
+            phase_tx,
+            phase_rx,
+            shutdown_rx,
+            Arc::clone(&self.shared),
         ));
         self.shared.jobs_tx.set(jobs_tx).map_err(|_| {
             PhpWorkerError::Startup("worker pool job channel was initialized twice".to_owned())
         })?;
+        let mut lifecycle = self.shared.lifecycle.lock().await;
+        if !matches!(*lifecycle, PoolLifecycle::Starting) {
+            drop(lifecycle);
+            self.shared.accepting.store(false, Ordering::Release);
+            self.shared.spawn_gate.begin_shutdown();
+            let _ = shutdown_tx.send(());
+            let _ = supervisor.await;
+            return Err(PhpWorkerError::Startup(
+                "worker pool shutdown started during startup".to_owned(),
+            ));
+        }
         self.shared.accepting.store(true, Ordering::Release);
         *lifecycle = PoolLifecycle::Running(PoolRuntime {
             shutdown_tx: Some(shutdown_tx),
-            dispatcher,
-            workers: worker_tasks,
+            supervisor,
         });
         Ok(reports)
     }
 
     pub async fn shutdown(&self) -> Result<(), PhpWorkerError> {
         self.shared.accepting.store(false, Ordering::Release);
+        self.shared.spawn_gate.begin_shutdown();
         let runtime = {
             let mut lifecycle = self.shared.lifecycle.lock().await;
             match std::mem::replace(&mut *lifecycle, PoolLifecycle::Stopped) {
                 PoolLifecycle::Running(runtime) => Some(runtime),
-                PoolLifecycle::New | PoolLifecycle::Stopped => None,
+                PoolLifecycle::New | PoolLifecycle::Starting | PoolLifecycle::Stopped => None,
             }
         };
         let Some(mut runtime) = runtime else {
@@ -620,28 +883,11 @@ impl PhpWorkerPool {
             let _ = shutdown_tx.send(());
         }
 
-        let mut first_error = None;
-        while let Some(joined) = runtime.workers.join_next().await {
-            match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        PhpWorkerError::Shutdown(format!("worker task failed: {error}"))
-                    });
-                }
-            }
-        }
-        if let Err(error) = runtime.dispatcher.await {
-            first_error.get_or_insert_with(|| {
-                PhpWorkerError::Shutdown(format!("dispatcher task failed: {error}"))
-            });
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        match runtime.supervisor.await {
+            Ok(result) => result,
+            Err(error) => Err(PhpWorkerError::Shutdown(format!(
+                "lifecycle supervisor failed: {error}"
+            ))),
         }
     }
 
@@ -689,6 +935,9 @@ impl PhpWorkerPool {
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(PoolExecuteError::Unavailable);
         }
+        if self.shared.live_workers.load(Ordering::Acquire) == 0 {
+            return Err(PoolExecuteError::Unavailable);
+        }
         let jobs_tx = self
             .shared
             .jobs_tx
@@ -717,66 +966,800 @@ impl PhpWorkerPool {
     }
 }
 
-async fn worker_task(
-    index: usize,
-    mut worker: PhpWorker,
-    mut worker_rx: mpsc::Receiver<WorkerCommand>,
-    idle_tx: mpsc::Sender<usize>,
-    shared: Arc<PoolShared>,
-) -> Result<(), PhpWorkerError> {
-    let _pid_guard = WorkerPidGuard {
-        shared: Arc::clone(&shared),
-        index,
-    };
-    if idle_tx.send(index).await.is_err() {
-        return worker.shutdown().await;
+fn initial_worker_snapshot(slot: usize) -> WorkerSnapshot {
+    WorkerSnapshot {
+        slot,
+        generation: 0,
+        pid: None,
+        state: WorkerLifecycleState::Starting,
+        spawn_reason: WorkerSpawnReason::Initial,
+        request_count: 0,
+        spawned_at: None,
+        consecutive_failures: 0,
+        last_exit_reason: None,
+    }
+}
+
+impl PoolShared {
+    fn update_slot(&self, slot: usize, update: impl FnOnce(&mut WorkerSnapshot)) {
+        let mut snapshot = self.slots[slot]
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        update(&mut snapshot);
     }
 
-    while let Some(command) = worker_rx.recv().await {
+    fn begin_generation(
+        &self,
+        slot: usize,
+        generation: u64,
+        spawn_reason: WorkerSpawnReason,
+        delay: Duration,
+    ) {
+        self.update_slot(slot, |snapshot| {
+            snapshot.generation = generation;
+            snapshot.pid = None;
+            snapshot.state = if delay.is_zero() {
+                WorkerLifecycleState::Bootstrapping
+            } else {
+                WorkerLifecycleState::Backoff
+            };
+            snapshot.spawn_reason = spawn_reason;
+            snapshot.request_count = 0;
+            snapshot.spawned_at = None;
+        });
+    }
+
+    fn mark_ready(
+        &self,
+        slot: usize,
+        generation: u64,
+        pid: u32,
+        spawn_reason: WorkerSpawnReason,
+        spawned_at: Instant,
+    ) {
+        self.update_slot(slot, |snapshot| {
+            snapshot.generation = generation;
+            snapshot.pid = Some(pid);
+            snapshot.state = WorkerLifecycleState::Ready;
+            snapshot.spawn_reason = spawn_reason;
+            snapshot.request_count = 0;
+            snapshot.spawned_at = Some(spawned_at);
+        });
+        self.live_workers.fetch_add(1, Ordering::AcqRel);
+        self.ready_workers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn mark_busy(&self, slot: usize, generation: u64) {
+        self.update_slot(slot, |snapshot| {
+            if snapshot.generation == generation && snapshot.state == WorkerLifecycleState::Ready {
+                snapshot.state = WorkerLifecycleState::Busy;
+                self.ready_workers.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+    }
+
+    fn mark_ready_after_job(&self, slot: usize, generation: u64) {
+        self.update_slot(slot, |snapshot| {
+            if snapshot.generation == generation && snapshot.state == WorkerLifecycleState::Busy {
+                snapshot.state = WorkerLifecycleState::Ready;
+                self.ready_workers.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+    }
+
+    fn record_success(&self, slot: usize, generation: u64, spawned_at: Instant) -> u64 {
+        let mut request_count = 0;
+        self.update_slot(slot, |snapshot| {
+            if snapshot.generation == generation {
+                snapshot.request_count = snapshot.request_count.saturating_add(1);
+                request_count = snapshot.request_count;
+                if spawned_at.elapsed() >= STABILITY_RESET_PERIOD {
+                    snapshot.consecutive_failures = 0;
+                }
+            }
+        });
+        request_count
+    }
+
+    fn mark_recycling(&self, slot: usize, generation: u64) {
+        self.update_slot(slot, |snapshot| {
+            if snapshot.generation != generation {
+                return;
+            }
+            if snapshot.state == WorkerLifecycleState::Ready {
+                self.ready_workers.fetch_sub(1, Ordering::AcqRel);
+            }
+            snapshot.state = WorkerLifecycleState::Recycling;
+        });
+    }
+
+    fn mark_unavailable(&self, slot: usize, generation: u64) {
+        self.update_slot(slot, |snapshot| {
+            if snapshot.generation == generation {
+                if snapshot.state == WorkerLifecycleState::Ready {
+                    self.ready_workers.fetch_sub(1, Ordering::AcqRel);
+                }
+                snapshot.state = WorkerLifecycleState::Unavailable;
+            }
+        });
+    }
+
+    fn record_exit(&self, exit: &GenerationExit, reason: String) {
+        self.update_slot(exit.slot, |snapshot| {
+            if snapshot.generation != exit.generation {
+                return;
+            }
+            if snapshot.pid.take().is_some() {
+                self.live_workers.fetch_sub(1, Ordering::AcqRel);
+            }
+            if snapshot.state == WorkerLifecycleState::Ready {
+                self.ready_workers.fetch_sub(1, Ordering::AcqRel);
+            }
+            snapshot.last_exit_reason = Some(reason);
+            snapshot.state = WorkerLifecycleState::Unavailable;
+        });
+    }
+
+    fn increment_failure(&self, slot: usize) -> usize {
+        let mut failures = 0;
+        self.update_slot(slot, |snapshot| {
+            snapshot.consecutive_failures = snapshot.consecutive_failures.saturating_add(1);
+            failures = snapshot.consecutive_failures;
+        });
+        failures
+    }
+
+    fn retire_slot(&self, slot: usize) {
+        self.update_slot(slot, |snapshot| {
+            snapshot.pid = None;
+            snapshot.state = WorkerLifecycleState::Retired;
+        });
+    }
+
+    fn stop_slot(&self, slot: usize, generation: u64) {
+        self.update_slot(slot, |snapshot| {
+            if snapshot.generation == generation {
+                if snapshot.pid.take().is_some() {
+                    self.live_workers.fetch_sub(1, Ordering::AcqRel);
+                }
+                if snapshot.state == WorkerLifecycleState::Ready {
+                    self.ready_workers.fetch_sub(1, Ordering::AcqRel);
+                }
+                snapshot.state = WorkerLifecycleState::Stopped;
+            }
+        });
+    }
+
+    fn try_acquire_recycle(&self, slot: usize) -> bool {
+        self.recycle_owner
+            .compare_exchange(0, slot + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release_recycle(&self, slot: usize) {
+        let _ =
+            self.recycle_owner
+                .compare_exchange(slot + 1, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+fn spawn_initial_generation(tasks: &mut JoinSet<GenerationExit>, spec: InitialGenerationSpec) {
+    let slot = spec.slot;
+    let generation = spec.generation;
+    let fallback_idle_tx = spec.idle_tx.clone();
+    tasks.spawn(async move {
+        let task = tokio::spawn(run_worker_generation(
+            spec.slot,
+            spec.generation,
+            spec.spawn_reason,
+            spec.worker,
+            spec.worker_tx,
+            spec.worker_rx,
+            spec.idle_tx,
+            spec.worker_shutdown_rx,
+            spec.shared,
+            Some(spec.spawned_at),
+        ));
+        match task.await {
+            Ok(exit) => exit,
+            Err(error) => GenerationExit {
+                slot,
+                generation,
+                idle_tx: fallback_idle_tx,
+                outcome: GenerationOutcome::Failed(format!(
+                    "generation task terminated unexpectedly: {error}"
+                )),
+            },
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_worker_generation(
+    slot: usize,
+    generation: u64,
+    spawn_reason: WorkerSpawnReason,
+    mut worker: PhpWorker,
+    worker_tx: mpsc::Sender<WorkerCommand>,
+    mut worker_rx: mpsc::Receiver<WorkerCommand>,
+    idle_tx: mpsc::Sender<IdleWorker>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    shared: Arc<PoolShared>,
+    already_ready_at: Option<Instant>,
+) -> GenerationExit {
+    let spawned_at = already_ready_at.unwrap_or_else(Instant::now);
+    if already_ready_at.is_none() {
+        let pid = worker
+            .pid()
+            .expect("started PHP generation must have a PID");
+        shared.mark_ready(slot, generation, pid, spawn_reason, spawned_at);
+    }
+    if matches!(
+        spawn_reason,
+        WorkerSpawnReason::MaxRequests | WorkerSpawnReason::MaxAge
+    ) {
+        shared.release_recycle(slot);
+    }
+    let idle = || IdleWorker {
+        slot,
+        generation,
+        mailbox: worker_tx.clone(),
+    };
+    if idle_tx.send(idle()).await.is_err() {
+        let result = worker.shutdown().await;
+        return GenerationExit {
+            slot,
+            generation,
+            idle_tx,
+            outcome: GenerationOutcome::Stopped(result),
+        };
+    }
+
+    let mut next_recycle_check = shared
+        .config
+        .max_worker_age
+        .map(|maximum| (spawned_at + maximum, WorkerSpawnReason::MaxAge));
+    loop {
+        let command = tokio::select! {
+            command = worker_rx.recv() => command,
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    None
+                } else {
+                    continue;
+                }
+            }
+            _ = async {
+                match next_recycle_check {
+                    Some((deadline, _)) => tokio::time::sleep_until(deadline.into()).await,
+                    None => pending::<()>().await,
+                }
+            } => {
+                let Some((_, reason)) = next_recycle_check else {
+                    continue;
+                };
+                if shared.try_acquire_recycle(slot) {
+                    shared.mark_recycling(slot, generation);
+                    worker_rx.close();
+                    let outcome = drain_and_stop_generation(
+                        slot,
+                        generation,
+                        &mut worker,
+                        &mut worker_rx,
+                        &shared,
+                        Some(reason),
+                        spawned_at,
+                    ).await;
+                    return GenerationExit { slot, generation, idle_tx, outcome };
+                }
+                next_recycle_check = Some((Instant::now() + RECYCLE_RETRY_DELAY, reason));
+                continue;
+            }
+        };
+        let Some(command) = command else {
+            worker_rx.close();
+            let outcome = drain_and_stop_generation(
+                slot,
+                generation,
+                &mut worker,
+                &mut worker_rx,
+                &shared,
+                None,
+                spawned_at,
+            )
+            .await;
+            return GenerationExit {
+                slot,
+                generation,
+                idle_tx,
+                outcome,
+            };
+        };
         match command {
             WorkerCommand::Job(job) => {
                 if job.response_tx.is_closed() {
-                    if idle_tx.send(index).await.is_err() {
+                    if idle_tx.send(idle()).await.is_err() {
                         break;
                     }
                     continue;
                 }
+                shared.mark_busy(slot, generation);
                 match worker.execute(job.request).await {
                     Ok(response) => {
+                        let request_count = shared.record_success(slot, generation, spawned_at);
                         let _ = job.response_tx.send(Ok(response));
-                        if idle_tx.send(index).await.is_err() {
+                        if *shutdown_rx.borrow() {
+                            worker_rx.close();
+                            let outcome = drain_and_stop_generation(
+                                slot,
+                                generation,
+                                &mut worker,
+                                &mut worker_rx,
+                                &shared,
+                                None,
+                                spawned_at,
+                            )
+                            .await;
+                            return GenerationExit {
+                                slot,
+                                generation,
+                                idle_tx,
+                                outcome,
+                            };
+                        }
+                        let recycle_reason = if shared
+                            .config
+                            .max_requests
+                            .is_some_and(|maximum| request_count >= maximum)
+                        {
+                            Some(WorkerSpawnReason::MaxRequests)
+                        } else if shared
+                            .config
+                            .max_worker_age
+                            .is_some_and(|maximum| spawned_at.elapsed() >= maximum)
+                        {
+                            Some(WorkerSpawnReason::MaxAge)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = recycle_reason {
+                            if shared.try_acquire_recycle(slot) {
+                                shared.mark_recycling(slot, generation);
+                                worker_rx.close();
+                                let outcome = drain_and_stop_generation(
+                                    slot,
+                                    generation,
+                                    &mut worker,
+                                    &mut worker_rx,
+                                    &shared,
+                                    Some(reason),
+                                    spawned_at,
+                                )
+                                .await;
+                                return GenerationExit {
+                                    slot,
+                                    generation,
+                                    idle_tx,
+                                    outcome,
+                                };
+                            }
+                            next_recycle_check =
+                                Some((Instant::now() + RECYCLE_RETRY_DELAY, reason));
+                        }
+                        shared.mark_ready_after_job(slot, generation);
+                        if idle_tx.send(idle()).await.is_err() {
                             break;
                         }
                     }
                     Err(error) => {
                         let message = error.to_string();
                         let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
-                        eprintln!("PHP worker {index} became unavailable: {error}");
-                        return Ok(());
+                        shared.mark_unavailable(slot, generation);
+                        eprintln!(
+                            "PHP worker slot {slot} generation {generation} became unavailable: {error}"
+                        );
+                        return GenerationExit {
+                            slot,
+                            generation,
+                            idle_tx,
+                            outcome: GenerationOutcome::Failed(error.to_string()),
+                        };
                     }
                 }
-            }
-            WorkerCommand::Shutdown => {
-                return worker.shutdown().await;
             }
         }
     }
 
-    worker.shutdown().await
+    let result = worker.shutdown().await;
+    GenerationExit {
+        slot,
+        generation,
+        idle_tx,
+        outcome: GenerationOutcome::Stopped(result),
+    }
 }
 
-struct WorkerPidGuard {
-    shared: Arc<PoolShared>,
-    index: usize,
-}
-
-impl Drop for WorkerPidGuard {
-    fn drop(&mut self) {
-        if let Ok(mut pids) = self.shared.pids.write()
-            && let Some(pid) = pids.get_mut(self.index)
-        {
-            *pid = None;
+async fn drain_and_stop_generation(
+    slot: usize,
+    generation: u64,
+    worker: &mut PhpWorker,
+    worker_rx: &mut mpsc::Receiver<WorkerCommand>,
+    shared: &PoolShared,
+    recycle_reason: Option<WorkerSpawnReason>,
+    spawned_at: Instant,
+) -> GenerationOutcome {
+    while let Some(WorkerCommand::Job(job)) = worker_rx.recv().await {
+        if job.response_tx.is_closed() {
+            continue;
         }
+        shared.mark_busy(slot, generation);
+        match worker.execute(job.request).await {
+            Ok(response) => {
+                shared.record_success(slot, generation, spawned_at);
+                let _ = job.response_tx.send(Ok(response));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                shared.mark_unavailable(slot, generation);
+                return GenerationOutcome::Failed(error.to_string());
+            }
+        }
+    }
+    match worker.shutdown().await {
+        Ok(()) => match recycle_reason {
+            Some(reason) => GenerationOutcome::Recycle(reason),
+            None => GenerationOutcome::Stopped(Ok(())),
+        },
+        Err(error) if recycle_reason.is_some() => GenerationOutcome::Failed(format!(
+            "planned recycle failed to stop generation: {error}"
+        )),
+        Err(error) => GenerationOutcome::Stopped(Err(error)),
+    }
+}
+
+async fn replacement_generation_task(mut spec: GenerationSpec) -> GenerationExit {
+    if !spec.delay.is_zero() {
+        tokio::select! {
+            _ = tokio::time::sleep(spec.delay) => {}
+            changed = spec.phase_rx.changed() => {
+                if changed.is_err() || *spec.phase_rx.borrow() == ServingPhase::ShuttingDown {
+                    return GenerationExit {
+                        slot: spec.slot,
+                        generation: spec.generation,
+                        idle_tx: spec.idle_tx,
+                        outcome: GenerationOutcome::CancelledBeforeSpawn,
+                    };
+                }
+            }
+        }
+    }
+    if !spec.shared.spawn_gate.is_serving() {
+        return GenerationExit {
+            slot: spec.slot,
+            generation: spec.generation,
+            idle_tx: spec.idle_tx,
+            outcome: GenerationOutcome::CancelledBeforeSpawn,
+        };
+    }
+    spec.shared.update_slot(spec.slot, |snapshot| {
+        snapshot.state = WorkerLifecycleState::Bootstrapping;
+    });
+    let mut worker = PhpWorker::new(spec.shared.worker_configs[spec.slot].clone());
+    match worker
+        .start_guarded(&spec.shared.spawn_gate, Some(&mut spec.phase_rx))
+        .await
+    {
+        Ok(_) if spec.shared.spawn_gate.is_serving() => {
+            let (worker_tx, worker_rx) = mpsc::channel(1);
+            run_worker_generation(
+                spec.slot,
+                spec.generation,
+                spec.spawn_reason,
+                worker,
+                worker_tx,
+                worker_rx,
+                spec.idle_tx,
+                spec.worker_shutdown_rx,
+                spec.shared,
+                None,
+            )
+            .await
+        }
+        Ok(_) => {
+            let result = worker.shutdown().await;
+            GenerationExit {
+                slot: spec.slot,
+                generation: spec.generation,
+                idle_tx: spec.idle_tx,
+                outcome: GenerationOutcome::Stopped(result),
+            }
+        }
+        Err(error) => GenerationExit {
+            slot: spec.slot,
+            generation: spec.generation,
+            idle_tx: spec.idle_tx,
+            outcome: GenerationOutcome::BootstrapFailed(error.to_string()),
+        },
+    }
+}
+
+fn backoff_delay(consecutive_failures: usize) -> Duration {
+    if consecutive_failures <= 1 {
+        return Duration::ZERO;
+    }
+    let exponent = (consecutive_failures - 2).min(6) as u32;
+    Duration::from_millis((100_u64 << exponent).min(5_000))
+}
+
+fn replacement_delay(consecutive_failures: usize) -> Option<Duration> {
+    (consecutive_failures <= MAX_CONSECUTIVE_FAILURES).then(|| backoff_delay(consecutive_failures))
+}
+
+fn spawn_replacement(
+    tasks: &mut JoinSet<GenerationExit>,
+    exit: GenerationExit,
+    spawn_reason: WorkerSpawnReason,
+    delay: Duration,
+    phase_rx: &watch::Receiver<ServingPhase>,
+    worker_shutdown_rx: &watch::Receiver<bool>,
+    shared: &Arc<PoolShared>,
+) {
+    let generation = exit.generation.saturating_add(1);
+    let slot = exit.slot;
+    shared.begin_generation(exit.slot, generation, spawn_reason, delay);
+    shared.total_respawns.fetch_add(1, Ordering::AcqRel);
+    let spec = GenerationSpec {
+        slot: exit.slot,
+        generation,
+        spawn_reason,
+        delay,
+        idle_tx: exit.idle_tx,
+        phase_rx: phase_rx.clone(),
+        worker_shutdown_rx: worker_shutdown_rx.clone(),
+        shared: Arc::clone(shared),
+    };
+    let fallback_idle_tx = spec.idle_tx.clone();
+    tasks.spawn(async move {
+        let task = tokio::spawn(replacement_generation_task(spec));
+        match task.await {
+            Ok(exit) => exit,
+            Err(error) => GenerationExit {
+                slot,
+                generation,
+                idle_tx: fallback_idle_tx,
+                outcome: GenerationOutcome::Failed(format!(
+                    "replacement task terminated unexpectedly: {error}"
+                )),
+            },
+        }
+    });
+}
+
+fn handle_serving_exit(
+    tasks: &mut JoinSet<GenerationExit>,
+    exit: GenerationExit,
+    phase_rx: &watch::Receiver<ServingPhase>,
+    worker_shutdown_rx: &watch::Receiver<bool>,
+    shared: &Arc<PoolShared>,
+) {
+    let (prior_reason, was_recycling) = {
+        let snapshot = shared.slots[exit.slot]
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        (
+            snapshot.spawn_reason,
+            snapshot.state == WorkerLifecycleState::Recycling,
+        )
+    };
+    match &exit.outcome {
+        GenerationOutcome::Failed(reason) | GenerationOutcome::BootstrapFailed(reason) => {
+            shared.record_exit(&exit, reason.clone());
+            if was_recycling
+                || matches!(
+                    prior_reason,
+                    WorkerSpawnReason::MaxRequests | WorkerSpawnReason::MaxAge
+                )
+            {
+                shared.release_recycle(exit.slot);
+            }
+            let failures = shared.increment_failure(exit.slot);
+            let Some(delay) = replacement_delay(failures) else {
+                eprintln!(
+                    "PHP worker slot {} retired after {} consecutive failures: {reason}",
+                    exit.slot, failures
+                );
+                shared.retire_slot(exit.slot);
+                return;
+            };
+            eprintln!(
+                "PHP worker slot {} scheduling generation {} after {} ms (failure {failures})",
+                exit.slot,
+                exit.generation.saturating_add(1),
+                delay.as_millis()
+            );
+            spawn_replacement(
+                tasks,
+                exit,
+                WorkerSpawnReason::Respawn,
+                delay,
+                phase_rx,
+                worker_shutdown_rx,
+                shared,
+            );
+        }
+        GenerationOutcome::Recycle(reason) => {
+            let spawn_reason = *reason;
+            shared.record_exit(&exit, format!("planned recycle: {reason:?}"));
+            spawn_replacement(
+                tasks,
+                exit,
+                spawn_reason,
+                Duration::ZERO,
+                phase_rx,
+                worker_shutdown_rx,
+                shared,
+            );
+        }
+        GenerationOutcome::Stopped(result) => {
+            let reason = match result {
+                Ok(()) => "generation stopped".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            eprintln!(
+                "PHP worker slot {} generation {} stopped unexpectedly: {reason}",
+                exit.slot, exit.generation
+            );
+            shared.record_exit(&exit, reason);
+            shared.stop_slot(exit.slot, exit.generation);
+        }
+        GenerationOutcome::CancelledBeforeSpawn => {
+            shared.stop_slot(exit.slot, exit.generation);
+        }
+    }
+}
+
+fn handle_shutdown_exit(
+    exit: GenerationExit,
+    shared: &PoolShared,
+    first_error: &mut Option<PhpWorkerError>,
+) {
+    let (prior_reason, was_recycling) = {
+        let snapshot = shared.slots[exit.slot]
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        (
+            snapshot.spawn_reason,
+            snapshot.state == WorkerLifecycleState::Recycling,
+        )
+    };
+    if was_recycling
+        || matches!(
+            prior_reason,
+            WorkerSpawnReason::MaxRequests | WorkerSpawnReason::MaxAge
+        )
+    {
+        shared.release_recycle(exit.slot);
+    }
+    let reason = match &exit.outcome {
+        GenerationOutcome::Failed(reason) | GenerationOutcome::BootstrapFailed(reason) => {
+            reason.clone()
+        }
+        GenerationOutcome::Recycle(reason) => format!("planned recycle: {reason:?}"),
+        GenerationOutcome::Stopped(Ok(())) => "generation stopped during shutdown".to_owned(),
+        GenerationOutcome::Stopped(Err(error)) => {
+            first_error.get_or_insert_with(|| {
+                PhpWorkerError::Shutdown(format!(
+                    "slot {} generation {}: {error}",
+                    exit.slot, exit.generation
+                ))
+            });
+            error.to_string()
+        }
+        GenerationOutcome::CancelledBeforeSpawn => "replacement cancelled by shutdown".to_owned(),
+    };
+    shared.record_exit(&exit, reason);
+    shared.stop_slot(exit.slot, exit.generation);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervisor_task(
+    mut generations: JoinSet<GenerationExit>,
+    mut dispatcher: JoinHandle<()>,
+    dispatcher_shutdown_tx: oneshot::Sender<()>,
+    worker_shutdown_tx: watch::Sender<bool>,
+    phase_tx: watch::Sender<ServingPhase>,
+    phase_rx: watch::Receiver<ServingPhase>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    shared: Arc<PoolShared>,
+) -> Result<(), PhpWorkerError> {
+    let mut dispatcher_shutdown_tx = Some(dispatcher_shutdown_tx);
+    let mut dispatcher_finished = None;
+    let mut first_error = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown_rx => break,
+            result = &mut dispatcher => {
+                dispatcher_finished = Some(result);
+                break;
+            }
+            joined = generations.join_next(), if !generations.is_empty() => {
+                match joined {
+                    Some(Ok(exit)) => handle_serving_exit(
+                        &mut generations,
+                        exit,
+                        &phase_rx,
+                        &worker_shutdown_tx.subscribe(),
+                        &shared,
+                    ),
+                    Some(Err(error)) => {
+                        first_error = Some(PhpWorkerError::Shutdown(format!(
+                            "worker generation task failed: {error}"
+                        )));
+                        break;
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    shared.accepting.store(false, Ordering::Release);
+    shared.spawn_gate.begin_shutdown();
+    let _ = phase_tx.send(ServingPhase::ShuttingDown);
+
+    if dispatcher_finished.is_none() {
+        if let Some(shutdown_tx) = dispatcher_shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        loop {
+            tokio::select! {
+                result = &mut dispatcher => {
+                    dispatcher_finished = Some(result);
+                    break;
+                }
+                joined = generations.join_next(), if !generations.is_empty() => {
+                    match joined {
+                        Some(Ok(exit)) => handle_shutdown_exit(exit, &shared, &mut first_error),
+                        Some(Err(error)) => {
+                            first_error.get_or_insert_with(|| PhpWorkerError::Shutdown(format!(
+                                "worker generation task failed during dispatcher drain: {error}"
+                            )));
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(Err(error)) = dispatcher_finished {
+        first_error.get_or_insert_with(|| {
+            PhpWorkerError::Shutdown(format!("dispatcher task failed: {error}"))
+        });
+    }
+
+    // The dispatcher has converged, so closing idle mailboxes cannot strand an
+    // accepted job waiting for capacity that will never be published.
+    let _ = worker_shutdown_tx.send(true);
+    while let Some(joined) = generations.join_next().await {
+        match joined {
+            Ok(exit) => handle_shutdown_exit(exit, &shared, &mut first_error),
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    PhpWorkerError::Shutdown(format!(
+                        "worker generation task failed during shutdown: {error}"
+                    ))
+                });
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -792,8 +1775,7 @@ impl Drop for DispatcherAvailabilityGuard {
 
 async fn dispatcher_task(
     mut jobs_rx: mpsc::Receiver<PhpJob>,
-    mut idle_rx: mpsc::Receiver<usize>,
-    worker_txs: Vec<mpsc::Sender<WorkerCommand>>,
+    mut idle_rx: mpsc::Receiver<IdleWorker>,
     mut shutdown_rx: oneshot::Receiver<()>,
     shared: Arc<PoolShared>,
 ) {
@@ -827,7 +1809,7 @@ async fn dispatcher_task(
         }
 
         loop {
-            let Some(worker_id) = idle_rx.recv().await else {
+            let Some(idle_worker) = idle_rx.recv().await else {
                 shared.accepting.store(false, Ordering::Release);
                 jobs_rx.close();
                 let _ = job.response_tx.send(Err(PoolJobError::Unavailable));
@@ -836,25 +1818,24 @@ async fn dispatcher_task(
                 }
                 return;
             };
-            match worker_txs[worker_id].try_send(WorkerCommand::Job(job)) {
+            match idle_worker.mailbox.try_send(WorkerCommand::Job(job)) {
                 Ok(()) => break,
                 Err(mpsc::error::TrySendError::Closed(WorkerCommand::Job(returned))) => {
                     job = returned;
                 }
                 Err(mpsc::error::TrySendError::Full(WorkerCommand::Job(returned))) => {
-                    debug_assert!(false, "idle worker mailbox unexpectedly full");
+                    eprintln!(
+                        "PHP worker slot {} generation {} published an invalid full idle mailbox",
+                        idle_worker.slot, idle_worker.generation
+                    );
                     let _ = returned.response_tx.send(Err(PoolJobError::Unavailable));
                     break;
                 }
-                Err(_) => unreachable!("dispatcher only sends job commands"),
             }
         }
     }
 
     shared.accepting.store(false, Ordering::Release);
-    for worker_tx in worker_txs {
-        let _ = worker_tx.send(WorkerCommand::Shutdown).await;
-    }
 }
 
 async fn fail_worker(inner: &mut WorkerSlot, reason: &str) {
@@ -999,6 +1980,8 @@ mod tests {
             worker: fixture(script),
             workers,
             queue_capacity,
+            max_requests: None,
+            max_worker_age: None,
         }))
     }
 
@@ -1042,7 +2025,6 @@ mod tests {
         let dispatcher = tokio::spawn(dispatcher_task(
             jobs_rx,
             idle_rx,
-            Vec::new(),
             shutdown_rx,
             Arc::clone(&pool.shared),
         ));
@@ -1065,6 +2047,74 @@ mod tests {
             pool.execute(request("GET", "/hello", "", Vec::new())).await,
             Err(PoolExecuteError::Unavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_channel_cannot_receive_a_job() {
+        let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
+            worker: PhpWorkerConfig {
+                executable: PathBuf::from("unused-php"),
+                script: PathBuf::from("unused-worker.php"),
+            },
+            workers: 1,
+            queue_capacity: 8,
+            max_requests: None,
+            max_worker_age: None,
+        }));
+        let (jobs_tx, jobs_rx) = mpsc::channel(1);
+        let (idle_tx, idle_rx) = mpsc::channel(2);
+        let (worker_tx, worker_rx) = mpsc::channel(1);
+        drop(worker_rx);
+        idle_tx
+            .send(IdleWorker {
+                slot: 0,
+                generation: 1,
+                mailbox: worker_tx,
+            })
+            .await
+            .unwrap();
+        drop(idle_tx);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        jobs_tx
+            .send(PhpJob {
+                request: request("GET", "/hello", "", Vec::new()),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        drop(jobs_tx);
+
+        dispatcher_task(jobs_rx, idle_rx, shutdown_rx, Arc::clone(&pool.shared)).await;
+        assert!(matches!(
+            response_rx.await.unwrap(),
+            Err(PoolJobError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn repeated_crashes_apply_backoff() {
+        let expected = [0, 100, 200, 400, 800, 1_600, 3_200, 5_000, 5_000, 5_000];
+        for (failures, milliseconds) in (1..=MAX_CONSECUTIVE_FAILURES).zip(expected) {
+            assert_eq!(backoff_delay(failures), Duration::from_millis(milliseconds));
+        }
+    }
+
+    #[test]
+    fn no_respawn_storm() {
+        assert_eq!(MAX_CONSECUTIVE_FAILURES, 10);
+        assert_eq!(backoff_delay(1), Duration::ZERO);
+        assert!(
+            (2..=MAX_CONSECUTIVE_FAILURES)
+                .map(backoff_delay)
+                .all(|delay| delay >= Duration::from_millis(100))
+        );
+        assert_eq!(backoff_delay(usize::MAX), Duration::from_secs(5));
+        assert_eq!(
+            replacement_delay(MAX_CONSECUTIVE_FAILURES),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(replacement_delay(MAX_CONSECUTIVE_FAILURES + 1), None);
     }
 
     #[test]

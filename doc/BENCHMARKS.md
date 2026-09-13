@@ -1180,3 +1180,44 @@ W8 C16-C32 was about 639-705 us (Hello) and 673-699 us (JSON). It did not appear
 uniformly at W4 C1-C4, and host variance remains material. This is an observation
 requiring later investigation, not evidence for a speculative dispatcher or
 channel rewrite in 0.2.0.
+
+## 0.3.0 Worker Lifecycle Regression Matrix
+
+The limited 0.3 regression run used the existing duration-controlled pool
+driver and the same Windows MSVC release/PHP 8.5.10 NTS environment as the
+accepted 0.2 corrective data. Each cell used three fresh Hamster/PHP process
+sets, 1,000 warm-up requests, at least 20,000 measured requests, at least eight
+measured seconds, and `queue_capacity = 128`. Both `max_requests` and
+`max_worker_age` were OFF. This is a steady-state lifecycle regression check,
+not a new scaling study.
+
+```powershell
+./benchmarks/php_worker_pool.ps1 -Runs 3 -Requests 20000 `
+  -WarmupRequests 1000 -MinimumSeconds 8 `
+  -WorkerCounts 1 -Concurrencies 1 -Workload all
+./benchmarks/php_worker_pool.ps1 -Runs 3 -Requests 20000 `
+  -WarmupRequests 1000 -MinimumSeconds 8 `
+  -WorkerCounts 4 -Concurrencies 16,32 -Workload all
+```
+
+| Workload | W/C | RPS min/med/max | P50 | P95 | P99 | SCPU | PCPU | CPU | SRAM | PRAM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Hello | 1/1 | 2,572/2,904/4,588 | .376 | .485 | .642 | 336.3 | 45.7 | 382.0 | 6.7 | 16.0 |
+| Hello | 4/16 | 9,945/10,314/15,815 | 1.515 | 2.267 | 2.951 | 579.5 | 67.4 | 646.9 | 8.5 | 63.9 |
+| Hello | 4/32 | 8,990/9,601/11,815 | 3.293 | 4.361 | 5.184 | 645.5 | 69.3 | 716.9 | 8.9 | 63.9 |
+| JSON | 1/1 | 3,434/3,526/3,950 | .251 | .452 | .605 | 299.1 | 45.4 | 344.5 | 6.7 | 16.0 |
+| JSON | 4/16 | 11,743/12,634/13,595 | 1.205 | 2.178 | 2.728 | 464.9 | 56.0 | 520.9 | 8.4 | 64.0 |
+| JSON | 4/32 | 11,508/11,911/12,675 | 2.828 | 3.996 | 4.756 | 510.9 | 61.4 | 575.5 | 8.7 | 64.0 |
+
+Latency columns are milliseconds; CPU columns are microseconds per request;
+RAM columns are MiB. Relative to the matching 0.2 cells, median RPS changed by
++34.3%, +0.8%, and +6.6% for Hello W1/C1, W4/C16, and W4/C32, and +42.3%,
++20.7%, and +52.2% for JSON. No cell crossed the release flag of more than 10%
+steady-state regression. The Hello W1/C1 and W4/C16 spreads remain wide, so
+the positive deltas are host observations, not claimed lifecycle performance
+improvements.
+
+Server CPU/request was 336 us (Hello) and 299 us (JSON) at W1/C1; 580/465 us
+at W4/C16; and 646/511 us at W4/C32. This limited matrix shows no new CPU
+regression attributable to dormant lifecycle management. It does not reopen
+the existing W4/W8 CPU investigation.
