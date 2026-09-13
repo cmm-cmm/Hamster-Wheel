@@ -117,6 +117,25 @@ later lifecycle milestone.
 
 ## Known Limitations and Roadmap
 
+### HTTP client cancellation can make the worker unavailable
+
+`PhpWorker::execute` runs inside the HTTP connection future and holds its guard
+across await points. If a client disconnects while a PHP transaction is in
+flight, that future is dropped after the REQUEST frame has been written but
+before the RESPONSE frame is consumed, so the protocol stream is left out of
+sync. The next request reads the previous response, the id check fails, and the
+worker is latched unavailable; with one worker and no respawn, every later PHP
+request returns 502 until the server restarts.
+
+This is an architectural property present since 0.1.0, not a 0.1.2 regression.
+It is deliberately not hotfixed: marking or killing the worker on cancellation
+would still let one disconnecting client remove the only worker. The fix is
+structural and belongs to the 0.2.0 worker pool, where a transaction runs inside
+a worker task whose lifetime is independent of the HTTP request. See
+`doc/research/WORKER_POOL_REVIEW.md`.
+
+### Other limitations
+
 The worker is a single serialized process with buffered messages, fixed timeout
 and size limits, simple stderr diagnostics, no health probe, no cancellation
 frame, no streaming, no respawn, and no state reset. It is a protocol/lifecycle
@@ -135,9 +154,17 @@ release suites with:
 cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- raw
 cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- variants
 cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- sync
+cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- stderr
 cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- timeline
 cargo bench --target x86_64-pc-windows-msvc --bench php_ipc --features profiling -- timeline_blocking
 ```
+
+Omitting `-- <suite>` runs every suite. Cargo appends its own `--bench` flag
+after anything passed behind `--`, so the suite is taken from the first
+positional argument rather than `argv[1]`; an unknown or second suite name
+fails with the accepted list. `cargo bench --no-run --features profiling` is the
+gate that actually links every bench: `cargo clippy --all-targets` only checks
+them and therefore cannot catch a linker error.
 
 ### Current Handoff Shape
 
@@ -193,6 +220,27 @@ behavior is the primary cause. Before any production edit, separately review a
 minimal `pipe.blocking` fixture change for shutdown/timeout implications and
 rerun every 0.1.0 failure and HTTP integration test plus the same benchmark.
 Do not begin a worker pool to hide this latency.
+
+## 0.1.2 Platform Verification Status
+
+| Target | Status |
+|---|---|
+| `x86_64-pc-windows-msvc` | VERIFIED |
+| `x86_64-unknown-linux-gnu` | COMPILE-CHECKED ONLY / NATIVE VERIFICATION DEFERRED |
+
+Windows is the fully verified target for 0.1.2: formatting, clippy, unit and
+integration tests, the PHP worker integration tests, the release build, the
+benchmark link gate, PHP fixture lint, and a production regression run all pass
+on it.
+
+The non-Windows `cfg` paths type-check: `cargo check` and `cargo clippy` for
+`x86_64-unknown-linux-gnu` were run as cross-target commands from the Windows
+host and pass. That is not native verification. No native Linux linker, test
+run, benchmark, or PHP worker execution has happened, and a cross-target check
+must not be reported as one. Linux native qualification is a deferred platform
+gate to be run when a Linux CI job or host exists; it is not a defect in 0.1.2
+and does not block the milestone. This milestone therefore claims a verified
+Windows target, not Linux support.
 
 ## 0.1.2 Production Blocking Pipe
 
