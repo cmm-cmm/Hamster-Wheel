@@ -1,7 +1,5 @@
 use std::{
-    ffi::c_void,
     io::{self, Read, Write},
-    mem::MaybeUninit,
     path::PathBuf,
     process::{Command as StdCommand, Stdio},
     time::Instant,
@@ -14,27 +12,47 @@ use hyper::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Lines},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    task::JoinHandle,
     time::{Duration, timeout},
 };
 
 const TRIALS: usize = 3;
+const SUITES: &str = "all, raw, variants, blocking, sync, stderr, timeline, timeline_blocking";
+const ECHO_CHILD_FLAG: &str = "--rust-echo-child";
+const STDERR_FLOOD_MODE: &str = "stderr_flood";
+/// Bytes the flood child writes to stderr before echoing. Far above the 64 KiB
+/// Windows pipe buffer, so an undrained parent deadlocks deterministically.
+const STDERR_FLOOD_BYTES: usize = 512 * 1024;
+/// Timeline sample windows. The steady-state and late windows are statistical
+/// boundaries from the 0.1.1 investigation and must not move silently.
+const TIMELINE_ITERATIONS: usize = 1_200;
+const TIMELINE_STEADY_START: usize = 99;
+const TIMELINE_LATE_START: usize = 999;
+const _: () = assert!(
+    TIMELINE_ITERATIONS > TIMELINE_LATE_START,
+    "timeline iterations must exceed the late-window start or the windows are empty"
+);
 const RAW_SIZES: [usize; 7] = [0, 16, 128, 1024, 16 * 1024, 64 * 1024, 1024 * 1024];
 const FRAME_LIMIT: usize = 2 * 1024 * 1024;
 const PIPE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let mut arguments = std::env::args();
-    let _program = arguments.next();
-    let suite = arguments.next().unwrap_or_else(|| "all".to_owned());
-    if suite == "--rust-echo-child" {
-        let mode = arguments.next().unwrap_or_else(|| "default".to_owned());
-        return rust_echo_child(&mode);
-    }
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let suite = match parse_invocation(&arguments) {
+        Ok(Invocation::EchoChild(mode)) => return rust_echo_child(&mode),
+        Ok(Invocation::Suite(suite)) => suite,
+        Err(message) => return Err(io::Error::new(io::ErrorKind::InvalidInput, message)),
+    };
 
     let paths = FixturePaths::discover()?;
     println!(
-        "IPC_CONFIG,trials={TRIALS},php={},echo={},timeline={}",
+        "IPC_CONFIG,trials={TRIALS},cpu_metric={},php={},echo={},timeline={}",
+        if cfg!(windows) {
+            "GetProcessTimes"
+        } else {
+            "unavailable"
+        },
         paths.php.display(),
         paths.echo.display(),
         paths.timeline.display()
@@ -45,23 +63,78 @@ async fn main() -> io::Result<()> {
             raw_payload_suite(&paths).await?;
             framing_and_buffering_suite(&paths).await?;
             synchronous_stdio_suite(&paths)?;
+            stderr_drain_suite().await?;
             timeline_suite(&paths, "default").await?;
             timeline_suite(&paths, "pipe_blocking").await?;
         }
         "raw" => raw_payload_suite(&paths).await?,
+        "stderr" => stderr_drain_suite().await?,
         "variants" => framing_and_buffering_suite(&paths).await?,
         "blocking" => blocking_pipe_suite(&paths).await?,
         "sync" => synchronous_stdio_suite(&paths)?,
         "timeline" => timeline_suite(&paths, "default").await?,
         "timeline_blocking" => timeline_suite(&paths, "pipe_blocking").await?,
-        _ => {
+        unknown => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "suite must be one of: all, raw, variants, blocking, sync, timeline, timeline_blocking",
+                format!("unknown suite {unknown:?}; expected one of: {SUITES}"),
             ));
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+const PHP_RELATIVE_PATH: &str = "php/8.5/php.exe";
+#[cfg(not(windows))]
+const PHP_RELATIVE_PATH: &str = "php/8.5/php";
+
+fn spawn_stderr_drain(mut stderr: ChildStderr) -> JoinHandle<io::Result<String>> {
+    tokio::spawn(async move {
+        let mut diagnostic = String::new();
+        stderr.read_to_string(&mut diagnostic).await?;
+        Ok(diagnostic)
+    })
+}
+
+async fn join_stderr_drain(task: JoinHandle<io::Result<String>>) -> io::Result<String> {
+    task.await.map_err(io::Error::other)?
+}
+
+enum Invocation {
+    EchoChild(String),
+    Suite(String),
+}
+
+/// Cargo appends its own `--bench` flag (and libtest may add more) after any
+/// arguments passed behind `--`, so the suite is the first positional value
+/// rather than `argv[1]`. No arguments at all means the full suite.
+fn parse_invocation(arguments: &[String]) -> Result<Invocation, String> {
+    if arguments
+        .first()
+        .is_some_and(|first| first == ECHO_CHILD_FLAG)
+    {
+        let mode = arguments
+            .iter()
+            .skip(1)
+            .find(|argument| !argument.starts_with('-'))
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
+        return Ok(Invocation::EchoChild(mode));
+    }
+    let mut positional = arguments
+        .iter()
+        .filter(|argument| !argument.starts_with('-'));
+    let suite = positional
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "all".to_owned());
+    if let Some(extra) = positional.next() {
+        return Err(format!(
+            "expected at most one suite name, but also received {extra:?}; suites are: {SUITES}"
+        ));
+    }
+    Ok(Invocation::Suite(suite))
 }
 
 struct FixturePaths {
@@ -74,7 +147,7 @@ impl FixturePaths {
     fn discover() -> io::Result<Self> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let paths = Self {
-            php: root.join("php/8.5/php.exe"),
+            php: root.join(PHP_RELATIVE_PATH),
             echo: root.join("fixtures/php-worker/ipc_echo.php"),
             timeline: root.join("fixtures/php-worker/ipc_timeline.php"),
         };
@@ -174,7 +247,9 @@ struct AsyncPeer {
     child: Child,
     writer: AsyncWriter,
     stdout: ChildStdout,
-    stderr: ChildStderr,
+    /// Drained concurrently with the child's lifetime. Reading stderr only
+    /// after `wait()` deadlocks as soon as the child fills the pipe buffer.
+    stderr: JoinHandle<io::Result<String>>,
     pid: u32,
     write_mode: ParentWriteMode,
 }
@@ -210,10 +285,12 @@ impl AsyncPeer {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("stdout unavailable"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("stderr unavailable"))?;
+        let stderr = spawn_stderr_drain(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| io::Error::other("stderr unavailable"))?,
+        );
         let writer = match write_mode {
             ParentWriteMode::Buffered => AsyncWriter::Buffered(BufWriter::new(stdin)),
             ParentWriteMode::Split | ParentWriteMode::Contiguous => AsyncWriter::Direct(stdin),
@@ -254,15 +331,28 @@ impl AsyncPeer {
             mut child,
             mut writer,
             stdout,
-            mut stderr,
+            stderr,
             ..
         } = self;
         writer.shutdown().await?;
         drop(writer);
         drop(stdout);
-        let status = timeout(PIPE_TIMEOUT, child.wait()).await??;
-        let mut diagnostic = String::new();
-        stderr.read_to_string(&mut diagnostic).await?;
+        let status = match timeout(PIPE_TIMEOUT, child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                child.start_kill()?;
+                let killed = child.wait().await?;
+                let diagnostic = join_stderr_drain(stderr).await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "echo child did not exit within {} ms and was killed ({killed}): {diagnostic}",
+                        PIPE_TIMEOUT.as_millis()
+                    ),
+                ));
+            }
+        };
+        let diagnostic = join_stderr_drain(stderr).await?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "echo child exited with {status}: {diagnostic}"
@@ -270,6 +360,38 @@ impl AsyncPeer {
         }
         Ok(diagnostic)
     }
+}
+
+/// Deterministic regression for the stderr lifecycle: the child writes far more
+/// than a pipe buffer before echoing, so a parent that drained stderr only after
+/// `wait()` would block here instead of completing.
+async fn stderr_drain_suite() -> io::Result<()> {
+    let mut peer = AsyncPeer::spawn(
+        PeerKind::Rust {
+            response_mode: STDERR_FLOOD_MODE,
+        },
+        ParentWriteMode::Split,
+    )
+    .await?;
+    let payload = payload(128);
+    for _ in 0..10 {
+        peer.round_trip(&payload).await?;
+    }
+    let diagnostic = peer.finish().await?;
+    if diagnostic.len() != STDERR_FLOOD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected {STDERR_FLOOD_BYTES} stderr bytes, received {}",
+                diagnostic.len()
+            ),
+        ));
+    }
+    println!(
+        "IPC_STDERR,peer=rust,mode={STDERR_FLOOD_MODE},flood_bytes={STDERR_FLOOD_BYTES},received_bytes={},round_trips=10,status=drained",
+        diagnostic.len()
+    );
+    Ok(())
 }
 
 async fn raw_payload_suite(paths: &FixturePaths) -> io::Result<()> {
@@ -358,8 +480,8 @@ async fn run_async_raw_case(
             latencies.push(peer.round_trip(&payload).await?);
         }
         let wall = wall_start.elapsed().as_secs_f64();
-        let parent_cpu = process_cpu_seconds(std::process::id())? - parent_cpu_start;
-        let child_cpu = process_cpu_seconds(peer.pid)? - child_cpu_start;
+        let parent_cpu = cpu_delta(parent_cpu_start, process_cpu_seconds(std::process::id())?);
+        let child_cpu = cpu_delta(child_cpu_start, process_cpu_seconds(peer.pid)?);
         let result = RawTrial::new(latencies, wall, parent_cpu, child_cpu);
         print_raw(
             "IPC_RAW_RUN",
@@ -394,21 +516,26 @@ struct RawTrial {
     stats: LatencyStats,
     wall_seconds: f64,
     rps: f64,
-    parent_cpu_us: f64,
-    child_cpu_us: f64,
-    combined_cpu_us: f64,
+    parent_cpu_us: CpuSeconds,
+    child_cpu_us: CpuSeconds,
+    combined_cpu_us: CpuSeconds,
 }
 
 impl RawTrial {
-    fn new(latencies: Vec<Duration>, wall_seconds: f64, parent_cpu: f64, child_cpu: f64) -> Self {
+    fn new(
+        latencies: Vec<Duration>,
+        wall_seconds: f64,
+        parent_cpu: CpuSeconds,
+        child_cpu: CpuSeconds,
+    ) -> Self {
         let operations = latencies.len() as f64;
         Self {
             stats: LatencyStats::new(&latencies),
             wall_seconds,
             rps: operations / wall_seconds,
-            parent_cpu_us: parent_cpu * 1_000_000.0 / operations,
-            child_cpu_us: child_cpu * 1_000_000.0 / operations,
-            combined_cpu_us: (parent_cpu + child_cpu) * 1_000_000.0 / operations,
+            parent_cpu_us: cpu_per_operation(parent_cpu, operations),
+            child_cpu_us: cpu_per_operation(child_cpu, operations),
+            combined_cpu_us: cpu_per_operation(cpu_sum(parent_cpu, child_cpu), operations),
         }
     }
 
@@ -417,9 +544,9 @@ impl RawTrial {
             stats: LatencyStats::field_median(trials.iter().map(|trial| &trial.stats)),
             wall_seconds: median(trials.iter().map(|trial| trial.wall_seconds).collect()),
             rps: median(trials.iter().map(|trial| trial.rps).collect()),
-            parent_cpu_us: median(trials.iter().map(|trial| trial.parent_cpu_us).collect()),
-            child_cpu_us: median(trials.iter().map(|trial| trial.child_cpu_us).collect()),
-            combined_cpu_us: median(trials.iter().map(|trial| trial.combined_cpu_us).collect()),
+            parent_cpu_us: median_cpu(trials.iter().map(|trial| trial.parent_cpu_us).collect()),
+            child_cpu_us: median_cpu(trials.iter().map(|trial| trial.child_cpu_us).collect()),
+            combined_cpu_us: median_cpu(trials.iter().map(|trial| trial.combined_cpu_us).collect()),
         }
     }
 }
@@ -433,7 +560,7 @@ fn print_raw(
     trial: &RawTrial,
 ) {
     println!(
-        "{prefix},peer={peer},parent_write={},payload_bytes={payload},run={run},rps={:.3},wall_s={:.6},p50_us={:.3},p95_us={:.3},p99_us={:.3},min_us={:.3},max_us={:.3},quantum_pct={:.3},parent_cpu_us={:.3},child_cpu_us={:.3},combined_cpu_us={:.3}",
+        "{prefix},peer={peer},parent_write={},payload_bytes={payload},run={run},rps={:.3},wall_s={:.6},p50_us={:.3},p95_us={:.3},p99_us={:.3},min_us={:.3},max_us={:.3},quantum_pct={:.3},parent_cpu_us={},child_cpu_us={},combined_cpu_us={}",
         mode.name(),
         trial.rps,
         trial.wall_seconds,
@@ -443,9 +570,9 @@ fn print_raw(
         trial.stats.min_us,
         trial.stats.max_us,
         trial.stats.quantum_pct,
-        trial.parent_cpu_us,
-        trial.child_cpu_us,
-        trial.combined_cpu_us
+        format_cpu(trial.parent_cpu_us),
+        format_cpu(trial.child_cpu_us),
+        format_cpu(trial.combined_cpu_us)
     );
 }
 
@@ -469,6 +596,18 @@ fn synchronous_stdio_suite(paths: &FixturePaths) -> io::Result<()> {
                 .spawn()?
         };
         let pid = child.id();
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("sync stderr unavailable"))?;
+        // Same lifecycle rule as the async peers: a blocking child that fills
+        // its stderr pipe never reaches exit, so drain it alongside the run.
+        let stderr_drain = std::thread::spawn(move || {
+            let mut diagnostic = String::new();
+            io::BufReader::new(stderr)
+                .read_to_string(&mut diagnostic)
+                .map(|_| diagnostic)
+        });
         let mut stdin = child
             .stdin
             .take()
@@ -501,8 +640,8 @@ fn synchronous_stdio_suite(paths: &FixturePaths) -> io::Result<()> {
             let result = RawTrial::new(
                 latencies,
                 wall,
-                process_cpu_seconds(std::process::id())? - parent_start,
-                process_cpu_seconds(pid)? - child_start,
+                cpu_delta(parent_start, process_cpu_seconds(std::process::id())?),
+                cpu_delta(child_start, process_cpu_seconds(pid)?),
             );
             print_raw(
                 "IPC_SYNC_RUN",
@@ -524,9 +663,12 @@ fn synchronous_stdio_suite(paths: &FixturePaths) -> io::Result<()> {
         );
         drop(stdin);
         let status = child.wait()?;
+        let diagnostic = stderr_drain
+            .join()
+            .map_err(|_| io::Error::other("sync stderr drain panicked"))??;
         if !status.success() {
             return Err(io::Error::other(format!(
-                "sync {peer} child exited with {status}"
+                "sync {peer} child exited with {status}: {diagnostic}"
             )));
         }
     }
@@ -554,7 +696,7 @@ fn sync_round_trip(
 
 async fn timeline_suite(paths: &FixturePaths, mode: &str) -> io::Result<()> {
     let mut peer = TimelinePeer::spawn(paths, mode).await?;
-    let iterations = 1_200;
+    let iterations = TIMELINE_ITERATIONS;
     let mut trials = Vec::new();
     for run in 1..=TRIALS {
         let parent_start = process_cpu_seconds(std::process::id())?;
@@ -566,10 +708,10 @@ async fn timeline_suite(paths: &FixturePaths, mode: &str) -> io::Result<()> {
                     .await?,
             );
         }
-        let parent_cpu = process_cpu_seconds(std::process::id())? - parent_start;
-        let child_cpu = process_cpu_seconds(peer.pid)? - child_start;
-        print_timeline_run(mode, run, &samples, parent_cpu, child_cpu);
-        trials.push(TimelineTrial::new(&samples, parent_cpu, child_cpu));
+        let parent_cpu = cpu_delta(parent_start, process_cpu_seconds(std::process::id())?);
+        let child_cpu = cpu_delta(child_start, process_cpu_seconds(peer.pid)?);
+        print_timeline_run(mode, run, &samples, parent_cpu, child_cpu)?;
+        trials.push(TimelineTrial::new(&samples, parent_cpu, child_cpu)?);
     }
     print_timeline_median(mode, &trials);
     peer.finish().await?;
@@ -664,6 +806,11 @@ impl TimelinePeer {
             ));
         }
         self.stdin.shutdown().await?;
+        // Drain whatever the fixture still has queued before waiting, so a
+        // trailing diagnostic burst cannot block the child from exiting.
+        while let Some(line) = timeout(PIPE_TIMEOUT, self.stderr_lines.next_line()).await?? {
+            let _ = line;
+        }
         let status = self.child.wait().await?;
         if !status.success() {
             return Err(io::Error::other(format!(
@@ -693,23 +840,35 @@ struct TimelineTrial {
     two_to_ten: LatencyStats,
     hundred_to_999: LatencyStats,
     thousand_plus: LatencyStats,
-    parent_cpu_us: f64,
-    child_cpu_us: f64,
+    parent_cpu_us: CpuSeconds,
+    child_cpu_us: CpuSeconds,
 }
 
 impl TimelineTrial {
-    fn new(samples: &[TimelineSample], parent_cpu: f64, child_cpu: f64) -> Self {
-        let steady = &samples[99..];
+    fn new(
+        samples: &[TimelineSample],
+        parent_cpu: CpuSeconds,
+        child_cpu: CpuSeconds,
+    ) -> io::Result<Self> {
+        if samples.len() <= TIMELINE_LATE_START {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "timeline needs more than {TIMELINE_LATE_START} samples for its published windows, got {}",
+                    samples.len()
+                ),
+            ));
+        }
         let operations = samples.len() as f64;
-        Self {
-            stages: timeline_stage_medians(steady),
+        Ok(Self {
+            stages: timeline_stage_medians(&samples[TIMELINE_STEADY_START..]),
             first: timeline_latency(&samples[..1]),
             two_to_ten: timeline_latency(&samples[1..10]),
-            hundred_to_999: timeline_latency(&samples[99..999]),
-            thousand_plus: timeline_latency(&samples[999..]),
-            parent_cpu_us: parent_cpu * 1_000_000.0 / operations,
-            child_cpu_us: child_cpu * 1_000_000.0 / operations,
-        }
+            hundred_to_999: timeline_latency(&samples[TIMELINE_STEADY_START..TIMELINE_LATE_START]),
+            thousand_plus: timeline_latency(&samples[TIMELINE_LATE_START..]),
+            parent_cpu_us: cpu_per_operation(parent_cpu, operations),
+            child_cpu_us: cpu_per_operation(child_cpu, operations),
+        })
     }
 }
 
@@ -717,11 +876,12 @@ fn print_timeline_run(
     mode: &str,
     run: usize,
     samples: &[TimelineSample],
-    parent_cpu: f64,
-    child_cpu: f64,
-) {
-    let trial = TimelineTrial::new(samples, parent_cpu, child_cpu);
+    parent_cpu: CpuSeconds,
+    child_cpu: CpuSeconds,
+) -> io::Result<()> {
+    let trial = TimelineTrial::new(samples, parent_cpu, child_cpu)?;
     print_timeline("IPC_TIMELINE_RUN", mode, &run.to_string(), &trial);
+    Ok(())
 }
 
 fn print_timeline_median(mode: &str, trials: &[TimelineTrial]) {
@@ -746,8 +906,8 @@ fn print_timeline_median(mode: &str, trials: &[TimelineTrial]) {
         two_to_ten: stats(|v| &v.two_to_ten),
         hundred_to_999: stats(|v| &v.hundred_to_999),
         thousand_plus: stats(|v| &v.thousand_plus),
-        parent_cpu_us: field(|v| v.parent_cpu_us),
-        child_cpu_us: field(|v| v.child_cpu_us),
+        parent_cpu_us: median_cpu(trials.iter().map(|v| v.parent_cpu_us).collect()),
+        child_cpu_us: median_cpu(trials.iter().map(|v| v.child_cpu_us).collect()),
     };
     print_timeline("IPC_TIMELINE_MEDIAN", mode, "median", &median_trial);
 }
@@ -755,7 +915,7 @@ fn print_timeline_median(mode: &str, trials: &[TimelineTrial]) {
 fn print_timeline(prefix: &str, mode: &str, run: &str, trial: &TimelineTrial) {
     let s = trial.stages;
     println!(
-        "{prefix},mode={mode},run={run},rust_encode_us={:.3},rust_write_us={:.3},combined_transfer_wait_us={:.3},php_decode_us={:.3},php_handler_us={:.3},php_encode_us={:.3},php_write_us={:.3},rust_decode_us={:.3},total_p50_us={:.3},parent_cpu_us={:.3},child_cpu_us={:.3},combined_cpu_us={:.3}",
+        "{prefix},mode={mode},run={run},rust_encode_us={:.3},rust_write_us={:.3},combined_transfer_wait_us={:.3},php_decode_us={:.3},php_handler_us={:.3},php_encode_us={:.3},php_write_us={:.3},rust_decode_us={:.3},total_p50_us={:.3},parent_cpu_us={},child_cpu_us={},combined_cpu_us={}",
         s.rust_encode_us,
         s.rust_write_us,
         s.combined_transfer_wait_us,
@@ -765,9 +925,9 @@ fn print_timeline(prefix: &str, mode: &str, run: &str, trial: &TimelineTrial) {
         s.php_write_us,
         s.rust_decode_us,
         s.total_us,
-        trial.parent_cpu_us,
-        trial.child_cpu_us,
-        trial.parent_cpu_us + trial.child_cpu_us
+        format_cpu(trial.parent_cpu_us),
+        format_cpu(trial.child_cpu_us),
+        format_cpu(cpu_sum(trial.parent_cpu_us, trial.child_cpu_us))
     );
     for (window, stats) in [
         ("first", &trial.first),
@@ -1049,6 +1209,18 @@ fn rust_echo_child(response_mode: &str) -> io::Result<()> {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     write_sync_frame(&mut stdout, b"READY", "default")?;
+    if response_mode == STDERR_FLOOD_MODE {
+        let block = vec![b'x'; 8 * 1024];
+        let mut stderr = io::stderr().lock();
+        let mut written = 0;
+        while written < STDERR_FLOOD_BYTES {
+            let remaining = STDERR_FLOOD_BYTES - written;
+            let chunk = remaining.min(block.len());
+            stderr.write_all(&block[..chunk])?;
+            written += chunk;
+        }
+        stderr.flush()?;
+    }
     while let Ok(payload) = read_sync_frame(&mut stdin) {
         write_sync_frame(&mut stdout, &payload, response_mode)?;
     }
@@ -1092,52 +1264,101 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
-#[repr(C)]
-struct FileTime {
-    low: u32,
-    high: u32,
+/// Process CPU accounting. `None` means the platform has no implementation, and
+/// must be reported as `unavailable`: a zero would read as measured idle CPU.
+type CpuSeconds = Option<f64>;
+
+fn cpu_delta(start: CpuSeconds, end: CpuSeconds) -> CpuSeconds {
+    match (start, end) {
+        (Some(start), Some(end)) => Some(end - start),
+        _ => None,
+    }
 }
 
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
-    fn CloseHandle(handle: *mut c_void) -> i32;
-    fn GetProcessTimes(
-        handle: *mut c_void,
-        creation: *mut FileTime,
-        exit: *mut FileTime,
-        kernel: *mut FileTime,
-        user: *mut FileTime,
-    ) -> i32;
+fn cpu_per_operation(delta: CpuSeconds, operations: f64) -> CpuSeconds {
+    delta.map(|seconds| seconds * 1_000_000.0 / operations)
 }
 
-fn process_cpu_seconds(pid: u32) -> io::Result<f64> {
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
+fn cpu_sum(left: CpuSeconds, right: CpuSeconds) -> CpuSeconds {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        _ => None,
     }
-    let mut creation = MaybeUninit::uninit();
-    let mut exit = MaybeUninit::uninit();
-    let mut kernel = MaybeUninit::uninit();
-    let mut user = MaybeUninit::uninit();
-    let success = unsafe {
-        GetProcessTimes(
-            handle,
-            creation.as_mut_ptr(),
-            exit.as_mut_ptr(),
-            kernel.as_mut_ptr(),
-            user.as_mut_ptr(),
-        )
-    };
-    unsafe {
-        CloseHandle(handle);
+}
+
+fn median_cpu(values: Vec<CpuSeconds>) -> CpuSeconds {
+    let samples: Vec<f64> = values.into_iter().flatten().collect();
+    if samples.is_empty() {
+        return None;
     }
-    if success == 0 {
-        return Err(io::Error::last_os_error());
+    Some(median(samples))
+}
+
+fn format_cpu(value: CpuSeconds) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.3}"))
+}
+
+#[cfg(windows)]
+use windows_cpu::process_cpu_seconds;
+
+#[cfg(windows)]
+mod windows_cpu {
+    use std::{ffi::c_void, io, mem::MaybeUninit};
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
     }
-    let (kernel, user) = unsafe { (kernel.assume_init(), user.assume_init()) };
-    let ticks = ((u64::from(kernel.high) << 32) | u64::from(kernel.low))
-        + ((u64::from(user.high) << 32) | u64::from(user.low));
-    Ok(ticks as f64 / 10_000_000.0)
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetProcessTimes(
+            handle: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    pub fn process_cpu_seconds(pid: u32) -> io::Result<super::CpuSeconds> {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut creation = MaybeUninit::uninit();
+        let mut exit = MaybeUninit::uninit();
+        let mut kernel = MaybeUninit::uninit();
+        let mut user = MaybeUninit::uninit();
+        let success = unsafe {
+            GetProcessTimes(
+                handle,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (kernel, user) = unsafe { (kernel.assume_init(), user.assume_init()) };
+        let ticks = ((u64::from(kernel.high) << 32) | u64::from(kernel.low))
+            + ((u64::from(user.high) << 32) | u64::from(user.low));
+        Ok(Some(ticks as f64 / 10_000_000.0))
+    }
+}
+
+#[cfg(not(windows))]
+/// No portable per-process CPU accounting is available without a new
+/// dependency, so this platform reports the metric as unavailable.
+fn process_cpu_seconds(_pid: u32) -> io::Result<CpuSeconds> {
+    Ok(None)
 }

@@ -877,3 +877,73 @@ There is no silent polling fallback.
 The measured bottleneck is fixed without a protocol or architecture redesign.
 The evidence supports proceeding to a separate 0.2.0 worker-pool design; this
 milestone does not implement it.
+
+## 0.1.2 Review/Maintenance Correction
+
+This section records a corrective-maintenance pass over the 0.1.2 test and
+benchmark tooling. It is **not** a new benchmark baseline: no measurement in any
+earlier section was rerun, reinterpreted, or replaced, and no production code
+path, protocol, timeout, or methodology changed. Benchmark numbers published
+above remain the record for their milestones.
+
+### Corrections
+
+- `SERVER_NAME` now derives from `CARGO_PKG_VERSION` instead of repeating the
+  version as a literal, and the static-file test asserts against that constant.
+  The 0.1.2 version bump had left `tests/static_files.rs` asserting
+  `HamsterWheel/0.1.0`, so `cargo test` failed on the branch.
+- `benches/php_ipc.rs` drains child stderr concurrently with the child's
+  lifetime in the async peers, the synchronous suite, and the timeline peer.
+  Reading stderr only after `wait()` deadlocks once a child fills the pipe
+  buffer. A child that does not exit within the pipe timeout is now killed and
+  reaped, and its diagnostics are still reported.
+- The Windows `GetProcessTimes` CPU accounting moved behind `cfg(windows)`. Other
+  platforms report `cpu_metric=unavailable` and print `unavailable` for each CPU
+  field rather than a zero that would read as measured idle CPU. No dependency
+  was added to obtain a portable metric.
+- The suite argument is read from the first positional argument, because Cargo
+  appends its own `--bench` flag; running the bench with no suite now selects
+  `all` as documented.
+- Timeline sample windows derive from named constants with an explicit minimum
+  sample check, replacing hard-coded `99`/`999` slices that depended silently on
+  `iterations = 1200`. The window boundaries themselves are unchanged.
+
+### Verification
+
+`cargo fmt --all -- --check`, `cargo clippy --target x86_64-pc-windows-msvc
+--all-targets --all-features -- -D warnings`, `cargo test --target
+x86_64-pc-windows-msvc` (42 passed), `cargo test -- --ignored` (11 PHP worker
+tests passed), `cargo build --release --target x86_64-pc-windows-msvc`, and
+`cargo bench --no-run --features profiling` (links all six benches) all pass.
+
+The new `stderr` suite is a deterministic regression rather than a timing
+measurement: the child writes 512 KiB to stderr — far beyond the 64 KiB Windows
+pipe buffer — before echoing, then completes ten round trips.
+
+```text
+IPC_STDERR,peer=rust,mode=stderr_flood,flood_bytes=524288,received_bytes=524288,round_trips=10,status=drained
+```
+
+A production spot check on the release binary returned `200` for static and PHP
+routes, `404` for `/api` and unknown hosts, `403` for traversal, and `413` above
+the 1 MiB body limit. Across 60 sequential `/php` requests no sample fell in the
+14.6-16.6 ms band, so the blocking-pipe path is intact; these latencies include
+per-request client process startup and are not comparable to the load-driver
+results above. Shutdown left no orphan `php.exe`.
+
+### Platform Status and Acceptance
+
+Windows `x86_64-pc-windows-msvc` is VERIFIED for 0.1.2. Cross-target
+`cargo check` and `cargo clippy` for `x86_64-unknown-linux-gnu` pass from the
+Windows host, so the non-Windows `cfg` paths type-check, but no native Linux
+link, test, or benchmark run exists. Linux is therefore COMPILE-CHECKED ONLY
+with native verification deferred to a future CI job or Linux host.
+
+0.1.2 is accepted for the verified Windows target. Linux native verification
+remains a deferred platform qualification task and is not treated as an open
+defect in this milestone.
+
+A one-run production spot check after the corrections reported
+`quantum_pct=0.0` for the simple, PHP Hello, and PHP JSON scenarios at 3,000
+requests each. It confirms the blocking-pipe path is intact and is explicitly
+not a replacement for the 0.1.2 baselines recorded above.

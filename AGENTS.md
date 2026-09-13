@@ -2,32 +2,83 @@
 
 ## Project Structure & Module Organization
 
-This repository is in the planning phase. Architecture and milestones live in `Doc/HAMSTER_WHEEL_SERVER_PLAN.md`. The planned Phase 0 layout is one Rust package with `Cargo.toml` and `src/{main,server,config}.rs`. Keep it small until a subsystem has a concrete reason to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`). Put integration tests in `tests/`, unit tests beside their modules, and benchmarks in `benches/`.
+Hamster Wheel is one Rust package (`hamster-wheel`, edition 2024, currently 0.1.2). Architecture and
+milestones live in `doc/HAMSTER_WHEEL_SERVER_PLAN.md`; each shipped milestone also has a behavior
+document in `doc/` (`ROUTING.md`, `CONFIGURATION.md`, `PHP_WORKER.md`, `BENCHMARKS.md`,
+`WINDOWS_STATIC_PROFILING.md`).
+
+`src/` holds `main.rs`, `lib.rs`, and the runtime modules `server`, `config`, `router`, `handler`,
+`static_files`, `php_worker`, and `php_protocol`. The `*_profile.rs` modules plus `profiling.rs` are
+`#[cfg(feature = "profiling")]` measurement code and must not affect the default build. Integration
+tests live in `tests/`, unit tests beside their modules, Cargo benches in `benches/`, PowerShell load
+drivers and their configs in `benchmarks/`, PHP worker fixtures in `fixtures/php-worker/`, and the
+static document root in `public/`. Keep it a single package until a subsystem has a concrete reason
+to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`).
+
+`php/` is deliberately git-ignored. A locally supplied PHP 8.5 NTS distribution must exist at
+`php/8.5/php.exe` before the checked-in `hamster.toml`, the PHP benchmarks, or the ignored PHP
+integration tests can run.
 
 ## Build, Test, and Development Commands
 
-There is no Cargo project yet, so these commands become applicable after Phase 0 is scaffolded:
-
-- `cargo run` starts the development server (the baseline target is `127.0.0.1:8080`).
-- `cargo build --release` creates the only build suitable for performance comparisons.
-- `cargo test` runs unit and integration tests.
+- `cargo run` starts the development server with the built-in config (`127.0.0.1:8080`).
+- `cargo run -- --config hamster.toml` starts it from an explicit configuration file.
+- `cargo build --release --target x86_64-pc-windows-msvc` creates the only build suitable for
+  performance comparisons.
+- `cargo test` runs unit and integration tests; `cargo test -- --ignored` adds the PHP worker tests.
+- `cargo test --test static_files` or `cargo test rejects_path_traversal` runs one file or one test.
 - `cargo fmt --all -- --check` verifies standard Rust formatting.
 - `cargo clippy --all-targets --all-features -- -D warnings` rejects lint warnings.
+- `cargo bench --target x86_64-pc-windows-msvc --bench <name> --features profiling -- <suite>` runs a
+  profiling bench. Benches use `harness = false` and require the `profiling` feature; `php_ipc`
+  accepts `all|raw|variants|blocking|sync|timeline|timeline_blocking` and `windows_filesystem`
+  accepts `all|handoff|backend|files|operations`. Omitting `-- <suite>` selects
+  `all`.
+- `cargo bench --no-run --features profiling` is the gate that links every bench;
+  `cargo clippy --all-targets` only checks them and misses linker errors.
+- `./benchmarks/static_http.ps1` and `./benchmarks/php_worker*.ps1` are end-to-end .NET load drivers
+  that launch the release binary themselves, so build release first.
 
-Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and test conditions.
+Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and
+test conditions.
 
 ## Coding Style & Naming Conventions
 
-Use stable Rust and default `rustfmt` formatting. Name modules, functions, and files in `snake_case`; types and traits in `UpperCamelCase`; constants in `SCREAMING_SNAKE_CASE`. Keep the request hot path measurable: avoid synchronous logging, unnecessary allocation, global locks, and runtime configuration parsing. Add dependencies and abstractions only for an active milestone. Document non-obvious choices with an ADR or research note.
+Use stable Rust and default `rustfmt` formatting. Name modules, functions, and files in
+`snake_case`; types and traits in `UpperCamelCase`; constants in `SCREAMING_SNAKE_CASE`. Keep the
+request hot path measurable: avoid synchronous logging, unnecessary allocation, global locks, and
+runtime configuration parsing. Configuration is parsed, validated, and compiled once into an
+immutable `RuntimeConfig`; request handling uses only the already-compiled router and handler graph.
+Add dependencies and abstractions only for an active milestone. Document non-obvious choices with an
+ADR or research note, and update the relevant `doc/` file in the same change.
 
 ## Testing Guidelines
 
-Use Rust's built-in test harness unless another framework is formally adopted. Name tests by behavior, such as `rejects_path_traversal`. Cover malformed HTTP, path normalization, configuration validation, graceful shutdown, worker state isolation, timeouts, and crash recovery. Bug fixes need a regression test; performance changes need comparable release benchmarks.
+Use Rust's built-in test harness unless another framework is formally adopted. Name tests by
+behavior, such as `rejects_path_traversal`. Cover malformed HTTP, path normalization, configuration
+validation, graceful shutdown, worker state isolation, timeouts, and crash recovery. Tests that need
+the local PHP distribution are marked `#[ignore]` with a reason. Bug fixes need a regression test;
+performance changes need comparable release benchmarks.
+
+## Benchmarking & Measurement
+
+`doc/BENCHMARKS.md` is an append-only record: earlier milestone results are immutable and must not be
+rewritten or reinterpreted to flatter a later comparison. Report medians of at least three runs from
+a release build, and state the machine, concurrency, request count, and warm-up used. PHP worker
+latency samples clustered near the Windows 15.625 ms timer quantum indicate the blocking-pipe path in
+`fixtures/php-worker/worker.php` regressed; treat that as a release blocker rather than noise.
 
 ## Commit & Pull Request Guidelines
 
-No Git history is present, so no existing commit convention can be inferred. Use short, imperative subjects, optionally scoped, such as `http: reject invalid host headers`. Keep commits focused. Pull requests should explain the problem and approach, list verification commands, link relevant issues or ADRs, and include benchmark evidence for hot-path changes. Add screenshots only for manager/UI changes, and call out platform-specific behavior on Windows or Linux.
+Use short, imperative subjects, optionally scoped, such as `http: reject invalid host headers`. Keep
+commits focused. Pull requests should explain the problem and approach, list verification commands,
+link relevant issues or ADRs, and include benchmark evidence for hot-path changes. Add screenshots
+only for manager/UI changes, and call out platform-specific behavior on Windows or Linux.
 
 ## Security & Configuration
 
-Never commit certificates, private keys, `.env` files, or local `hamster.toml` secrets. Treat path traversal prevention, request limits, invalid hosts, safe TLS defaults, and worker isolation as correctness requirements rather than optional hardening.
+Never commit certificates, private keys, `.env` files, local `hamster.toml` secrets, PHP binaries, or
+ETW traces. Treat path traversal prevention, per-request target canonicalization and root
+containment, request limits, invalid hosts, safe TLS defaults, and worker isolation as correctness
+requirements rather than optional hardening. The PHP worker is spawned directly with a trusted
+executable and script path, never through a shell and never resolved from `PATH`.
