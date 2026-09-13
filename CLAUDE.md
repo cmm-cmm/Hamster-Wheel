@@ -8,8 +8,9 @@ the long-form roadmap and is written in Vietnamese.
 ## What this is
 
 Hamster Wheel is a Rust HTTP server (hyper 1 + Tokio, edition 2024) built milestone by milestone.
-Current version is 0.1.2. It serves static files, routes by host/location, loads configuration from
-TOML, and runs one persistent PHP CLI worker over a custom binary stdio protocol. Windows
+Current version is 0.2.0 (Fixed PHP Worker Pool + Cancellation Safety), accepted on the Windows
+target. It serves static files, routes by host/location, loads configuration from TOML, and runs a
+fixed pool of persistent PHP CLI workers over a custom binary stdio protocol. Windows
 (`x86_64-pc-windows-msvc`) is the primary development and measurement platform.
 
 ## Commands
@@ -50,6 +51,7 @@ themselves, so build release first:
 ./benchmarks/php_worker.ps1 -Runs 3 -Requests 20000 -WarmupRequests 100
 ./benchmarks/php_worker_concurrency.ps1
 ./benchmarks/php_worker_soak.ps1 -Requests 100000
+./benchmarks/php_worker_pool.ps1 -Runs 3 -Requests 20000 -WarmupRequests 1000 -MinimumSeconds 8
 ```
 
 `php/` is git-ignored. Supply a PHP 8.5 NTS distribution at `php/8.5/php.exe` before using
@@ -66,9 +68,9 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
 - `main.rs` parses argv (`config::parse_arguments`), loads config, calls `server::run`.
 - `config.rs` is a three-stage pipeline: `RawConfig` (serde/TOML, `deny_unknown_fields`) ->
   `ValidatedConfig` (all validation, error messages carry host/location indices) -> `RuntimeConfig`
-  (canonicalized paths, compiled routers, started PHP workers). Nothing downstream re-reads TOML or
-  resolves paths. Relative paths resolve against the config file's directory, not the CWD; the
-  built-in config (no CLI args) resolves against the startup CWD.
+  (canonicalized paths, compiled routers, started PHP worker pools). Nothing downstream re-reads
+  TOML or resolves paths. Relative paths resolve against the config file's directory, not the CWD;
+  the built-in config (no CLI args) resolves against the startup CWD.
 - `router.rs` holds `HostRouter` (small `Vec<VirtualHost>`, exact ASCII-case-insensitive Host match,
   port ignored) and `LocationRouter` (prefixes normalized and sorted by descending length once,
   linear longest-prefix scan on segment boundaries, `/` is the catch-all). Missing/invalid/duplicate
@@ -78,26 +80,44 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
   (append `index.html` for a directory) -> canonicalize -> `starts_with(root)` containment ->
   metadata -> read. HEAD deliberately skips the body read. Per-request canonicalization is what
   rejects symlink/junction escapes; do not remove it for speed.
-- `php_worker.rs` + `php_protocol.rs`: one `php.exe` child spawned directly (no shell, no FastCGI),
-  stdio carries only frames, stderr is drained separately. `STARTING -> BOOTSTRAPPING -> READY ->
-  BUSY -> READY`. A single Tokio `Mutex` is held across the whole write-request/read-response
-  transaction, so concurrent HTTP requests serialize. Any I/O, protocol, request-ID mismatch, or
-  timeout marks the worker `Unavailable` and kills it; subsequent requests get 502. No respawn, no
-  pool, no state reset in this milestone. Timeouts: 5 s startup, 5 s request, 2 s shutdown.
+- `php_worker.rs` + `php_protocol.rs`: a fixed pool of `php.exe` children spawned directly (no shell,
+  no FastCGI), stdio carries only frames, stderr is drained per child. Each worker moves through
+  `STARTING -> BOOTSTRAPPING -> READY -> BUSY -> READY`. The pool topology is a bounded FIFO job
+  queue (`queue_capacity`, 1-128, default `min(workers * 8, 128)`) -> one dispatcher task -> N
+  dedicated worker tasks, each with a capacity-1 mailbox. A worker task exclusively owns one
+  `PhpWorker` and therefore its child, stdin, stdout, and request-ID sequence for the task's whole
+  lifetime; there is no `Arc<Mutex<PhpWorker>>` and no global PHP execution lock. HTTP tasks only
+  `try_send` a job and await a `oneshot`: a full queue or a closed pool is a controlled 503, never a
+  wait.
+- Transaction ownership is cancellation-safe and this is a correctness requirement, not a
+  refinement. Once a REQUEST frame starts, the owning worker task always consumes the RESPONSE (or
+  fails the worker), so a disconnected HTTP client can never desynchronize the protocol stream. A job
+  whose receiver is already gone is skipped before execution begins; a job is re-dispatched only when
+  the mailbox send proves PHP never started, so a possibly-started request is never retried. Any I/O,
+  protocol, request-ID mismatch, or timeout marks that worker `Unavailable`, kills it, and ends its
+  task; surviving workers keep serving in degraded mode and their callers still get responses. Only
+  worker tasks hold `idle_tx`, so the last worker's exit closes `idle_rx`, and that closure is the
+  zero-healthy-worker signal: held and queued jobs are resolved with 503 instead of hanging. Startup
+  is all-or-nothing. No respawn, no adaptive sizing, no state reset in this milestone. Timeouts: 5 s
+  startup, 5 s request, 2 s shutdown.
+- `queue_capacity` bounds admitted job count, not bytes. Request bodies are buffered before pool
+  admission, so a full queue can retain roughly 128 MiB at the 1 MiB body limit. A total-byte
+  admission budget and body streaming are deferred, not implemented.
 - Wire format is version 1: `[u32 BE length][payload]`, first payload byte is the kind
   (READY/REQUEST/RESPONSE/SHUTDOWN/SHUTDOWN_ACK). Limits: 8 MiB frame, 1 MiB request body,
   128 headers. Body over the limit -> 413 without touching the worker. Worker-supplied
   hop-by-hop headers, `Content-Length`, or `Server` are rejected -> 502. Changing framing means
   changing `php_protocol.rs` and `fixtures/php-worker/protocol.php` together.
-- `server.rs` owns the accept loop and graceful shutdown: Ctrl+C stops accepts, a `watch` channel
-  tells live connections to `graceful_shutdown`, then workers are shut down (SHUTDOWN /
-  SHUTDOWN_ACK, then kill on timeout; `kill_on_drop` is the orphan fallback).
+- `server.rs` owns the accept loop and graceful shutdown: worker pools start before the listener
+  binds, Ctrl+C stops accepts, a `watch` channel tells live connections to `graceful_shutdown`, then
+  the pools are shut down (stop admission, drain already-accepted jobs, SHUTDOWN / SHUTDOWN_ACK,
+  then kill on timeout, reap, join; `kill_on_drop` is the orphan fallback).
 - `*_profile.rs` modules and `profiling.rs` are `#[cfg(feature = "profiling")]` only and exist to
   feed `benches/`. They must never affect the default build's hot path.
 
 ## Working rules specific to this repo
 
-- Platform status for 0.1.2: Windows `x86_64-pc-windows-msvc` is verified; Linux is compile-checked
+- Platform status for 0.2.0: Windows `x86_64-pc-windows-msvc` is verified; Linux is compile-checked
   only (cross-target `cargo check`/`clippy` from Windows) with native verification deferred. Do not
   describe Linux as supported, and do not report a cross-target check as a native run.
 - Every milestone's behavior, measurements, and explicitly rejected alternatives are written down in

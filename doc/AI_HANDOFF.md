@@ -2,30 +2,40 @@
 
 ## Current Milestone
 
-0.2.0 — Fixed PHP Worker Pool + Cancellation Safety.
+0.2.0 — Fixed PHP Worker Pool + Cancellation Safety. Reviewed and accepted;
+closed for technical change.
 
-Do not start 0.3.0 work. Automatic respawn, adaptive sizing, recycle, health
-polling/backoff, protocol changes, Laravel lifecycle, FastCGI, TLS, HTTP/2, and
-static-file optimization are outside the current scope.
+The next milestone is 0.3.0 — Worker Lifecycle & Recovery. Do not start 0.3.0
+work until it is explicitly opened. Automatic respawn, adaptive sizing, recycle,
+health polling/backoff, protocol changes, Laravel lifecycle, FastCGI, TLS,
+HTTP/2, and static-file optimization remain outside the current scope.
 
 ## Current Status
 
-The implementation and corrective pass are present as uncommitted changes on
-`dev`. The branch is three documentation/maintenance commits ahead of
-`origin/dev`. Do not commit, push, merge, or discard existing changes without
-an explicit request.
+0.2.0 FINAL REVIEW: **ACCEPTED**. Blocking findings: **NONE**.
 
-Claude's adversarial-review findings are being corrected. The queue envelope,
-benchmark methodology, Ctrl+C environment detection, pool-soak wording,
-dispatcher abnormal-exit propagation, and poisoned PID-lock drop path have been
-addressed in code or documentation. The long-duration benchmark matrix is
-complete; final quality gates remain to be completed.
+The implementation and the corrective pass are committed on `dev` at `c9810bc`,
+which matches `origin/dev`. This milestone-close documentation pass is the only
+uncommitted work in the tree. Do not commit, push, merge, tag, or discard
+changes without an explicit request.
+
+Every adversarial-review finding was verified as fixed against the code rather
+than against the report: the queue envelope (`MAX_QUEUE_CAPACITY = 128`, default
+`min(workers * 8, 128)`, validated and tested), benchmark methodology and
+variance wording, Ctrl+C console detection, pool-soak wording, the dispatcher
+RAII availability guard, the non-panicking `WorkerPidGuard::drop`, and the
+documented `queue_capacity = 128` benchmark driver. The long-duration benchmark
+matrix and all Windows quality gates are complete.
 
 ## Verified Platform
 
 The accepted native platform is Windows `x86_64-pc-windows-msvc` with the local
-PHP 8.5 NTS executable at `php/8.5/php.exe`. Linux has not been natively
-qualified. Do not report cross-target checking as native Linux verification.
+PHP 8.5 NTS executable at `php/8.5/php.exe`. Windows native gates: **PASS**.
+
+Linux: **NOT NATIVE VERIFIED**. It is compile-checked only, via cross-target
+`cargo check`/`clippy` from Windows. That is not LINUX VERIFIED, not LINUX
+SUPPORTED, and not NATIVE LINUX TESTED. Do not upgrade the claim, and do not
+report cross-target checking as a native run.
 
 ## Architecture Summary
 
@@ -92,15 +102,39 @@ The 100,000-request direct `pool.execute()` test is a PHP worker pool-level
 correctness soak, not an end-to-end HTTP benchmark. It did not sample working
 set start/end and makes no memory-stability claim.
 
+## Quality Gates at Milestone Close
+
+Re-run independently during the final review, all on `x86_64-pc-windows-msvc`,
+all passing: `cargo fmt --all -- --check`; Clippy with all targets, all
+features, and warnings denied; the normal test suite (44 tests:
+21 library, 14 configuration, 4 routing, 5 static); the ignored PHP suite (24
+tests: 8 PHP-worker unit, 16 PHP HTTP/process); the release build; and
+`cargo bench --no-run --features profiling`, which linked eight bench
+executables. Ctrl+C had an attached console and ran the real signal/reap
+assertion rather than skipping. All nine PHP worker fixtures passed `php -l`,
+and no orphan `php.exe` or `hamster-wheel` process remained afterwards.
+
+No Linux verification was performed. See Verified Platform above.
+
+## Backlog
+
+Deferred work, none of which blocks 0.2.0:
+
+- HTTP body byte-budget admission and body streaming.
+- W4/W8 server CPU/request investigation at C16-C32.
+- W1 benchmark re-measurement on a quieter host; the current same-methodology
+  batches disagree too much to state a pool-overhead percentage.
+- Native Linux qualification.
+- 0.3.0 worker lifecycle and recovery: respawn, replacement, backoff, recycling,
+  adaptive sizing.
+- Laravel persistent lifecycle.
+- Hamster Morph / Request-Graph JIT research, later.
+
 ## Next Action
 
-Current final gate result: `cargo fmt --all -- --check`, Windows-target Clippy
-with all targets/features and warnings denied, normal Windows tests, ignored PHP
-tests, Windows release build, and the profiling bench link gate all pass. The
-normal suite passed 21 library, 14 configuration, 4 routing, and 5 static tests.
-The ignored suite passed 8 PHP-worker unit tests and 16 PHP HTTP/process tests.
-Ctrl+C had an attached console and ran the real assertion rather than skipping.
-All nine PHP worker fixtures passed `php -l`, and no orphan `php.exe` remained.
+0.2.0 is closed for technical change. The next action is the project owner's
+decision to commit and tag the milestone-close documentation pass.
 
-The next action is final Claude review of the uncommitted 0.2.0 diff. Do not
-commit, push, merge, or begin 0.3.0 during that review.
+Do not reopen 0.2.0 for optimization, and do not begin 0.3.0 until it is
+explicitly opened. `doc/HAMSTER_MORPH_REQUEST_GRAPH_JIT.md` is untracked
+research for a later milestone and must stay out of the 0.2.0 commit and tag.

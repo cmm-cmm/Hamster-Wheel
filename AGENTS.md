@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Hamster Wheel is one Rust package (`hamster-wheel`, edition 2024, currently 0.1.2). Architecture and
+Hamster Wheel is one Rust package (`hamster-wheel`, edition 2024, currently 0.2.0). Architecture and
 milestones live in `doc/HAMSTER_WHEEL_SERVER_PLAN.md`; each shipped milestone also has a behavior
 document in `doc/` (`ROUTING.md`, `CONFIGURATION.md`, `PHP_WORKER.md`, `BENCHMARKS.md`,
 `WINDOWS_STATIC_PROFILING.md`).
