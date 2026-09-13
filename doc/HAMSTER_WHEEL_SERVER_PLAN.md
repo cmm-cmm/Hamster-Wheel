@@ -1198,26 +1198,37 @@ Basic request/response transport
 
 Đây là milestone chiến lược đầu tiên.
 
-### 0.2.0 - Worker Pool
+### 0.2.0 - Fixed Worker Pool + Cancellation Safety
 
 ``` text
-Multiple workers
-Queue
+Fixed-size worker pool
+Bounded queue + backpressure
 Scheduling
-Health
-Basic respawn
+Cancellation safety
+Unavailable tracking + degraded pool
+Startup all-or-nothing
+Graceful shutdown
 ```
+
+Respawn và health management nâng cao đã chuyển sang 0.3.0. Ở 0.2.0, worker
+lỗi chỉ được đánh dấu unavailable và pool tiếp tục phục vụ bằng các worker
+còn khỏe. Cancellation safety là yêu cầu bắt buộc của milestone này: HTTP
+client cancellation không được phép hủy một PHP transaction đã bắt đầu.
+Chi tiết thiết kế trong `doc/research/WORKER_POOL_REVIEW.md`.
 
 ### 0.3.0 - Worker Lifecycle
 
 ``` text
+Worker health management
+Automatic respawn
+Recycle policy
+Repeated-failure backoff
 Reset
 Drain
 Max requests
 Memory limit
 Timeout
 Crash recovery
-Respawn
 ```
 
 ### 0.4.0 - Laravel Worker Mode
@@ -1297,8 +1308,8 @@ Benchmark phải thực hiện sau từng milestone.
 0.0.3 Router
 0.0.4 Config
 0.1.0 Single PHP Worker
-0.2.0 Worker Pool
-0.3.0 Worker Lifecycle
+0.2.0 Fixed Worker Pool + Cancellation Safety
+0.3.0 Worker Lifecycle / Respawn / Recycle
 0.4.0 Laravel Worker
 ```
 
