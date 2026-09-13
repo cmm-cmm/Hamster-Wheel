@@ -947,3 +947,236 @@ A one-run production spot check after the corrections reported
 `quantum_pct=0.0` for the simple, PHP Hello, and PHP JSON scenarios at 3,000
 requests each. It confirms the blocking-pipe path is intact and is explicitly
 not a replacement for the 0.1.2 baselines recorded above.
+
+## 0.2.0 Fixed PHP Worker Pool
+
+### NON-COMPARABLE / INVESTIGATION DATA (superseded methodology)
+
+This section is additive and does not replace the immutable 0.1.2 results.
+Measurements used PHP 8.5.10 NTS, the MSVC release build, loopback HTTP/1.1,
+1,000 warm-up requests, 10,000 measured requests, and three fresh server/PHP
+process sets per cell. The pool config used `queue_capacity = 256`. Values are
+field medians. Individual measured runs were often only about one second, which
+is too short for stable Windows scheduling and process-CPU observations. These
+tables are retained as investigation data, not an accepted 0.2.0 baseline.
+The command below records the historical invocation; the driver has since been
+corrected to duration-controlled runs and `queue_capacity = 128`, so it no
+longer reproduces these exact cells.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+./benchmarks/php_worker_pool.ps1 -Runs 3 -Requests 10000 -WarmupRequests 1000
+```
+
+`SCPU`, `PCPU`, and `CPU` are Hamster, total PHP, and combined microseconds per
+request. `SRAM` and `PRAM` are Hamster and total PHP working set in MiB.
+Queue wait was not instrumented because the current driver cannot isolate it
+without adding hot-path timing solely for the benchmark.
+
+### PHP Hello
+
+| W | C | RPS | P50 | P95 | P99 | SCPU | PCPU | CPU | SRAM | PRAM |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 2,755 | .308 | .633 | .762 | 301.6 | 57.8 | 359.4 | 6.6 | 16.0 |
+| 1 | 2 | 3,750 | .518 | .885 | 1.083 | 404.7 | 67.2 | 473.4 | 6.7 | 16.0 |
+| 1 | 4 | 8,304 | .448 | .608 | 1.364 | 228.1 | 42.2 | 265.6 | 6.8 | 16.0 |
+| 1 | 8 | 8,541 | .901 | 1.076 | 2.259 | 215.6 | 29.7 | 242.2 | 6.9 | 16.0 |
+| 1 | 16 | 8,733 | 1.794 | 2.030 | 2.953 | 209.4 | 37.5 | 246.9 | 7.0 | 16.0 |
+| 1 | 32 | 8,603 | 3.616 | 4.045 | 5.223 | 204.7 | 26.6 | 223.4 | 7.3 | 16.0 |
+| 2 | 1 | 4,427 | .202 | .384 | .587 | 217.2 | 45.3 | 253.1 | 6.7 | 32.0 |
+| 2 | 2 | 8,797 | .211 | .367 | .531 | 182.8 | 35.9 | 218.8 | 6.9 | 32.0 |
+| 2 | 4 | 14,534 | .251 | .427 | .814 | 192.2 | 40.6 | 232.8 | 7.2 | 32.0 |
+| 2 | 8 | 15,598 | .487 | .664 | 1.253 | 200.0 | 42.2 | 243.8 | 7.4 | 32.0 |
+| 2 | 16 | 15,876 | .942 | 1.399 | 2.687 | 195.3 | 43.8 | 245.3 | 7.7 | 32.0 |
+| 2 | 32 | 15,521 | 1.893 | 2.731 | 6.407 | 214.1 | 37.5 | 253.1 | 8.3 | 32.0 |
+| 4 | 1 | 2,133 | .461 | .694 | .822 | 429.7 | 73.4 | 506.3 | 6.9 | 63.9 |
+| 4 | 2 | 10,763 | .181 | .234 | .276 | 170.3 | 37.5 | 207.8 | 7.1 | 63.9 |
+| 4 | 4 | 6,598 | .578 | .858 | 1.061 | 523.4 | 100.0 | 623.4 | 7.4 | 63.9 |
+| 4 | 8 | 8,961 | .845 | 1.391 | 1.767 | 604.7 | 90.6 | 681.3 | 7.8 | 63.9 |
+| 4 | 16 | 9,652 | 1.623 | 2.299 | 2.785 | 557.8 | 71.9 | 642.2 | 8.1 | 64.0 |
+| 4 | 32 | 9,079 | 3.443 | 4.580 | 5.627 | 595.3 | 68.8 | 657.8 | 9.0 | 63.9 |
+| 8 | 1 | 3,889 | .195 | .558 | .822 | 251.6 | 48.4 | 285.9 | 7.3 | 127.8 |
+| 8 | 2 | 2,496 | .822 | 1.278 | 1.651 | 584.4 | 112.5 | 681.3 | 7.5 | 127.8 |
+| 8 | 4 | 6,015 | .603 | .989 | 2.075 | 525.0 | 92.2 | 617.2 | 7.7 | 127.9 |
+| 8 | 8 | 4,127 | 1.632 | 3.947 | 6.295 | 960.9 | 125.0 | 1,085.9 | 8.3 | 127.8 |
+| 8 | 16 | 20,924 | .684 | 1.346 | 2.447 | 282.8 | 31.3 | 314.1 | 8.9 | 127.9 |
+| 8 | 32 | 9,505 | 2.643 | 8.013 | 13.266 | 670.3 | 67.2 | 740.6 | 9.5 | 127.9 |
+
+### PHP JSON
+
+| W | C | RPS | P50 | P95 | P99 | SCPU | PCPU | CPU | SRAM | PRAM |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 2,232 | .419 | .761 | .941 | 406.3 | 65.6 | 459.4 | 6.6 | 16.0 |
+| 1 | 2 | 3,885 | .504 | .893 | 1.159 | 409.4 | 56.3 | 465.6 | 6.7 | 16.0 |
+| 1 | 4 | 8,352 | .453 | .589 | 1.002 | 204.7 | 29.7 | 235.9 | 6.8 | 16.0 |
+| 1 | 8 | 8,717 | .897 | 1.031 | 1.542 | 212.5 | 31.3 | 243.8 | 6.9 | 16.0 |
+| 1 | 16 | 8,607 | 1.797 | 2.059 | 3.206 | 204.7 | 28.1 | 235.9 | 7.3 | 16.0 |
+| 1 | 32 | 8,573 | 3.624 | 4.090 | 6.514 | 221.9 | 32.8 | 251.6 | 7.5 | 16.0 |
+| 2 | 1 | 2,109 | .459 | .710 | .907 | 414.1 | 75.0 | 489.1 | 6.7 | 32.0 |
+| 2 | 2 | 8,856 | .210 | .342 | .529 | 184.4 | 39.1 | 212.5 | 6.9 | 32.0 |
+| 2 | 4 | 14,749 | .250 | .386 | .707 | 203.1 | 43.8 | 250.0 | 7.1 | 32.0 |
+| 2 | 8 | 15,389 | .481 | .676 | 1.556 | 204.7 | 51.6 | 254.7 | 7.3 | 32.0 |
+| 2 | 16 | 15,146 | .983 | 1.483 | 2.994 | 207.8 | 46.9 | 254.7 | 7.6 | 32.0 |
+| 2 | 32 | 15,501 | 1.919 | 2.681 | 5.786 | 190.6 | 40.6 | 231.3 | 8.0 | 32.0 |
+| 4 | 1 | 3,004 | .264 | .688 | .890 | 310.9 | 50.0 | 371.9 | 6.9 | 64.0 |
+| 4 | 2 | 4,435 | .435 | .610 | .782 | 396.9 | 84.4 | 471.9 | 7.1 | 64.0 |
+| 4 | 4 | 6,326 | .613 | .876 | 1.069 | 543.8 | 98.4 | 646.9 | 7.4 | 64.1 |
+| 4 | 8 | 9,378 | .808 | 1.322 | 1.663 | 545.3 | 84.4 | 653.1 | 7.8 | 64.0 |
+| 4 | 16 | 9,262 | 1.661 | 2.377 | 2.987 | 595.3 | 82.8 | 678.1 | 8.3 | 64.0 |
+| 4 | 32 | 8,696 | 3.621 | 4.759 | 5.536 | 620.3 | 67.2 | 692.2 | 8.7 | 64.1 |
+| 8 | 1 | 3,085 | .323 | .514 | .825 | 317.2 | 43.8 | 360.9 | 7.3 | 128.0 |
+| 8 | 2 | 4,302 | .312 | 1.017 | 1.248 | 317.2 | 79.7 | 396.9 | 7.5 | 128.0 |
+| 8 | 4 | 6,091 | .636 | .891 | 1.280 | 546.9 | 114.1 | 660.9 | 7.7 | 128.0 |
+| 8 | 8 | 9,379 | .775 | 1.457 | 1.960 | 550.0 | 51.6 | 601.6 | 8.3 | 128.0 |
+| 8 | 16 | 10,143 | 1.394 | 2.808 | 4.657 | 601.6 | 53.1 | 671.9 | 9.1 | 128.0 |
+| 8 | 32 | 19,934 | 1.379 | 3.158 | 6.150 | 312.5 | 34.4 | 334.4 | 9.3 | 128.0 |
+
+Latency columns are milliseconds. The best observed medians were 8,733/15,876/
+10,763/20,924 RPS for Hello and 8,717/15,501/9,378/19,934 for JSON at W1/W2/
+W4/W8. Relative to W1, peak throughput was 1.82x/1.23x/2.40x for Hello and
+1.78x/1.08x/2.29x for JSON, or about 91%/31%/30% and 89%/27%/29% per-worker
+efficiency. W2 scales well; W4 is anomalously slower than W2; W8 needs C16-C32
+to win. Several W8 cells varied by more than 4x between runs, so these are honest
+host results, not evidence of linear scaling. Saturation begins near C8-C16 for
+W1/W2, while larger pools are noisy enough that a stable saturation point cannot
+be claimed.
+
+### W1 comparison and soak
+
+The immutable 0.1.2 concurrency smoke used 2,000 requests and one long-lived
+process across its concurrency levels, while the investigation tables above
+used a different parallel driver, 10,000 requests, and fresh processes per
+cell. The earlier statement that W1 was materially slower at C1-C2 is withdrawn:
+those figures cannot establish a regression percentage. The 3,000-request C1
+spot check was also too short to replace the published 20,000-request 0.1.2
+methodology. The accepted apples-to-apples W1 comparison is recorded below
+after rerunning the 0.1.2 driver unchanged.
+
+A separate release PHP worker pool-level correctness soak called
+`pool.execute()` directly for 100,000 requests at W4/C32. It completed in
+6.91 s while preserving all four PIDs, bootstrap count one per PID, the exact
+aggregate request count, protocol synchronization, and clean reap. It is not an
+end-to-end HTTP throughput benchmark; its elapsed time and derived ~14.5k RPS
+must not be compared with HTTP benchmark cells. Working set was not sampled at
+the start and end, so this soak makes no memory-stability claim. A distinct
+external HTTP W4/C16 100,000-request run reported 11,917 RPS, P50/P95/P99
+1.124/2.648/3.518 ms, Hamster/PHP/combined CPU 443.6/45.5/489.1 us per request,
+and 8.6/64.0 MiB Hamster/total-PHP working set. Cancellation stress is a
+correctness test, not a throughput workload; 32 marker-synchronized disconnects
+left all four original workers healthy and serving.
+
+### Accepted corrective benchmark methodology
+
+The corrective run used the same PHP 8.5.10 NTS and Windows MSVC release target,
+loopback HTTP/1.1, 1,000 sequential warm-up requests, `queue_capacity = 128`,
+and three fresh Hamster/PHP process sets per cell. Each measured run continued
+for at least eight seconds and at least 20,000 requests. The matrix covered
+W1/W2/W4/W8, C1/C2/C4/C8/C16/C32, and Hello/JSON. Reproduce with:
+
+```powershell
+./benchmarks/php_worker_pool.ps1 -Runs 3 -Requests 20000 `
+  -WarmupRequests 1000 -MinimumSeconds 8
+```
+
+`RPS min/med/max` is the spread across three runs. Latencies are milliseconds;
+`SCPU`, `PCPU`, and `CPU` are median Hamster, total-PHP, and combined process
+microseconds per request. `SRAM` and `PRAM` are median working set MiB. Fields
+are medians independently and therefore need not sum exactly. The host still
+showed distinct slow/fast modes in some cells; the spread is part of the result.
+
+#### PHP Hello — accepted duration-controlled data
+
+| W | C | RPS min/med/max | P50 | P95 | P99 | SCPU | PCPU | CPU | SRAM | PRAM |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 2,060/2,162/2,280 | .452 | .665 | .848 | 403.1 | 62.5 | 468.8 | 6.7 | 16.0 |
+| 1 | 2 | 3,081/3,386/3,784 | .619 | .888 | 1.094 | 466.7 | 84.2 | 550.9 | 6.8 | 16.0 |
+| 1 | 4 | 4,040/4,817/4,850 | .598 | 1.482 | 1.873 | 341.1 | 62.0 | 403.1 | 6.9 | 16.0 |
+| 1 | 8 | 3,087/3,128/4,081 | 2.504 | 3.220 | 3.731 | 531.4 | 91.7 | 623.1 | 6.9 | 16.0 |
+| 1 | 16 | 2,510/3,484/4,532 | 4.914 | 6.727 | 7.484 | 457.1 | 85.1 | 542.3 | 7.3 | 16.0 |
+| 1 | 32 | 3,427/4,297/5,281 | 8.512 | 11.068 | 12.238 | 392.6 | 62.2 | 454.8 | 7.6 | 16.0 |
+| 2 | 1 | 2,342/2,445/3,430 | .386 | .613 | .823 | 352.3 | 49.2 | 401.6 | 6.7 | 31.9 |
+| 2 | 2 | 3,643/4,048/5,459 | .502 | .744 | .922 | 440.0 | 80.1 | 520.1 | 7.0 | 31.9 |
+| 2 | 4 | 8,759/8,849/9,144 | .340 | .805 | .980 | 324.9 | 73.5 | 398.3 | 7.3 | 32.0 |
+| 2 | 8 | 6,886/7,684/8,087 | 1.112 | 1.413 | 1.640 | 408.7 | 83.3 | 491.0 | 7.5 | 31.9 |
+| 2 | 16 | 9,889/10,866/11,097 | 1.435 | 1.691 | 1.820 | 285.4 | 57.9 | 339.5 | 7.8 | 31.9 |
+| 2 | 32 | 10,268/10,390/10,787 | 3.081 | 3.442 | 3.668 | 291.4 | 56.8 | 352.5 | 8.1 | 32.0 |
+| 4 | 1 | 3,418/3,463/3,483 | .289 | .364 | .410 | 243.1 | 40.6 | 280.9 | 6.9 | 63.9 |
+| 4 | 2 | 5,155/5,385/5,690 | .369 | .473 | .540 | 280.0 | 57.3 | 337.3 | 7.1 | 63.9 |
+| 4 | 4 | 7,661/9,617/10,199 | .392 | .583 | .778 | 341.4 | 64.6 | 406.0 | 7.5 | 63.9 |
+| 4 | 8 | 8,441/10,006/10,692 | .759 | 1.377 | 1.716 | 507.5 | 67.7 | 575.2 | 7.9 | 63.9 |
+| 4 | 16 | 9,975/10,228/10,522 | 1.500 | 2.615 | 3.175 | 527.0 | 51.6 | 579.2 | 8.4 | 64.0 |
+| 4 | 32 | 8,696/9,010/9,748 | 3.654 | 5.089 | 6.144 | 598.0 | 62.4 | 660.4 | 9.1 | 63.9 |
+| 8 | 1 | 1,806/2,216/3,016 | .417 | .902 | 1.157 | 421.1 | 84.4 | 505.5 | 7.4 | 127.9 |
+| 8 | 2 | 3,550/3,795/5,669 | .529 | .784 | .949 | 432.4 | 87.0 | 519.3 | 7.5 | 127.8 |
+| 8 | 4 | 6,301/6,398/6,407 | .606 | .868 | 1.086 | 529.2 | 98.2 | 627.4 | 7.7 | 127.9 |
+| 8 | 8 | 8,494/8,762/8,842 | .839 | 1.557 | 2.038 | 651.9 | 63.7 | 715.6 | 8.4 | 127.9 |
+| 8 | 16 | 8,946/10,100/11,285 | 1.449 | 2.935 | 3.982 | 638.9 | 50.2 | 690.5 | 9.3 | 127.8 |
+| 8 | 32 | 9,138/9,911/10,697 | 2.921 | 5.936 | 7.665 | 704.7 | 49.8 | 754.7 | 9.9 | 127.8 |
+
+#### PHP JSON — accepted duration-controlled data
+
+| W | C | RPS min/med/max | P50 | P95 | P99 | SCPU | PCPU | CPU | SRAM | PRAM |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 2,296/2,477/2,988 | .392 | .700 | .935 | 385.2 | 45.3 | 436.7 | 6.7 | 16.0 |
+| 1 | 2 | 4,888/4,936/4,993 | .299 | .758 | 1.002 | 328.6 | 60.5 | 386.5 | 6.8 | 16.0 |
+| 1 | 4 | 3,396/4,129/4,535 | 1.081 | 1.593 | 1.969 | 391.2 | 78.5 | 469.7 | 6.8 | 16.0 |
+| 1 | 8 | 3,896/4,751/4,863 | 1.216 | 3.079 | 3.638 | 343.7 | 60.0 | 403.7 | 7.0 | 16.0 |
+| 1 | 16 | 4,077/4,280/4,896 | 4.248 | 5.595 | 6.615 | 378.0 | 69.8 | 447.8 | 7.2 | 16.0 |
+| 1 | 32 | 3,392/4,109/4,867 | 8.800 | 11.005 | 12.191 | 410.7 | 62.2 | 472.9 | 7.6 | 16.0 |
+| 2 | 1 | 2,358/2,492/3,230 | .405 | .605 | .817 | 353.9 | 48.4 | 407.0 | 6.8 | 32.0 |
+| 2 | 2 | 5,969/5,971/6,178 | .250 | .653 | .822 | 291.1 | 60.4 | 348.1 | 7.1 | 32.0 |
+| 2 | 4 | 8,636/8,877/9,016 | .345 | .801 | .975 | 333.3 | 71.5 | 401.5 | 7.3 | 32.0 |
+| 2 | 8 | 7,915/8,526/9,049 | 1.048 | 1.435 | 1.659 | 368.8 | 76.7 | 445.5 | 7.5 | 32.0 |
+| 2 | 16 | 10,001/10,454/10,681 | 1.519 | 1.816 | 1.971 | 287.1 | 61.6 | 348.8 | 7.8 | 32.0 |
+| 2 | 32 | 10,263/10,553/11,147 | 3.015 | 3.482 | 3.748 | 297.9 | 58.7 | 357.1 | 8.3 | 32.0 |
+| 4 | 1 | 3,208/3,286/3,320 | .301 | .420 | .516 | 271.8 | 53.5 | 324.5 | 6.9 | 64.0 |
+| 4 | 2 | 4,973/5,030/6,163 | .388 | .508 | .616 | 328.8 | 69.9 | 398.7 | 7.2 | 64.0 |
+| 4 | 4 | 8,224/8,446/8,636 | .429 | .799 | 1.023 | 387.6 | 72.8 | 459.5 | 7.5 | 64.1 |
+| 4 | 8 | 8,682/10,620/10,951 | .682 | 1.365 | 1.760 | 485.9 | 59.8 | 545.7 | 7.8 | 64.0 |
+| 4 | 16 | 8,871/10,466/10,848 | 1.460 | 2.557 | 3.097 | 527.4 | 62.3 | 584.7 | 8.4 | 64.0 |
+| 4 | 32 | 6,221/7,825/11,502 | 4.042 | 5.338 | 6.171 | 724.4 | 65.1 | 789.5 | 8.9 | 64.0 |
+| 8 | 1 | 1,861/1,995/2,975 | .449 | .868 | 1.160 | 473.4 | 88.3 | 561.7 | 7.3 | 128.0 |
+| 8 | 2 | 4,257/5,149/5,892 | .289 | .699 | .876 | 339.1 | 73.2 | 412.3 | 7.5 | 128.1 |
+| 8 | 4 | 7,186/7,332/8,065 | .556 | .837 | 1.056 | 460.8 | 82.6 | 541.3 | 7.8 | 128.1 |
+| 8 | 8 | 8,871/10,539/10,772 | .673 | 1.476 | 1.997 | 501.4 | 51.1 | 551.6 | 8.4 | 128.0 |
+| 8 | 16 | 8,882/9,748/11,362 | 1.499 | 3.086 | 4.056 | 698.7 | 51.9 | 750.6 | 9.3 | 128.0 |
+| 8 | 32 | 9,420/10,011/10,187 | 2.823 | 6.419 | 8.553 | 672.7 | 47.7 | 720.4 | 9.9 | 128.0 |
+
+#### W1 apples-to-apples and scaling interpretation
+
+The unchanged 0.1.2 driver was run against 0.2.0 W1 with its published
+20,000-request, 100-warm-up, concurrency-one methodology. The first three-run
+batch produced Hello 3,406/5,129/5,300 RPS and JSON 2,086/3,002/5,293 RPS
+(min/median/max). A workload-isolated repeat produced Hello 1,984/2,009/3,408
+and JSON 2,171/2,402/2,410 RPS. Historical 0.1.2 medians were 7,004 and 7,204
+RPS respectively. Thus the same-methodology measurements do show lower W1
+throughput, but the two contemporary batches disagree substantially; they do
+not isolate a trustworthy pool-overhead percentage on this host. No 0.2.0
+performance improvement is claimed.
+
+Same-concurrency median RPS illustrates the measured scaling without mixing
+different load levels:
+
+| Workload | C | W1 | W2 | W4 | W8 |
+|---|---:|---:|---:|---:|---:|
+| Hello | 4 | 4,817 | 8,849 | 9,617 | 6,398 |
+| Hello | 16 | 3,484 | 10,866 | 10,228 | 10,100 |
+| Hello | 32 | 4,297 | 10,390 | 9,010 | 9,911 |
+| JSON | 4 | 4,129 | 8,877 | 8,446 | 7,332 |
+| JSON | 16 | 4,280 | 10,454 | 10,466 | 9,748 |
+| JSON | 32 | 4,109 | 10,553 | 7,825 | 10,011 |
+
+The best observed median configurations were W2/C16 at 10,866 RPS for Hello
+and W4/C8 at 10,620 RPS for JSON. Those are best configurations, not scaling
+efficiency claims. W2 supplied the major concurrency gain; W4 and W8 did not
+improve consistently at the same concurrency. Latency increased once
+concurrency exceeded useful parallelism, and PHP working set scaled at roughly
+16 MiB per worker.
+
+The earlier W4 Hamster CPU signal reproduced at higher concurrency: W4 C16 was
+about 527 us/request for both workloads versus about 285-287 us for W2 C16,
+with similar throughput. W4 C32 rose to 598 us (Hello) and 724 us (JSON), and
+W8 C16-C32 was about 639-705 us (Hello) and 673-699 us (JSON). It did not appear
+uniformly at W4 C1-C4, and host variance remains material. This is an observation
+requiring later investigation, not evidence for a speculative dispatcher or
+channel rewrite in 0.2.0.

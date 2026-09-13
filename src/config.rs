@@ -10,7 +10,10 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::php_worker::{PhpWorker, PhpWorkerConfig, PhpWorkerError, WorkerStart};
+use crate::php_worker::{
+    MAX_QUEUE_CAPACITY, MAX_WORKERS, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool,
+    PhpWorkerPoolConfig, WorkerStart,
+};
 use crate::router::{
     Handler, HostRouter, LocationRouter, RouterBuildError, VirtualHost, normalize_location,
     valid_hostname,
@@ -62,12 +65,19 @@ struct RawLocation {
 struct RawPhpWorker {
     executable: PathBuf,
     script: PathBuf,
+    #[serde(default = "default_php_workers")]
+    workers: usize,
+    queue_capacity: Option<usize>,
+}
+
+const fn default_php_workers() -> usize {
+    1
 }
 
 pub struct RuntimeConfig {
     listen: SocketAddr,
     router: Arc<HostRouter>,
-    php_workers: Vec<Arc<PhpWorker>>,
+    php_pools: Vec<Arc<PhpWorkerPool>>,
 }
 
 impl RuntimeConfig {
@@ -84,22 +94,22 @@ impl RuntimeConfig {
     }
 
     pub async fn start_workers(&self) -> Result<Vec<WorkerStart>, PhpWorkerError> {
-        let mut starts = Vec::with_capacity(self.php_workers.len());
-        for worker in &self.php_workers {
-            starts.push(worker.start().await?);
+        let mut starts = Vec::new();
+        for pool in &self.php_pools {
+            starts.extend(pool.start().await?);
         }
         Ok(starts)
     }
 
     pub async fn shutdown_workers(&self) -> Result<(), PhpWorkerError> {
-        for worker in &self.php_workers {
-            worker.shutdown().await?;
+        for pool in &self.php_pools {
+            pool.shutdown().await?;
         }
         Ok(())
     }
 
-    pub fn php_worker(&self) -> Option<&Arc<PhpWorker>> {
-        self.php_workers.first()
+    pub fn php_worker(&self) -> Option<&Arc<PhpWorkerPool>> {
+        self.php_pools.first()
     }
 }
 
@@ -292,6 +302,8 @@ enum ValidatedHandler {
     PhpWorker {
         executable: PathBuf,
         script: PathBuf,
+        workers: usize,
+        queue_capacity: usize,
     },
 }
 
@@ -425,15 +437,30 @@ pub(crate) fn validate_raw(
                             "{context}.php.script must not be empty"
                         )));
                     }
+                    if !(1..=MAX_WORKERS).contains(&php.workers) {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php.workers must be between 1 and {MAX_WORKERS}"
+                        )));
+                    }
+                    let queue_capacity = php
+                        .queue_capacity
+                        .unwrap_or_else(|| php.workers.saturating_mul(8).min(MAX_QUEUE_CAPACITY));
+                    if !(1..=MAX_QUEUE_CAPACITY).contains(&queue_capacity) {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php.queue_capacity must be between 1 and {MAX_QUEUE_CAPACITY}"
+                        )));
+                    }
                     php_worker_count += 1;
                     if php_worker_count > 1 {
                         return Err(ConfigError::Validation(format!(
-                            "{context}: milestone 0.1.0 permits exactly one php_worker location"
+                            "{context}: milestone 0.2.0 permits exactly one php_worker location"
                         )));
                     }
                     ValidatedHandler::PhpWorker {
                         executable: resolve_path(base_directory, php.executable),
                         script: resolve_path(base_directory, php.script),
+                        workers: php.workers,
+                        queue_capacity,
                     }
                 }
                 handler => {
@@ -499,7 +526,7 @@ fn register_hostname(
 
 pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeConfig, ConfigError> {
     let mut virtual_hosts = Vec::new();
-    let mut php_workers = Vec::new();
+    let mut php_pools = Vec::new();
     for (host_index, host) in validated.hosts.into_iter().enumerate() {
         let mut locations = Vec::with_capacity(host.locations.len());
         for (location_index, location) in host.locations.into_iter().enumerate() {
@@ -529,7 +556,12 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     Handler::static_files(Arc::new(canonical_root))
                 }
                 ValidatedHandler::NotFound => Handler::not_found(),
-                ValidatedHandler::PhpWorker { executable, script } => {
+                ValidatedHandler::PhpWorker {
+                    executable,
+                    script,
+                    workers,
+                    queue_capacity,
+                } => {
                     let executable = canonical_file(
                         &executable,
                         &format!(
@@ -544,9 +576,13 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                             host.name
                         ),
                     )?;
-                    let worker = Arc::new(PhpWorker::new(PhpWorkerConfig { executable, script }));
-                    php_workers.push(Arc::clone(&worker));
-                    Handler::php_worker(worker)
+                    let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
+                        worker: PhpWorkerConfig { executable, script },
+                        workers,
+                        queue_capacity,
+                    }));
+                    php_pools.push(Arc::clone(&pool));
+                    Handler::php_worker(pool)
                 }
             };
             locations.push((location.path, handler));
@@ -573,7 +609,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
     Ok(RuntimeConfig {
         listen: validated.listen,
         router: Arc::new(router),
-        php_workers,
+        php_pools,
     })
 }
 

@@ -1,6 +1,8 @@
 # 0.2.0 Fixed PHP Worker Pool + Cancellation Safety - Design Review
 
-Status: design review only. No production code was written for this document.
+Status: implemented for 0.2.0. The accepted design below remains the source of
+truth; implementation notes are recorded at the end without rewriting the
+review decisions.
 Baseline: 0.1.2, Windows-accepted (see the platform status in
 `doc/PHP_WORKER.md`).
 
@@ -661,3 +663,36 @@ changing the architecture.
 Acceptance for 0.2.0 must include Test 1 (the 1.1 regression test) and Test 6
 (the zero-healthy-worker test) passing, plus the cancellation stress soak in
 section 16.
+
+## 21. Implementation Notes
+
+The implementation follows the recommended actor topology: every mutable
+`PhpWorker` is moved into exactly one task, the bounded admission channel uses
+`try_send`, and HTTP tasks await only a response oneshot. The dispatcher owns
+`idle_rx` but no `idle_tx`; only worker tasks own idle senders, so the last
+worker exit closes the channel and resolves held, queued, and future requests
+with 503 instead of parking.
+
+The worker task checks a closed response sender before the first protocol write.
+After `PhpWorker::execute` begins, it always consumes a matching response or
+handles a genuine timeout/process/protocol failure, regardless of HTTP client
+cancellation. A failed oneshot send is normal and returns the worker to READY.
+No transaction is retried after worker ownership begins; only a mailbox send to
+an already-closed worker task is retried, which proves no request byte was
+written.
+
+Startup creates all children concurrently and exposes admission only after all
+READY frames validate. A partial failure shuts down every successful child.
+Shutdown explicitly closes admission, drains accepted jobs, queues SHUTDOWN
+behind in-flight work, validates SHUTDOWN_ACK, applies the existing timeout/kill
+fallback, and joins worker and dispatcher tasks. Automatic respawn, recycle,
+and backoff remain deferred to 0.3.0.
+
+The implementation caps `queue_capacity` at 128. This bounds admitted job
+count, not total request bytes: HTTP bodies are buffered before admission, so a
+full queue can retain about 128 MiB of payload and total request memory can be
+higher. A total-byte budget or body streaming requires separate design work and
+is not part of 0.2.0.
+
+The configuration backlog item about the old "milestone 0.1.0" error text is
+resolved; validation now reports the 0.2.0 one-pool rule.

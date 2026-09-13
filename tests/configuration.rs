@@ -341,6 +341,40 @@ fn compiles_one_php_worker_with_config_relative_files() {
         HandlerKind::PhpWorker
     );
     assert!(runtime.php_worker().is_some());
+    let pool = runtime.php_worker().unwrap();
+    assert_eq!(pool.worker_count(), 1);
+    assert_eq!(pool.queue_capacity(), 8);
+}
+
+#[test]
+fn validates_php_pool_worker_and_queue_bounds() {
+    let temporary = TestDirectory::new();
+    std::fs::write(temporary.path.join("php.exe"), "fixture executable").unwrap();
+    std::fs::write(temporary.path.join("worker.php"), "<?php").unwrap();
+    let base = "\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/php\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = \"php.exe\"\nscript = \"worker.php\"\n";
+
+    for field in [
+        "workers = 0",
+        "workers = 65",
+        "queue_capacity = 0",
+        "queue_capacity = 129",
+    ] {
+        let source = not_found_config(&format!("{base}{field}\n"));
+        assert!(matches!(
+            config::compile_str(&source, &temporary.path),
+            Err(ConfigError::Validation(_))
+        ));
+    }
+
+    let source = not_found_config(&format!("{base}workers = 4\nqueue_capacity = 32\n"));
+    let runtime = config::compile_str(&source, &temporary.path).unwrap();
+    let pool = runtime.php_worker().unwrap();
+    assert_eq!(pool.worker_count(), 4);
+    assert_eq!(pool.queue_capacity(), 32);
+
+    let source = not_found_config(&format!("{base}workers = 64\n"));
+    let runtime = config::compile_str(&source, &temporary.path).unwrap();
+    assert_eq!(runtime.php_worker().unwrap().queue_capacity(), 128);
 }
 
 #[test]

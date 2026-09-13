@@ -38,9 +38,18 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
     }
 
     parse_str($request['query'], $query);
-    if ($request['path'] === '/delay') {
+    if (isset($query['start_marker'])) {
+        file_put_contents((string) $query['start_marker'], (string) getmypid(), LOCK_EX);
+    }
+    if ($request['path'] === '/delay' || $request['path'] === '/state-delay' || $request['path'] === '/crash') {
         $milliseconds = min(10_000, max(0, (int) ($query['ms'] ?? 0)));
         usleep($milliseconds * 1000);
+    }
+    if (isset($query['done_marker'])) {
+        file_put_contents((string) $query['done_marker'], (string) getmypid(), LOCK_EX);
+    }
+    if ($request['path'] === '/crash') {
+        exit(42);
     }
 
     $response = [
@@ -52,6 +61,7 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
 
     switch ($request['path']) {
         case '/state':
+        case '/state-delay':
             $response['headers'] = [['content-type', 'application/json']];
             $response['body'] = json_encode([
                 'pid' => getmypid(),

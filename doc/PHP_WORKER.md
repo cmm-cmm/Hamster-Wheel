@@ -1,4 +1,82 @@
-# PHP Worker Prototype
+# PHP Worker Pool
+
+## 0.2.0 Architecture
+
+Milestone 0.2.0 replaces the HTTP-owned single-worker transaction with a fixed
+pool of actor-owned workers:
+
+```text
+HTTP task -> bounded jobs queue -> dispatcher -> per-worker mailbox
+                                             -> dedicated worker task
+                                             -> response oneshot
+```
+
+Each worker task exclusively owns one mutable `PhpWorker`, including its child,
+stdin/stdout, request IDs, protocol state, shutdown, kill, and reap operations.
+There is no global worker mutex and no task shares a process. One worker still
+executes at most one request at a time; concurrency comes only from multiple PHP
+processes. Protocol v1 and the 8 MiB frame, 1 MiB request body, and 128-header
+limits remain byte-for-byte unchanged.
+
+Admission uses bounded `mpsc::channel(queue_capacity)` and non-blocking
+`try_send`. A full or closed queue returns 503 immediately. Accepted jobs are
+paired FIFO with idle worker IDs. Only worker tasks hold `idle_tx`; therefore,
+when the last healthy worker exits, `idle_rx` closes and the dispatcher resolves
+its held job and every queued job with 503, closes admission, and exits without
+polling or a healthy-counter race. One worker failure leaves the pool serving in
+degraded mode; there is no respawn in 0.2.0.
+
+## Cancellation Safety
+
+The transaction lifetime is independent of the HTTP future. A queued job whose
+oneshot receiver has closed is skipped before assignment, and the worker checks
+again before writing. Once REQUEST writing begins, the worker task always reads
+and validates the complete RESPONSE or handles a genuine timeout, process, I/O,
+or protocol failure. Client disconnect is never a worker-health input. If the
+receiver disappears after assignment, response delivery fails harmlessly and a
+valid worker returns to READY.
+
+This structurally fixes the known 0.1.2 cancellation availability limitation;
+it does not treat cancellation as worker failure and does not retry a possibly
+started transaction.
+
+## Pool Configuration
+
+```toml
+[[hosts.locations]]
+path = "/php"
+handler = "php_worker"
+
+[hosts.locations.php]
+executable = "php/8.5/php.exe"
+script = "fixtures/php-worker/worker.php"
+workers = 4
+queue_capacity = 32
+```
+
+`workers` defaults to 1 and is validated in 1-64. `queue_capacity` defaults to
+`min(workers * 8, 128)` and is validated in 1-128. At most one PHP worker
+location is still permitted. The 128 hard maximum caps queued request payload
+at approximately 128 MiB when every admitted job carries the 1 MiB maximum,
+before request metadata and allocator overhead.
+
+This bounded queue limits the number of jobs admitted to the PHP pool; it is
+not complete memory backpressure for the HTTP server. HTTP bodies are buffered
+before `pool.execute()` attempts admission, and memory can also include the job
+held by the dispatcher, in-flight worker jobs, and concurrently buffering HTTP
+requests. Total-byte admission and body streaming remain backlog items outside
+0.2.0. Deployments should choose a lower `queue_capacity` for a tighter memory
+envelope.
+
+Startup is all-or-nothing: children start concurrently, all must validate READY,
+and admission is exposed only afterwards. Any partial failure shuts down every
+child that reached READY and kills/reaps failed handshakes. Explicit shutdown
+stops admission, drains accepted jobs, lets in-flight transactions finish, sends
+SHUTDOWN to healthy workers, validates SHUTDOWN_ACK, applies the two-second
+kill/reap fallback, and joins the worker and dispatcher tasks. Windows Ctrl+C
+uses the same coordinated shutdown path and has a process-level regression test.
+
+## 0.1.x Historical Architecture
 
 ## Architecture
 
@@ -117,7 +195,7 @@ later lifecycle milestone.
 
 ## Known Limitations and Roadmap
 
-### HTTP client cancellation can make the worker unavailable
+### 0.1.2 cancellation limitation (fixed in 0.2.0)
 
 `PhpWorker::execute` runs inside the HTTP connection future and holds its guard
 across await points. If a client disconnects while a PHP transaction is in
@@ -127,21 +205,20 @@ sync. The next request reads the previous response, the id check fails, and the
 worker is latched unavailable; with one worker and no respawn, every later PHP
 request returns 502 until the server restarts.
 
-This is an architectural property present since 0.1.0, not a 0.1.2 regression.
-It is deliberately not hotfixed: marking or killing the worker on cancellation
-would still let one disconnecting client remove the only worker. The fix is
-structural and belongs to the 0.2.0 worker pool, where a transaction runs inside
-a worker task whose lifetime is independent of the HTTP request. See
+This was an architectural property present since 0.1.0, not a 0.1.2 regression.
+It was deliberately not hotfixed because marking or killing the worker on
+cancellation would still let one disconnecting client remove the only worker.
+0.2.0 fixes it structurally: the transaction now runs inside a dedicated worker
+task whose lifetime is independent of the HTTP request. See
 `doc/research/WORKER_POOL_REVIEW.md`.
 
 ### Other limitations
 
-The worker is a single serialized process with buffered messages, fixed timeout
-and size limits, simple stderr diagnostics, no health probe, no cancellation
-frame, no streaming, no respawn, and no state reset. It is a protocol/lifecycle
-proof, not a throughput architecture or a claim against Node.js. Milestone 0.2.0
-may introduce a measured worker pool, queue policy, health and respawn behavior;
-FastCGI and Laravel integration remain separate later work.
+Workers still use buffered messages, fixed timeout and size limits, and simple
+stderr diagnostics. There is no health polling, cancellation frame, streaming,
+respawn, recycle, adaptive sizing, or state reset. Respawn and advanced health
+management remain deferred to 0.3.0; FastCGI and Laravel integration remain
+separate later work.
 
 ## 0.1.1 Windows IPC Investigation
 

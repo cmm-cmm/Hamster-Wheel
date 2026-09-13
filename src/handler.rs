@@ -8,7 +8,7 @@ use hyper::{
     header::{CONTENT_TYPE, HeaderValue, SERVER},
 };
 
-use crate::{config::SERVER_NAME, php_worker::PhpWorker, static_files};
+use crate::{config::SERVER_NAME, php_worker::PhpWorkerPool, static_files};
 
 pub(crate) type HandlerResponse = Response<Full<Bytes>>;
 
@@ -29,7 +29,7 @@ pub enum Handler {
         body: &'static str,
     },
     PhpWorker {
-        worker: Arc<PhpWorker>,
+        pool: Arc<PhpWorkerPool>,
     },
 }
 
@@ -46,8 +46,8 @@ impl Handler {
         Self::simple(StatusCode::NOT_FOUND, "Not Found")
     }
 
-    pub fn php_worker(worker: Arc<PhpWorker>) -> Self {
-        Self::PhpWorker { worker }
+    pub fn php_worker(pool: Arc<PhpWorkerPool>) -> Self {
+        Self::PhpWorker { pool }
     }
 
     pub const fn kind(&self) -> HandlerKind {
@@ -67,7 +67,7 @@ impl Handler {
                 static_files::serve(request, Arc::clone(document_root)).await
             }
             Self::Simple { status, body } => Ok(simple_response(*status, body)),
-            Self::PhpWorker { worker } => Ok(worker.serve_http(request).await),
+            Self::PhpWorker { pool } => Ok(pool.serve_http(request).await),
         }
     }
 

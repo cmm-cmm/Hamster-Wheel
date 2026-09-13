@@ -1200,6 +1200,9 @@ Basic request/response transport
 
 ### 0.2.0 - Fixed Worker Pool + Cancellation Safety
 
+Status: implemented on the current `dev` branch; Windows qualification and
+benchmark evidence are recorded in `doc/BENCHMARKS.md`.
+
 ``` text
 Fixed-size worker pool
 Bounded queue + backpressure
@@ -1215,6 +1218,11 @@ lỗi chỉ được đánh dấu unavailable và pool tiếp tục phục vụ 
 còn khỏe. Cancellation safety là yêu cầu bắt buộc của milestone này: HTTP
 client cancellation không được phép hủy một PHP transaction đã bắt đầu.
 Chi tiết thiết kế trong `doc/research/WORKER_POOL_REVIEW.md`.
+
+Giới hạn queue 0.2.0 chỉ bound số job đã được pool nhận; HTTP body vẫn được
+buffer trước admission nên đây chưa phải total-memory backpressure. Total-byte
+admission hoặc body streaming là backlog riêng, không được ghép vào lifecycle
+work của 0.3.0 nếu chưa có design review.
 
 ### 0.3.0 - Worker Lifecycle
 

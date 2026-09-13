@@ -16,6 +16,8 @@ handler = "php_worker"
 [hosts.locations.php]
 executable = "php/8.5/php.exe"
 script = "fixtures/php-worker/worker.php"
+workers = 4
+queue_capacity = 32
 
 [[hosts.locations]]
 path = "/"
