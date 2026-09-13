@@ -930,6 +930,35 @@ async fn graceful_recycle_after_max_age() {
 
 #[tokio::test]
 #[ignore = "requires repository php/8.5/php.exe"]
+async fn max_worker_age_recycles_a_pool_with_no_traffic() {
+    let server = TestServer::start_with_policy(1, 8, None, Some(1)).await;
+    let pool = server.runtime.php_worker().unwrap();
+    let initial = pool.snapshot().workers[0].generation;
+
+    // No request is ever sent. Before the dispatcher drained idle
+    // capabilities continuously, the pool published `workers * 2` tokens that
+    // nobody consumed, the next generation blocked inside its publish before
+    // arming its own age deadline, and recycling stopped at generation 3.
+    let recycled = wait_for_pool(pool, |snapshot| {
+        snapshot.workers[0].generation >= initial + 4
+    })
+    .await;
+    assert!(recycled.total_respawns >= 4);
+    assert_eq!(recycled.workers[0].spawn_reason, WorkerSpawnReason::MaxAge);
+    assert_eq!(recycled.workers[0].consecutive_failures, 0);
+
+    // Ageing must keep advancing rather than settling on a fixed generation.
+    // Serving after an age recycle is asserted by graceful_recycle_after_max_age;
+    // this pool recycles every second, so it has no stable window to request in.
+    wait_for_pool(pool, |snapshot| {
+        snapshot.workers[0].generation >= recycled.workers[0].generation + 2
+    })
+    .await;
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
 async fn voluntary_recycles_are_serialized_and_eventual() {
     let server = TestServer::start_with_policy(2, 8, Some(1), None).await;
     let pool = server.runtime.php_worker().unwrap();

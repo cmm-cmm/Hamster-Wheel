@@ -61,8 +61,7 @@ Unknown fields are errors.
 Both recycle policies are thresholds, not hard caps. Voluntary recycling holds
 one pool-wide permit, so a generation that reaches `max_requests` while another
 slot is recycling keeps serving and retries at its next transaction boundary.
-`max_worker_age` additionally does not advance on a pool with no traffic; see
-the known-defect section in `doc/PHP_WORKER.md`.
+See the recycling limitation in `doc/PHP_WORKER.md`.
 
 The queue bound limits the number of jobs admitted to the PHP pool, not total
 HTTP request memory. PHP request bodies are currently buffered before pool

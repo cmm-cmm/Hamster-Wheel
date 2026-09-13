@@ -8,7 +8,7 @@ the long-form roadmap and is written in Vietnamese.
 ## What this is
 
 Hamster Wheel is a Rust HTTP server (hyper 1 + Tokio, edition 2024) built milestone by milestone.
-Current version is 0.3.0 (PHP Worker Lifecycle), implemented on the Windows target. It serves
+Current version is 0.3.1 (PHP Worker Lifecycle), implemented on the Windows target. It serves
 static files, routes by host/location, loads configuration from TOML, and runs a fixed pool of
 persistent PHP CLI workers with automatic replacement over a custom binary stdio protocol. Windows
 (`x86_64-pc-windows-msvc`) is the primary development and measurement platform.
@@ -87,6 +87,9 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
   capacity-1 mailboxes -> exclusive worker tasks. `IdleWorker` carries slot, generation, and that
   generation's mailbox; the dispatcher has no lookup table. There is no `Arc<Mutex<PhpWorker>>` or
   global PHP execution lock. HTTP admission uses `try_send`; full or unavailable is controlled 503.
+  The dispatcher drains idle capabilities continuously, not only while it holds a job, and discards
+  closed mailboxes. Publishing a capability is a blocking send, so this is what keeps a pool with no
+  traffic from filling the idle channel and stalling `max_worker_age`; do not make it lazy again.
 - Transaction ownership is cancellation-safe and this is a correctness requirement, not a
   refinement. Once a REQUEST frame starts, the owning worker task always consumes the RESPONSE (or
   fails the worker), so a disconnected HTTP client can never desynchronize the protocol stream. A job
@@ -100,7 +103,7 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
   all-or-nothing. Backoff is per slot (immediate, then 100 ms doubling to 5 s), with retirement after
   more than 10 consecutive failures and stability reset after 60 s plus one success. Optional
   `max_requests` and `max_worker_age` recycle policies default OFF and use serialized
-  stop-then-spawn. No adaptive sizing, proactive idle probe, or application Reset exists in 0.3.0.
+  stop-then-spawn. No adaptive sizing, proactive idle probe, or application Reset exists in 0.3.1.
 - `queue_capacity` bounds admitted job count, not bytes. Request bodies are buffered before pool
   admission, so a full queue can retain roughly 128 MiB at the 1 MiB body limit. A total-byte
   admission budget and body streaming are deferred, not implemented.
@@ -118,7 +121,7 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
 
 ## Working rules specific to this repo
 
-- Platform status for 0.3.0: Windows `x86_64-pc-windows-msvc` is the verified target; Linux is compile-checked
+- Platform status for 0.3.1: Windows `x86_64-pc-windows-msvc` is the verified target; Linux is compile-checked
   only (cross-target `cargo check`/`clippy` from Windows) with native verification deferred. Do not
   describe Linux as supported, and do not report a cross-target check as a native run.
 - Every milestone's behavior, measurements, and explicitly rejected alternatives are written down in

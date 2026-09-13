@@ -30,29 +30,26 @@ one voluntary recycle across the pool. A recycling worker closes its mailbox,
 drains an already-buffered job, and does not publish another idle token.
 Planned recycle does not increment failure history.
 
-### Known 0.3.0 recycling defects
+The dispatcher drains idle capabilities continuously, not only while it holds
+a job, and discards capabilities whose generation has already closed its
+mailbox. This is a correctness requirement of the recycle path, not an
+optimization: a generation publishes its capability with a blocking send, so a
+pool with no traffic would otherwise fill the `workers * 2` idle channel with
+stale capabilities, block the next generation inside its publish before it
+could arm its own age deadline, and stall `max_worker_age` at generation three.
+`max_worker_age_recycles_a_pool_with_no_traffic` and
+`dispatcher_drains_idle_capabilities_without_a_pending_job` are the regression
+tests.
 
-Both are recorded from the independent 0.3.0 review. Neither violates a
-correctness invariant, and both only affect the optional policies that default
-OFF.
-
-`max_worker_age` stops making progress on a pool with no traffic. A generation
-publishes its idle token with a blocking send, and the dispatcher only reads
-idle tokens while it holds a job, so an idle pool never consumes them. The idle
-channel holds `workers * 2` tokens, so after two recycled generations per slot
-the next generation blocks inside the publish, never enters its command loop,
-and therefore never arms its age deadline. Measured: `workers = 1`,
-`max_worker_age = 1`, six idle seconds produced generation 3 rather than about
-seven. The next request drains the stale tokens and recycling resumes, so the
-effect is a stalled age policy on an idle pool, not a deadlock. The intended
-fix is for the dispatcher to drain idle tokens continuously and discard tokens
-whose mailbox is closed.
+### Known 0.3.0 recycling limitation
 
 `max_requests` is a soft threshold, not a cap. Voluntary recycling holds a
 single pool-wide permit; a generation that cannot take the permit keeps serving
 and retries at the next transaction boundary. Measured: `workers = 2`,
 `max_requests = 1`, 200 requests produced 8 recycles. Overshoot is bounded by
 permit contention and replacement bootstrap time, not by the configured value.
+This does not violate a correctness invariant and only affects an optional
+policy that defaults OFF.
 
 Shutdown changes the global phase before signalling tasks, permanently closing
 spawn authorization. Admission stops, backoff/bootstrap work is cancelled, the

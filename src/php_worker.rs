@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt,
     future::pending,
     io,
@@ -1773,6 +1774,26 @@ impl Drop for DispatcherAvailabilityGuard {
     }
 }
 
+/// Accepts a freshly published capability. Stale capabilities are dropped only
+/// once the stash exceeds one live token per slot, which keeps the steady-state
+/// cost at a length comparison while still bounding the stash.
+fn stash_idle(stash: &mut VecDeque<IdleWorker>, published: IdleWorker, workers: usize) {
+    stash.push_back(published);
+    if stash.len() > workers {
+        stash.retain(|idle_worker| !idle_worker.mailbox.is_closed());
+    }
+}
+
+/// Returns the next capability whose generation can still receive a job.
+fn take_idle(stash: &mut VecDeque<IdleWorker>) -> Option<IdleWorker> {
+    while let Some(idle_worker) = stash.pop_front() {
+        if !idle_worker.mailbox.is_closed() {
+            return Some(idle_worker);
+        }
+    }
+    None
+}
+
 async fn dispatcher_task(
     mut jobs_rx: mpsc::Receiver<PhpJob>,
     mut idle_rx: mpsc::Receiver<IdleWorker>,
@@ -1785,20 +1806,42 @@ async fn dispatcher_task(
     let _availability_guard = DispatcherAvailabilityGuard {
         shared: Arc::clone(&shared),
     };
+    // Idle capabilities are drained continuously, not only while a job is
+    // held. A pool with no traffic would otherwise fill the idle channel with
+    // stale capabilities and block the next generation inside its publish
+    // before it can arm its own age deadline, which stalled max_worker_age.
+    let mut idle = VecDeque::with_capacity(shared.config.workers);
+    let mut idle_closed = false;
     let mut draining = false;
     loop {
-        let job = if draining {
-            jobs_rx.recv().await
-        } else {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => {
-                    shared.accepting.store(false, Ordering::Release);
-                    jobs_rx.close();
-                    draining = true;
-                    jobs_rx.recv().await
+        let job = loop {
+            if draining {
+                tokio::select! {
+                    biased;
+                    job = jobs_rx.recv() => break job,
+                    published = idle_rx.recv(), if !idle_closed => match published {
+                        Some(idle_worker) => {
+                            stash_idle(&mut idle, idle_worker, shared.config.workers);
+                        }
+                        None => idle_closed = true,
+                    },
                 }
-                job = jobs_rx.recv() => job,
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => {
+                        shared.accepting.store(false, Ordering::Release);
+                        jobs_rx.close();
+                        draining = true;
+                    }
+                    job = jobs_rx.recv() => break job,
+                    published = idle_rx.recv(), if !idle_closed => match published {
+                        Some(idle_worker) => {
+                            stash_idle(&mut idle, idle_worker, shared.config.workers);
+                        }
+                        None => idle_closed = true,
+                    },
+                }
             }
         };
         let Some(mut job) = job else {
@@ -1809,14 +1852,27 @@ async fn dispatcher_task(
         }
 
         loop {
-            let Some(idle_worker) = idle_rx.recv().await else {
-                shared.accepting.store(false, Ordering::Release);
-                jobs_rx.close();
-                let _ = job.response_tx.send(Err(PoolJobError::Unavailable));
-                while let Some(queued) = jobs_rx.recv().await {
-                    let _ = queued.response_tx.send(Err(PoolJobError::Unavailable));
+            let idle_worker = match take_idle(&mut idle) {
+                Some(idle_worker) => idle_worker,
+                None => {
+                    let published = if idle_closed {
+                        None
+                    } else {
+                        idle_rx.recv().await
+                    };
+                    match published {
+                        Some(idle_worker) => idle_worker,
+                        None => {
+                            shared.accepting.store(false, Ordering::Release);
+                            jobs_rx.close();
+                            let _ = job.response_tx.send(Err(PoolJobError::Unavailable));
+                            while let Some(queued) = jobs_rx.recv().await {
+                                let _ = queued.response_tx.send(Err(PoolJobError::Unavailable));
+                            }
+                            return;
+                        }
+                    }
                 }
-                return;
             };
             match idle_worker.mailbox.try_send(WorkerCommand::Job(job)) {
                 Ok(()) => break,
@@ -2090,6 +2146,79 @@ mod tests {
             response_rx.await.unwrap(),
             Err(PoolJobError::Unavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_drains_idle_capabilities_without_a_pending_job() {
+        let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
+            worker: PhpWorkerConfig {
+                executable: PathBuf::from("unused-php"),
+                script: PathBuf::from("unused-worker.php"),
+            },
+            workers: 1,
+            queue_capacity: 8,
+            max_requests: None,
+            max_worker_age: None,
+        }));
+        let (jobs_tx, jobs_rx) = mpsc::channel(8);
+        // The production capacity for a single-slot pool.
+        let (idle_tx, idle_rx) = mpsc::channel(2);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let dispatcher = tokio::spawn(dispatcher_task(
+            jobs_rx,
+            idle_rx,
+            shutdown_rx,
+            Arc::clone(&pool.shared),
+        ));
+
+        // Recycled generations publish and stop while no job is pending. The
+        // third publish blocked forever before the dispatcher drained idle
+        // capabilities continuously, which stalled max_worker_age recycling.
+        for generation in 1..=5 {
+            let (worker_tx, worker_rx) = mpsc::channel(1);
+            drop(worker_rx);
+            timeout(
+                Duration::from_secs(5),
+                idle_tx.send(IdleWorker {
+                    slot: 0,
+                    generation,
+                    mailbox: worker_tx,
+                }),
+            )
+            .await
+            .expect("publishing an idle capability must not block on an idle pool")
+            .expect("dispatcher must still own the idle receiver");
+        }
+
+        let (worker_tx, mut worker_rx) = mpsc::channel(1);
+        idle_tx
+            .send(IdleWorker {
+                slot: 0,
+                generation: 6,
+                mailbox: worker_tx,
+            })
+            .await
+            .unwrap();
+        let (response_tx, _response_rx) = oneshot::channel();
+        jobs_tx
+            .send(PhpJob {
+                request: request("GET", "/hello", "", Vec::new()),
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        let command = timeout(Duration::from_secs(5), worker_rx.recv())
+            .await
+            .expect("the live generation must receive the job");
+        assert!(matches!(command, Some(WorkerCommand::Job(_))));
+
+        drop(jobs_tx);
+        drop(idle_tx);
+        timeout(Duration::from_secs(5), dispatcher)
+            .await
+            .expect("dispatcher must converge")
+            .unwrap();
     }
 
     #[test]

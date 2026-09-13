@@ -60,9 +60,9 @@ proactive stdout probe, respawn circuit breaker beyond per-slot retirement,
 adaptive sizing, memory-threshold recycle, or byte-based admission. HTTP bodies
 still buffer before pool admission. `max_requests` and `max_worker_age` default
 OFF; recycling is stop-then-spawn and permits one voluntary recycle at a time.
-Both recycle policies are thresholds rather than caps, and `max_worker_age`
-does not advance on a pool with no traffic; see the known-defect section in
-`doc/PHP_WORKER.md`. Application Reset moved to 0.4.0 Laravel Worker.
+Both recycle policies are thresholds rather than caps; see the recycling
+limitation in `doc/PHP_WORKER.md`. Application Reset moved to 0.4.0 Laravel
+Worker.
 
 ## Current Findings
 
@@ -89,10 +89,14 @@ five-second READY timeout.
 
 ## Backlog
 
-Non-blocking follow-ups from the independent 0.3.0 review, highest value first:
+Non-blocking follow-ups from the independent 0.3.0 review, highest value first.
+The first item is done on `dev` after the `v0.3.0` tag.
 
-- Make the dispatcher drain idle tokens continuously and discard tokens whose
-  mailbox is closed, so `max_worker_age` advances on an idle pool.
+- DONE: the dispatcher drains idle capabilities continuously and discards
+  closed mailboxes, so `max_worker_age` advances on a pool with no traffic.
+  Regression tests are `max_worker_age_recycles_a_pool_with_no_traffic` and
+  `dispatcher_drains_idle_capabilities_without_a_pending_job`; both fail
+  against the `v0.3.0` tree.
 - Add an end-to-end backoff/retirement test. The current `backoff_delay` and
   `replacement_delay` unit tests do not prove the supervisor applies them.
 - Strengthen the `ctrl_c_stops_server_and_reaps_pool` console guard so a

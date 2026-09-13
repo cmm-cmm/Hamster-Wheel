@@ -160,9 +160,13 @@ new generation; only requests that arrive inside that window are rejected.
 Voluntary recycling is threshold-based, not capped. `max_requests` and
 `max_worker_age` request a recycle at the next transaction boundary; the
 single pool-wide permit and replacement bootstrap time mean a generation can
-overshoot its configured value. `max_worker_age` further does not advance on a
-pool with no traffic. Both behaviours are recorded as known defects in
-`doc/PHP_WORKER.md` and are scheduled for 0.3.1.
+overshoot its configured value. This is recorded in `doc/PHP_WORKER.md`.
+
+The dispatcher drains idle capabilities continuously and discards capabilities
+whose mailbox has closed. Publishing a capability is a blocking send, so this
+is what keeps "a worker never blocks while publishing idle" true on a pool with
+no traffic. Without it, `max_worker_age` stalled once `workers * 2` stale
+capabilities filled the idle channel.
 
 ## Non-Goals
 
