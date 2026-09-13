@@ -586,7 +586,13 @@ enum WorkerCommand {
     Job(PhpJob),
 }
 
-#[derive(Clone)]
+/// A dispatch capability for exactly one generation.
+///
+/// Deliberately not `Clone`. A generation may have at most one capability
+/// outstanding, which is what bounds its capacity-1 mailbox to a single
+/// buffered job and makes `TrySendError::Full` unreachable. That bound is held
+/// only by the shape of `run_worker_generation`, which publishes one
+/// capability per command it consumes; cloning one would break it silently.
 struct IdleWorker {
     slot: usize,
     generation: u64,

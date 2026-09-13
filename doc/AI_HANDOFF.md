@@ -107,11 +107,15 @@ The first item is done on `dev` after the `v0.3.0` tag.
 - `all_workers_crash_then_pool_recovers` asserts all four concurrent requests
   receive 502; a fast replacement can answer one with 200. Make it
   deterministic.
-- Smaller debt: unused `Clone` on `IdleWorker`; `WorkerState` and
-  `WorkerLifecycleState` duplicate each other; the pre-request exit path drops
-  the worker without awaiting its stderr drain; `total_respawns` also counts
-  planned recycles; the dispatcher's full-mailbox branch lost the 0.2
-  `debug_assert`; `SpawnGate` holds a std mutex across `Command::spawn`.
+- Smaller debt: `WorkerState` and `WorkerLifecycleState` duplicate each other;
+  the pre-request exit path drops the worker without awaiting its stderr
+  drain; `total_respawns` also counts planned recycles; the dispatcher's
+  full-mailbox branch lost the 0.2 `debug_assert`; `SpawnGate` holds a std
+  mutex across `Command::spawn`.
+- DONE: `IdleWorker` no longer derives `Clone`. One capability per generation
+  is what bounds the capacity-1 mailbox to a single buffered job, and that
+  bound was held only by the shape of `run_worker_generation`. Cloning is now
+  a type error rather than a silent way to break it.
 
 ## Next Action
 
