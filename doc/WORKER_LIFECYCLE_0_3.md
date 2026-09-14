@@ -60,16 +60,46 @@ Mailbox `Closed` is safe for redispatch because no generation received that
 job. Mailbox `Full`, ambiguous delivery, I/O failure, timeout, protocol error,
 or process exit never authorizes transparent retry.
 
-## Backoff and Retirement
+## Backoff and Cooldown
 
 Failure one gets an immediate replacement. Later consecutive failures wait
 100, 200, 400, 800, 1600, 3200, then at most 5000 ms. Backoff waits are
-shutdown-aware. `MAX_CONSECUTIVE_FAILURES` is 10; exceeding it retires the slot.
-No extra circuit breaker is added.
+shutdown-aware. `MAX_CONSECUTIVE_FAILURES` is 10.
+
+Exceeding it no longer retires the slot. Replacement moves from the fast
+backoff ladder into a bounded cooldown band that doubles from
+`COOLDOWN_BASE` (30 s) to `COOLDOWN_MAX` (300 s) and stays there:
+30, 60, 120, 240, then 300 s forever. There is no terminal slot state and no
+extra circuit breaker. A slot that can never start is retried roughly every
+five minutes indefinitely, which is measured at about 0.2 spawns per minute
+per slot.
+
+The delay depends only on the slot's own consecutive failure count and fixed
+constants. It is never a function of HTTP throughput, concurrency, queue
+depth, failed-request count, or client behaviour, which is what bounds the
+respawn rate independently of load.
 
 Failure history resets only after a generation has remained READY/alive for at
-least 60 seconds and has successfully served at least one request. Planned
+least `STABILITY_RESET_PERIOD` (15 s, three times `REQUEST_TIMEOUT`) and has
+successfully served at least one request. The threshold is measured from the
+instant the generation reached READY, so bootstrap time is excluded. Planned
 recycling does not increment failure history.
+
+Stability stays time based deliberately. Resetting on successful request
+*count* was evaluated and rejected: a crash loop reaches any request threshold
+sooner the faster the pool serves, so request-count stability would make the
+respawn rate proportional to application throughput. The time threshold bounds
+the worst case at `60 / 15 = 4` spawns per minute per slot at any load.
+
+### Why permanent retirement was removed
+
+Measured on the 0.3 policy: a W4 pool whose workers were killed every ~19 s
+reached the ten-failure threshold on all four slots after ~208 s and then
+served 503 permanently, even after the fault stopped. Each killed generation
+had served requests successfully. A transient host problem lasting longer than
+roughly 40 seconds therefore became an outage that only a restart could clear.
+Recovery costs about 0.25 additional spawns per minute per slot, which is the
+entire price of never needing operator intervention.
 
 ## Recycling
 

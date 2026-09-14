@@ -1221,3 +1221,54 @@ Server CPU/request was 336 us (Hello) and 299 us (JSON) at W1/C1; 580/465 us
 at W4/C16; and 646/511 us at W4/C32. This limited matrix shows no new CPU
 regression attributable to dormant lifecycle management. It does not reopen
 the existing W4/W8 CPU investigation.
+
+## 0.3 Retirement Hardening — Steady-State Regression Check
+
+Release `x86_64-pc-windows-msvc`, PHP 8.5.10 NTS, `benchmarks/php_worker_pool.ps1`,
+recycling OFF, no injected failures, queue_capacity 128, three runs per cell with an
+eight-second floor. Baseline and candidate were built and measured in the same session
+on the same host, back to back, because this host's run-to-run spread has repeatedly
+exceeded the effect being looked for.
+
+Baseline is the pre-change working tree (60-second stability period, permanent
+retirement). Candidate is the same tree with `STABILITY_RESET_PERIOD` at 15 s and
+permanent retirement replaced by the bounded cooldown band.
+
+| Workload | W/C | Baseline RPS (min/med/max) | Candidate RPS (min/med/max) | Median delta |
+|---|---|---|---|---|
+| Hello | 1/1 | 6080 / 6455 / 6574 | 5734 / 6235 / 6425 | -3.4% |
+| JSON | 1/1 | 6354 / 6455 / 6463 | 6432 / 6489 / 6564 | +0.5% |
+| Hello | 4/16 | 29000 / 30285 / 31378 | 30332 / 31606 / 31617 | +4.4% |
+| JSON | 4/16 | 30648 / 31231 / 31621 | 30909 / 31574 / 31953 | +1.1% |
+| Hello | 4/32 | 27691 / 31127 / 31440 | 30701 / 31206 / 32319 | +0.3% |
+| JSON | 4/32 | 31122 / 31141 / 31811 | 30702 / 31904 / 32426 | +2.4% |
+
+Latency medians, milliseconds:
+
+| Workload | W/C | Baseline p50/p95/p99 | Candidate p50/p95/p99 |
+|---|---|---|---|
+| Hello | 1/1 | 0.145 / 0.211 / 0.347 | 0.147 / 0.234 / 0.329 |
+| JSON | 1/1 | 0.143 / 0.221 / 0.327 | 0.141 / 0.211 / 0.337 |
+| Hello | 4/16 | 0.485 / 0.859 / 1.155 | 0.463 / 0.822 / 1.129 |
+| JSON | 4/16 | 0.470 / 0.834 / 1.140 | 0.466 / 0.808 / 1.115 |
+| Hello | 4/32 | 0.972 / 1.541 / 2.308 | 0.977 / 1.460 / 1.926 |
+| JSON | 4/32 | 0.982 / 1.479 / 1.993 | 0.962 / 1.484 / 2.009 |
+
+Server RAM was 6.8-9.1 MiB on both trees; PHP RAM was 16.0 MiB at W1 and 64.0-64.1 MiB
+at W4 on both. Combined CPU per request was 184-223 us on both trees with no ordering
+by tree.
+
+Hello W1/C1 was the only negative cell, so it was re-measured with five runs per tree:
+baseline 6025/6467/6717, candidate 6221/6599/6681, a median delta of **+2.0%**. The sign
+of that cell reversed between repetitions, which shows the first -3.4% was host noise
+rather than a measured cost.
+
+No cell crossed the release flag of more than 10% steady-state regression. Because the
+run-to-run spread on this host is larger than every delta observed, these numbers can
+only fail to detect a regression; they do not establish an improvement, and none is
+claimed. The structural argument is the stronger evidence: the diff adds no operation to
+a successful request. `record_success` is unchanged except for the value of a constant
+it already compared against, the new `cooldown_delay` runs only from
+`handle_serving_exit` on the failure path, and the `stash_idle` bound assertion is a
+`debug_assert!` that compiles out of the release profile, which sets no
+`[profile.release]` override and therefore leaves `debug-assertions` off.

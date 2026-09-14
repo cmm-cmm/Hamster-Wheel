@@ -12,17 +12,31 @@ generation. The dispatcher has no worker lookup table.
 Unexpected process, pipe, timeout, or protocol failure fails the affected
 request once and schedules a replacement. A possibly-started request is never
 retried. The first replacement is immediate; subsequent failures back off for
-100, 200, 400, 800, 1600, 3200, then at most 5000 ms. A slot is retired after
-the tenth replacement also fails. Failure history resets only after a
-generation has lived for 60 seconds and completed a request successfully.
+100, 200, 400, 800, 1600, 3200, then at most 5000 ms. After the tenth failure
+the slot moves into a bounded cooldown band instead of being retired: 30, 60,
+120, 240, then 300 seconds, repeating at that ceiling. **Slots are never
+permanently retired**, so a pool that lost every worker to a transient host
+problem restores itself without an operator restart. Failure history resets
+only after a generation has stayed READY for 15 seconds and completed a
+request successfully; the 15 seconds are measured from READY, so bootstrap
+time does not count toward it.
+
+Stability is time based on purpose. Treating successful request *count* as
+proof of health would tie the respawn rate to application throughput, because
+a crash loop reaches any request threshold sooner the faster the pool serves.
+The time threshold bounds the worst case at four spawns per minute per slot at
+any load, and a permanently broken slot at roughly 0.2 spawns per minute.
+
 Idle process death is detected passively when its generation is next selected;
 there is no proactive stdout probe in this milestone.
 
 Only live generation tasks or pending backoff/bootstrap tasks own `idle_tx`.
 The supervisor never keeps a permanent clone. Zero READY workers is therefore
-transient while a replacement is possible; `idle_rx` closes only when no live
-or pending generation can restore service. New requests receive controlled 503
-while no process is live, and service resumes after replacement READY.
+transient while a replacement is possible. Because a slot always has a pending
+replacement, `idle_rx` no longer closes through exhausted retries; admission
+still refuses immediately rather than blocking, because `execute` checks
+`live_workers` before queueing. New requests receive controlled 503 while no
+process is live, and service resumes after replacement READY.
 
 Optional `max_requests` and `max_worker_age` policies default OFF. Recycling is
 stop-then-spawn, happens only at a transaction boundary, and is serialized to

@@ -1016,6 +1016,185 @@ async fn shutdown_during_backoff() {
 }
 
 #[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe; drives the backoff ladder to exhaustion"]
+async fn shutdown_during_prolonged_failure_cooldown() {
+    // A slot past MAX_CONSECUTIVE_FAILURES waits out a cooldown of at least
+    // 30 seconds before its next replacement. Shutdown must cancel that wait
+    // rather than block on it, and must still leave no PHP child behind.
+    let server = TestServer::start_with(1, 8).await;
+    // Hold the runtime separately: `stop` consumes the server, and these
+    // assertions inspect the pool afterwards.
+    let runtime = Arc::clone(&server.runtime);
+    let pool = runtime.php_worker().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while pool.snapshot().workers[0].consecutive_failures <= 10 {
+        assert!(
+            Instant::now() < deadline,
+            "slot never reached the cooldown band; last snapshot: {:#?}",
+            pool.snapshot()
+        );
+        if pool.snapshot().ready_workers == 1 {
+            let _ = server.request(&close_request("/crash")).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let snapshot = wait_for_pool(pool, |snapshot| {
+        snapshot.workers[0].state == WorkerLifecycleState::Backoff
+    })
+    .await;
+    assert!(
+        snapshot.workers[0].consecutive_failures > 10,
+        "the slot must be in the cooldown band, not the fast ladder"
+    );
+
+    let started = Instant::now();
+    server.stop().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "shutdown waited for the cooldown to expire: {elapsed:?}"
+    );
+    assert!(
+        pool.pids().is_empty(),
+        "shutdown must leave no PHP child behind"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe; drives one slot to exhaustion"]
+async fn one_bad_slot_does_not_disturb_healthy_slots() {
+    // Failure accounting, backoff and cooldown are per slot. Driving one slot
+    // into the cooldown band must leave the other three serving normally: no
+    // global lifecycle lock, no pool-wide cooldown.
+    let server = TestServer::start_with(4, 32).await;
+    let runtime = Arc::clone(&server.runtime);
+    let pool = runtime.php_worker().unwrap();
+    wait_for_pool(pool, |snapshot| snapshot.ready_workers == 4).await;
+
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let mut kills = 0;
+    while pool.snapshot().workers[0].consecutive_failures <= 10 {
+        assert!(
+            Instant::now() < deadline,
+            "slot 0 never reached the cooldown band; last snapshot: {:#?}",
+            pool.snapshot()
+        );
+        // Target slot 0 specifically, by PID taken from its own snapshot.
+        if let Some(pid) = pool.snapshot().workers[0].pid {
+            kill_process(pid).await;
+            kills += 1;
+            // A dead idle worker is only discovered when a job is assigned to
+            // it, so drive traffic until the supervisor has observed the exit.
+            // Requests that land on healthy slots simply succeed.
+            let observed = Instant::now() + Duration::from_secs(20);
+            while pool.snapshot().workers[0].pid == Some(pid) {
+                assert!(
+                    Instant::now() < observed,
+                    "slot 0 exit was never observed; last snapshot: {:#?}",
+                    pool.snapshot()
+                );
+                let _ = server.request(&close_request("/")).await;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    assert!(
+        kills >= 10,
+        "slot 0 must have been killed repeatedly: {kills}"
+    );
+
+    let snapshot = pool.snapshot();
+    assert!(snapshot.workers[0].consecutive_failures > 10);
+    for slot in 1..4 {
+        assert_eq!(
+            snapshot.workers[slot].consecutive_failures, 0,
+            "healthy slot {slot} must not inherit slot 0's failure history"
+        );
+        assert!(
+            matches!(
+                snapshot.workers[slot].state,
+                WorkerLifecycleState::Ready | WorkerLifecycleState::Busy
+            ),
+            "healthy slot {slot} must keep serving, was {:?}",
+            snapshot.workers[slot].state
+        );
+    }
+    assert!(
+        snapshot.ready_workers >= 3,
+        "three healthy workers must remain available, saw {}",
+        snapshot.ready_workers
+    );
+
+    // The pool still serves while slot 0 sits in its cooldown.
+    for _ in 0..10 {
+        let response = server.request(&close_request("/")).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "healthy slots must keep answering while one slot is in cooldown"
+        );
+    }
+
+    server.stop().await;
+    assert!(pool.pids().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe; drives the backoff ladder to exhaustion"]
+async fn prolonged_failure_never_retires_a_slot_permanently() {
+    // The 0.3 policy retired a slot permanently after more than ten
+    // consecutive failures, which turned a long transient fault into an outage
+    // that only a restart could clear. A slot must now stay replaceable: it
+    // slows down, but it never stops being scheduled.
+    let server = TestServer::start_with(1, 8).await;
+    // Hold the runtime separately: `stop` consumes the server, and these
+    // assertions inspect the pool afterwards.
+    let runtime = Arc::clone(&server.runtime);
+    let pool = runtime.php_worker().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut generations_seen = 0;
+    while pool.snapshot().workers[0].consecutive_failures <= 10 {
+        assert!(
+            Instant::now() < deadline,
+            "slot never reached the cooldown band; last snapshot: {:#?}",
+            pool.snapshot()
+        );
+        if pool.snapshot().ready_workers == 1 {
+            generations_seen += 1;
+            let _ = server.request(&close_request("/crash")).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let snapshot = pool.snapshot();
+    assert!(
+        generations_seen >= 10,
+        "the slot must have been replaced repeatedly, saw {generations_seen}"
+    );
+    // Still a live slot with a scheduled replacement, not a terminal state.
+    assert_eq!(snapshot.target_workers, 1);
+    assert_eq!(snapshot.workers[0].state, WorkerLifecycleState::Backoff);
+    assert!(snapshot.workers[0].generation > 10);
+    // Admission stays honest while no generation is READY: callers get a
+    // controlled refusal instead of blocking on capacity that is minutes away.
+    assert_eq!(snapshot.ready_workers, 0);
+    let response = server.request(&close_request("/")).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"),
+        "degraded pool must refuse quickly, got: {}",
+        String::from_utf8_lossy(&response[..response.len().min(40)])
+    );
+
+    server.stop().await;
+    assert!(pool.pids().is_empty());
+}
+
+#[tokio::test]
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn shutdown_during_replacement_bootstrap() {
     let startup_marker = marker_path("shutdown-bootstrap-count");

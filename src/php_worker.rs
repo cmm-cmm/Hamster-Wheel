@@ -43,8 +43,29 @@ pub const MAX_QUEUE_CAPACITY: usize = 128;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const STABILITY_RESET_PERIOD: Duration = Duration::from_secs(60);
+/// How long a generation must stay READY, with at least one successful
+/// request, before its slot's failure history is forgiven.
+///
+/// Measured from the instant the generation reached READY, so bootstrap time
+/// is excluded. Three times `REQUEST_TIMEOUT`: a generation that has served
+/// successfully for longer than its own worst-case single-request budget,
+/// three times over, has demonstrated more than "did not crash immediately".
+///
+/// This stays time based on purpose. Resetting on successful request *count*
+/// would tie the respawn rate to application throughput, because a crash loop
+/// reaches any request threshold sooner the faster the pool serves. A time
+/// threshold bounds the worst-case respawn rate at `60 / 15 = 4` spawns per
+/// minute per slot regardless of load.
+const STABILITY_RESET_PERIOD: Duration = Duration::from_secs(15);
+/// Failure count after which replacement leaves the fast backoff ladder and
+/// enters the bounded cooldown band. Slots are never permanently retired.
 const MAX_CONSECUTIVE_FAILURES: usize = 10;
+/// First cooldown delay once the backoff ladder is exhausted.
+const COOLDOWN_BASE: Duration = Duration::from_secs(30);
+/// Ceiling for the cooldown band. A slot that can never start is retried at
+/// this interval forever, which is the entire cost of never requiring an
+/// operator restart after a transient host problem.
+const COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const RECYCLE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
@@ -71,7 +92,6 @@ pub enum WorkerLifecycleState {
     Busy,
     Recycling,
     Unavailable,
-    Retired,
     Stopped,
 }
 
@@ -1116,13 +1136,6 @@ impl PoolShared {
         failures
     }
 
-    fn retire_slot(&self, slot: usize) {
-        self.update_slot(slot, |snapshot| {
-            snapshot.pid = None;
-            snapshot.state = WorkerLifecycleState::Retired;
-        });
-    }
-
     fn stop_slot(&self, slot: usize, generation: u64) {
         self.update_slot(slot, |snapshot| {
             if snapshot.generation == generation {
@@ -1182,6 +1195,28 @@ fn spawn_initial_generation(tasks: &mut JoinSet<GenerationExit>, spec: InitialGe
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Owns one generation exclusively: its process, pipes, protocol state and
+/// capacity-1 mailbox.
+///
+/// # Publishing a capability is a blocking send, and shutdown depends on it
+///
+/// `idle_tx.send(...).await` below blocks when the idle channel is full. That
+/// is deliberate — it is what stops a pool with no traffic from filling the
+/// idle channel with stale capabilities — but it creates an ordering
+/// dependency that shutdown must respect:
+///
+/// * The dispatcher drains idle capabilities continuously, not only while it
+///   holds a job. If it ever became lazy again, a worker could block here
+///   forever and its generation task would never join, hanging shutdown.
+/// * `supervisor_task` signals `worker_shutdown_tx` only *after* the
+///   dispatcher has converged, and keeps joining generations while it waits.
+///   Reversing that order would close the idle mailboxes while the dispatcher
+///   still holds an accepted job, leaving it waiting for capacity that can
+///   never be published.
+///
+/// Both halves are required. Changing either one — making the drain
+/// conditional, or signalling workers before the dispatcher converges — can
+/// deadlock lifecycle shutdown rather than fail visibly.
 async fn run_worker_generation(
     slot: usize,
     generation: u64,
@@ -1499,8 +1534,33 @@ fn backoff_delay(consecutive_failures: usize) -> Duration {
     Duration::from_millis((100_u64 << exponent).min(5_000))
 }
 
-fn replacement_delay(consecutive_failures: usize) -> Option<Duration> {
-    (consecutive_failures <= MAX_CONSECUTIVE_FAILURES).then(|| backoff_delay(consecutive_failures))
+/// Delay for a slot whose failures have exhausted the fast backoff ladder.
+///
+/// Doubles from `COOLDOWN_BASE` up to `COOLDOWN_MAX` and stays there. The
+/// shift is clamped before it is applied, so an unbounded failure count cannot
+/// overflow the shift.
+fn cooldown_delay(consecutive_failures: usize) -> Duration {
+    let steps = consecutive_failures
+        .saturating_sub(MAX_CONSECUTIVE_FAILURES + 1)
+        .min(6) as u32;
+    let millis = (COOLDOWN_BASE.as_millis() as u64) << steps;
+    Duration::from_millis(millis.min(COOLDOWN_MAX.as_millis() as u64))
+}
+
+/// How long to wait before the next replacement generation for a slot.
+///
+/// Never returns "give up". A slot that keeps failing slows down to
+/// `COOLDOWN_MAX` and keeps trying at that interval, so a temporary host
+/// problem cannot turn into a permanent outage that needs an operator. The
+/// delay depends only on the slot's own consecutive failure count, never on
+/// HTTP throughput, concurrency, queue depth, or client behaviour, which is
+/// what bounds the respawn rate independently of load.
+fn replacement_delay(consecutive_failures: usize) -> Duration {
+    if consecutive_failures <= MAX_CONSECUTIVE_FAILURES {
+        backoff_delay(consecutive_failures)
+    } else {
+        cooldown_delay(consecutive_failures)
+    }
 }
 
 fn spawn_replacement(
@@ -1543,6 +1603,21 @@ fn spawn_replacement(
     });
 }
 
+/// Handles one generation that has ended while the pool is still serving.
+///
+/// # One live generation per slot
+///
+/// This is only ever reached from `generations.join_next()`, so the old
+/// generation's task has already completed: its `PhpWorker`, child process,
+/// pipes and mailbox receiver are dropped before `spawn_replacement` creates
+/// the next generation for that slot. Two live generations for one slot
+/// therefore never overlap.
+///
+/// That ordering is load-bearing, not incidental. It is what makes a closed
+/// mailbox a reliable "this generation is gone" signal for `take_idle`, and it
+/// is the first half of the stash bound proved in `stash_idle`. Spawning a
+/// replacement before joining the old generation would break both, and would
+/// also let a slot hold two PHP children at once.
 fn handle_serving_exit(
     tasks: &mut JoinSet<GenerationExit>,
     exit: GenerationExit,
@@ -1571,19 +1646,17 @@ fn handle_serving_exit(
                 shared.release_recycle(exit.slot);
             }
             let failures = shared.increment_failure(exit.slot);
-            let Some(delay) = replacement_delay(failures) else {
-                eprintln!(
-                    "PHP worker slot {} retired after {} consecutive failures: {reason}",
-                    exit.slot, failures
-                );
-                shared.retire_slot(exit.slot);
-                return;
-            };
+            let delay = replacement_delay(failures);
             eprintln!(
-                "PHP worker slot {} scheduling generation {} after {} ms (failure {failures})",
+                "PHP worker slot {} scheduling generation {} after {} ms (failure {failures}{})",
                 exit.slot,
                 exit.generation.saturating_add(1),
-                delay.as_millis()
+                delay.as_millis(),
+                if failures > MAX_CONSECUTIVE_FAILURES {
+                    ", cooldown"
+                } else {
+                    ""
+                }
             );
             spawn_replacement(
                 tasks,
@@ -1783,11 +1856,32 @@ impl Drop for DispatcherAvailabilityGuard {
 /// Accepts a freshly published capability. Stale capabilities are dropped only
 /// once the stash exceeds one live token per slot, which keeps the steady-state
 /// cost at a length comparison while still bounding the stash.
+///
+/// # Bound
+///
+/// The stash holds at most `workers + 1` entries. The proof has two halves:
+///
+/// 1. At most one live capability exists per slot. `IdleWorker` is not `Clone`
+///    and `run_worker_generation` publishes exactly one capability per command
+///    it consumes. The supervisor joins a slot's old generation before
+///    spawning its replacement (see `handle_serving_exit`), so two live
+///    generations for one slot never overlap.
+/// 2. Therefore a `retain` pass that drops closed mailboxes leaves at most
+///    `workers` entries, and this function pushes at most one before checking.
+///
+/// A violation would mean the capability-per-generation invariant broke
+/// somewhere upstream, so the assertion is placed here where it can catch it.
 fn stash_idle(stash: &mut VecDeque<IdleWorker>, published: IdleWorker, workers: usize) {
     stash.push_back(published);
     if stash.len() > workers {
         stash.retain(|idle_worker| !idle_worker.mailbox.is_closed());
     }
+    debug_assert!(
+        stash.len() <= workers + 1,
+        "idle stash holds {} capabilities for {workers} workers; at most one live \
+         capability may exist per slot",
+        stash.len()
+    );
 }
 
 /// Returns the next capability whose generation can still receive a job.
@@ -2247,9 +2341,140 @@ mod tests {
         assert_eq!(backoff_delay(usize::MAX), Duration::from_secs(5));
         assert_eq!(
             replacement_delay(MAX_CONSECUTIVE_FAILURES),
-            Some(Duration::from_secs(5))
+            Duration::from_secs(5)
         );
-        assert_eq!(replacement_delay(MAX_CONSECUTIVE_FAILURES + 1), None);
+    }
+
+    /// Builds a capability whose generation is already gone: dropping the
+    /// receiver is exactly what a finished `run_worker_generation` does.
+    fn stale_capability(slot: usize, generation: u64) -> IdleWorker {
+        let (mailbox, receiver) = mpsc::channel(1);
+        drop(receiver);
+        IdleWorker {
+            slot,
+            generation,
+            mailbox,
+        }
+    }
+
+    #[tokio::test]
+    async fn take_idle_discards_stale_capabilities_and_dispatches_once() {
+        // Several dead generations queued ahead of one live generation is the
+        // shape produced by a burst of replacements: the dispatcher stashes
+        // capabilities faster than it consumes them.
+        let mut stash = VecDeque::new();
+        stash.push_back(stale_capability(0, 1));
+        stash.push_back(stale_capability(0, 2));
+        stash.push_back(stale_capability(1, 4));
+        let (live_mailbox, mut live_rx) = mpsc::channel(1);
+        stash.push_back(IdleWorker {
+            slot: 2,
+            generation: 7,
+            mailbox: live_mailbox,
+        });
+
+        let taken = take_idle(&mut stash).expect("the live capability must survive");
+        assert_eq!(taken.slot, 2);
+        assert_eq!(taken.generation, 7);
+        assert!(
+            stash.is_empty(),
+            "every stale capability ahead of the live one must be discarded"
+        );
+
+        // The job reaches the live generation, and reaches it exactly once.
+        // Redispatch here is only ever legal because a closed mailbox proves
+        // that generation never received the job, so no possibly-started
+        // transaction can be replayed.
+        let (response_tx, _response_rx) = oneshot::channel();
+        taken
+            .mailbox
+            .try_send(WorkerCommand::Job(PhpJob {
+                request: request("GET", "/", "", Vec::new()),
+                response_tx,
+            }))
+            .expect("the live mailbox must accept the job");
+        let WorkerCommand::Job(delivered) = live_rx.recv().await.expect("job must be delivered");
+        assert_eq!(delivered.request.path, b"/".to_vec());
+        assert!(
+            live_rx.try_recv().is_err(),
+            "the job must not be delivered more than once"
+        );
+    }
+
+    #[test]
+    fn take_idle_reports_empty_when_every_capability_is_stale() {
+        let mut stash = VecDeque::new();
+        stash.push_back(stale_capability(0, 1));
+        stash.push_back(stale_capability(1, 1));
+        assert!(take_idle(&mut stash).is_none());
+        assert!(stash.is_empty());
+    }
+
+    #[test]
+    fn stash_idle_stays_within_its_bound() {
+        // One live capability per slot plus the freshly published one is the
+        // documented ceiling; stale entries must not accumulate past it.
+        let workers = 2;
+        let mut stash = VecDeque::new();
+        for generation in 1..=32 {
+            stash_idle(&mut stash, stale_capability(0, generation), workers);
+            assert!(
+                stash.len() <= workers + 1,
+                "stash grew to {} for {workers} workers",
+                stash.len()
+            );
+        }
+    }
+
+    #[test]
+    fn prolonged_failure_enters_bounded_cooldown() {
+        // Past the ladder the delay keeps growing to a ceiling and stays
+        // there. A slot is never permanently retired, so recovery after a
+        // transient host problem needs no operator action.
+        let expected = [30, 60, 120, 240, 300, 300, 300];
+        for (index, seconds) in expected.into_iter().enumerate() {
+            let failures = MAX_CONSECUTIVE_FAILURES + 1 + index;
+            assert_eq!(
+                replacement_delay(failures),
+                Duration::from_secs(seconds),
+                "failure {failures}"
+            );
+        }
+        // Saturating shift: an unbounded failure count stays at the ceiling
+        // rather than overflowing or wrapping back to a tight loop.
+        assert_eq!(replacement_delay(usize::MAX), COOLDOWN_MAX);
+        assert_eq!(replacement_delay(10_000), COOLDOWN_MAX);
+    }
+
+    #[test]
+    fn respawn_rate_is_bounded_independently_of_load() {
+        // The only inputs to the delay are the slot's own failure count and
+        // fixed constants. Nothing here can be influenced by HTTP throughput,
+        // concurrency, or how many requests failed, which is what keeps a
+        // permanently broken slot from becoming a spawn storm.
+        let ceiling = replacement_delay(usize::MAX);
+        assert_eq!(ceiling, COOLDOWN_MAX);
+        let spawns_per_hour = 3_600 / ceiling.as_secs();
+        assert!(
+            spawns_per_hour <= 12,
+            "a permanently failing slot must not exceed 12 spawns per hour, got {spawns_per_hour}"
+        );
+        // The fast ladder is only reachable while the failure count is low.
+        assert!(replacement_delay(MAX_CONSECUTIVE_FAILURES + 1) >= COOLDOWN_BASE);
+    }
+
+    #[test]
+    fn stability_period_outlasts_a_single_request_budget() {
+        // A generation counts as stable only after staying READY for longer
+        // than its own worst-case single request, with margin. Keeping this
+        // time based is what decouples respawn rate from throughput.
+        assert!(STABILITY_RESET_PERIOD > REQUEST_TIMEOUT);
+        assert_eq!(STABILITY_RESET_PERIOD, REQUEST_TIMEOUT * 3);
+        let worst_case_spawns_per_minute = 60 / STABILITY_RESET_PERIOD.as_secs();
+        assert!(
+            worst_case_spawns_per_minute <= 4,
+            "a slot that fails just above the stability threshold must stay bounded"
+        );
     }
 
     #[test]
