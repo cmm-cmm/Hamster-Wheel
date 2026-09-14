@@ -70,18 +70,84 @@ pub(crate) struct WorkerResponse {
     pub body: Vec<u8>,
 }
 
+/// A frame write that failed, and how much of it reached the pipe first.
+///
+/// `transferred` is what makes the never-retry invariant decidable. A failure
+/// at zero transferred bytes proves the peer cannot have seen any part of this
+/// frame, so the job it carried never started. Any other count leaves open the
+/// possibility that PHP read the frame and began work, and those are never
+/// retried.
+#[derive(Debug)]
+pub(crate) struct FrameWriteError {
+    pub source: ProtocolError,
+    pub transferred: usize,
+}
+
+impl fmt::Display for FrameWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} after {} byte(s) written",
+            self.source, self.transferred
+        )
+    }
+}
+
 pub(crate) async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), ProtocolError>
 where
     W: AsyncWrite + Unpin,
 {
+    write_frame_tracked(writer, payload)
+        .await
+        .map_err(|error| error.source)
+}
+
+/// Writes a frame, reporting how many bytes were handed to the writer when it
+/// fails. `write_all` cannot answer that question, so the length prefix and the
+/// payload are written through one loop that counts its own progress.
+pub(crate) async fn write_frame_tracked<W>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<(), FrameWriteError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let too_large = |length: usize| FrameWriteError {
+        source: ProtocolError::FrameTooLarge(length),
+        transferred: 0,
+    };
     if payload.len() > MAX_FRAME_LEN {
-        return Err(ProtocolError::FrameTooLarge(payload.len()));
+        return Err(too_large(payload.len()));
     }
-    let length =
-        u32::try_from(payload.len()).map_err(|_| ProtocolError::FrameTooLarge(payload.len()))?;
-    writer.write_all(&length.to_be_bytes()).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
+    let length = u32::try_from(payload.len()).map_err(|_| too_large(payload.len()))?;
+
+    let mut transferred = 0_usize;
+    for mut chunk in [&length.to_be_bytes()[..], payload] {
+        while !chunk.is_empty() {
+            match writer.write(chunk).await {
+                Ok(0) => {
+                    return Err(FrameWriteError {
+                        source: ProtocolError::Io(io::Error::from(io::ErrorKind::WriteZero)),
+                        transferred,
+                    });
+                }
+                Ok(written) => {
+                    transferred += written;
+                    chunk = &chunk[written..];
+                }
+                Err(error) => {
+                    return Err(FrameWriteError {
+                        source: ProtocolError::Io(error),
+                        transferred,
+                    });
+                }
+            }
+        }
+    }
+    writer.flush().await.map_err(|error| FrameWriteError {
+        source: ProtocolError::Io(error),
+        transferred,
+    })?;
     Ok(())
 }
 
@@ -349,5 +415,65 @@ mod tests {
             read_frame(&mut reader).await,
             Err(ProtocolError::Io(_))
         ));
+    }
+
+    /// A writer that accepts a fixed number of bytes and then fails, so a
+    /// partial frame write can be observed without a real pipe.
+    struct FailingWriter {
+        accept: usize,
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.accept == 0 {
+                return std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+            }
+            let written = buffer.len().min(self.accept);
+            self.accept -= written;
+            std::task::Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_write_reports_whether_any_byte_reached_the_peer() {
+        // Nothing was transferred, so the peer provably never saw this frame.
+        let error = write_frame_tracked(&mut FailingWriter { accept: 0 }, b"payload")
+            .await
+            .expect_err("a writer that refuses everything must fail");
+        assert_eq!(error.transferred, 0);
+
+        // The length prefix went out, so the peer may already have started
+        // reading. This is exactly the case that must never be retried.
+        let error = write_frame_tracked(&mut FailingWriter { accept: 4 }, b"payload")
+            .await
+            .expect_err("a writer that fails mid-frame must fail");
+        assert_eq!(error.transferred, 4);
+
+        let error = write_frame_tracked(&mut FailingWriter { accept: 6 }, b"payload")
+            .await
+            .expect_err("a writer that fails inside the payload must fail");
+        assert_eq!(error.transferred, 6);
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        write_frame_tracked(&mut writer, b"payload").await.unwrap();
+        assert_eq!(read_frame(&mut reader).await.unwrap(), b"payload");
     }
 }

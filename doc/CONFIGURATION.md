@@ -44,6 +44,11 @@ queue_capacity = 32
 # Optional lifecycle policies; omitted means OFF.
 max_requests = 10000
 max_worker_age = 3600
+
+# Optional extra environment for the worker process.
+[hosts.locations.php.env]
+HAMSTER_LARAVEL_PATH = "www/pms"
+HAMSTER_LARAVEL_RESET = "targeted"
 ```
 
 `server.listen` must be a numeric IP socket address. Host names and aliases use
@@ -57,6 +62,17 @@ on another handler are errors. `max_requests` is an optional positive request
 count. `max_worker_age` is an optional integer number of seconds and must be at
 least 1. Both default OFF. Milestone 0.3.0 permits one PHP worker pool location.
 Unknown fields are errors.
+
+`php.env` is an optional table of extra environment variables for the worker
+process, applied on top of the server's own environment and given to every
+generation including replacements. The server never interprets these; they exist
+so a worker script can be told what application it serves without the server
+needing to know what kind of application that is. A variable name must be
+non-empty and must not contain `=` or NUL, and no value may contain NUL. Values
+are redacted from the configuration's `Debug` output, because credentials
+belong here and logs do not. `doc/LARAVEL_WORKER_0_4.md` describes the variables
+the Laravel worker reads: `HAMSTER_LARAVEL_PATH` (required),
+`HAMSTER_LARAVEL_RESET` and `HAMSTER_LARAVEL_WARMUP`.
 
 Both recycle policies are thresholds, not hard caps. Voluntary recycling holds
 one pool-wide permit, so a generation that reaches `max_requests` while another

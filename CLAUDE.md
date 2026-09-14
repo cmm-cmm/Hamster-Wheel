@@ -2,16 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Read `AGENTS.md` too; it holds the repository conventions. `doc/HAMSTER_WHEEL_SERVER_PLAN.md` is
-the long-form roadmap and is written in Vietnamese.
+Read `AGENTS.md` too; it holds the repository conventions. `doc/AI_HANDOFF.md` is the session-start
+status file — current milestone, verified platform, known limitations, and the ranked backlog; read
+it before starting work and update it when a milestone or backlog item moves.
+`doc/WORKER_LIFECYCLE_0_3.md` is the accepted 0.3 lifecycle contract.
+`doc/LARAVEL_WORKER_0_4.md` covers the persistent Laravel worker: its
+measurements, its reset, and what it deliberately does not do.
+`doc/HAMSTER_WHEEL_SERVER_PLAN.md` is the long-form roadmap and is written in Vietnamese.
 
 ## What this is
 
 Hamster Wheel is a Rust HTTP server (hyper 1 + Tokio, edition 2024) built milestone by milestone.
-Current version is 0.3.1 (PHP Worker Lifecycle), implemented on the Windows target. It serves
-static files, routes by host/location, loads configuration from TOML, and runs a fixed pool of
-persistent PHP CLI workers with automatic replacement over a custom binary stdio protocol. Windows
-(`x86_64-pc-windows-msvc`) is the primary development and measurement platform.
+Current version is 0.3.1 (PHP Worker Lifecycle) with 0.4.0 (Laravel Persistent Worker) in review,
+implemented on the Windows target. It serves static files, routes by host/location, loads
+configuration from TOML, and runs a fixed pool of persistent PHP CLI workers with automatic
+replacement over a custom binary stdio protocol. A supplied Laravel application can be kept booted
+inside those workers; that lifecycle, including request reconstruction and
+`multipart/form-data` uploads, lives entirely in PHP. Windows (`x86_64-pc-windows-msvc`) is
+the primary development and measurement platform. `www/` is git-ignored and holds locally supplied
+Laravel applications used for measurement.
 
 ## Commands
 
@@ -25,7 +34,17 @@ cargo test rejects_path_traversal              # one test by name
 cargo test -- --ignored                        # PHP worker tests; requires php/8.5/php.exe
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo check --target x86_64-unknown-linux-gnu     # cross-target only; not native verification
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 ```
+
+The full Windows gate before calling work done: `fmt --check`, `clippy --all-targets --all-features
+-D warnings`, `cargo test`, `cargo test -- --ignored`, `cargo bench --no-run --features profiling`,
+and a release build. Lifecycle changes also need the ignored suite in `tests/php_worker.rs`, which
+holds the accepted 18-test lifecycle matrix plus the 0.2 cancellation/shutdown regressions.
+`ctrl_c_stops_server_and_reaps_pool` needs a real conhost console; its `GetConsoleCP` guard does not
+recognize ConPTY, so under those terminals it hard-fails at a five-second wait instead of skipping —
+a known harness gap, not a regression.
 
 Benchmarks are feature-gated behind `profiling` and use `harness = false`; each takes a suite name
 after `--`:
@@ -81,7 +100,14 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
   metadata -> read. HEAD deliberately skips the body read. Per-request canonicalization is what
   rejects symlink/junction escapes; do not remove it for speed.
 - `php_worker.rs` + `php_protocol.rs`: a fixed target of `php.exe` children spawned directly (no
-  shell, no FastCGI), stdio carries only frames, and stderr is drained per child. Stable slots own
+  shell, no FastCGI), stdio carries only frames, and stderr is drained per child. The optional
+  `php.env` table adds environment variables to every generation, replacements included; the pool
+  never reads them, and they are how a worker script is told what application it serves without
+  Rust knowing what kind of application that is. Keep it that way: framework-specific lifecycle
+  belongs in PHP. Because stdout is the frame stream, a worker script must send PHP's own
+  diagnostics to stderr before loading anything — PHP 8.5 emits deprecation notices for ordinary
+  application code, and one such line ahead of the first frame is read as a frame length. Stable
+  slots own
   monotonically increasing generations; PID is not identity. The topology is a bounded FIFO job
   queue (`queue_capacity`, 1-128, default `min(workers * 8, 128)`) -> dispatcher -> generation-specific
   capacity-1 mailboxes -> exclusive worker tasks. `IdleWorker` carries slot, generation, and that
@@ -93,17 +119,31 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
 - Transaction ownership is cancellation-safe and this is a correctness requirement, not a
   refinement. Once a REQUEST frame starts, the owning worker task always consumes the RESPONSE (or
   fails the worker), so a disconnected HTTP client can never desynchronize the protocol stream. A job
-  whose receiver is already gone is skipped before execution begins; a job is re-dispatched only when
-  the mailbox send proves PHP never started, so a possibly-started request is never retried. Any I/O,
+  whose receiver is already gone is skipped before execution begins; a job is re-dispatched only on
+  proof that PHP never started, so a possibly-started request is never retried. There are exactly
+  two such proofs: a closed generation mailbox, and `PhpWorkerError::NotStarted`, returned when
+  `try_wait` reaps the process before the frame write or when the write transfers zero bytes
+  (`write_frame_tracked` reports the count; `write_all` cannot). A write that moved any bytes and a
+  timeout are both treated as started. `MAX_NOT_STARTED_REDISPATCHES` is 1, which covers a worker
+  killed while idle without letting a crash-looping pool bounce one job forever. Any I/O,
   protocol, request-ID mismatch, or timeout marks that worker `Unavailable`, kills it, and ends its
   task. The lifecycle supervisor replaces failed generations without retrying their request;
   surviving workers serve degraded until replacement READY. Only live generations or pending
   replacement/backoff tasks hold `idle_tx`; the supervisor never keeps a clone. Thus zero READY can
-  be transient, while `idle_rx` closure means terminal unavailability. Startup remains
-  all-or-nothing. Backoff is per slot (immediate, then 100 ms doubling to 5 s), with retirement after
-  more than 10 consecutive failures and stability reset after 60 s plus one success. Optional
+  be transient. Startup remains
+  all-or-nothing. Backoff is per slot (immediate, then 100 ms doubling to 5 s); past 10 consecutive
+  failures it enters a bounded cooldown band (30 s doubling to a 300 s ceiling) instead of retiring.
+  Slots are never permanently retired, so a pool recovers from a long transient fault without a
+  restart, and `idle_rx` no longer closes through exhausted retries; `execute` already refuses on
+  `live_workers == 0`, so a degraded pool still answers 503 immediately instead of blocking.
+  Stability reset needs 15 s READY plus one success, measured from READY. It is time based on
+  purpose: resetting on request count would make the respawn rate proportional to throughput.
+  Optional
   `max_requests` and `max_worker_age` recycle policies default OFF and use serialized
   stop-then-spawn. No adaptive sizing, proactive idle probe, or application Reset exists in 0.3.1.
+  The hard-coded budgets live at the top of `php_worker.rs`: `workers` 1-64, 5 s READY startup, 5 s
+  per request, 2 s shutdown before kill. Idle worker death is detected passively on the next
+  assignment; there is no stdout probe.
 - `queue_capacity` bounds admitted job count, not bytes. Request bodies are buffered before pool
   admission, so a full queue can retain roughly 128 MiB at the 1 MiB body limit. A total-byte
   admission budget and body streaming are deferred, not implemented.
@@ -126,7 +166,10 @@ TcpListener -> hyper http1 conn -> HostRouter -> LocationRouter -> Handler -> Re
   describe Linux as supported, and do not report a cross-target check as a native run.
 - Every milestone's behavior, measurements, and explicitly rejected alternatives are written down in
   `doc/`. When you change behavior in an area, update its doc (`ROUTING.md`, `CONFIGURATION.md`,
-  `PHP_WORKER.md`, `BENCHMARKS.md`, `WINDOWS_STATIC_PROFILING.md`).
+  `PHP_WORKER.md`, `BENCHMARKS.md`, `WINDOWS_STATIC_PROFILING.md`) in the same change, and update
+  `AI_HANDOFF.md` when the milestone status or backlog moves.
+- Protocol v1 is frozen outside a milestone that explicitly owns it. Do not renumber frames, change
+  limits, or add frame kinds as a side effect of another change.
 - `doc/BENCHMARKS.md` results are historical and immutable — append new sections, never rewrite old
   numbers. Report medians of at least three runs, release builds only, with the conditions recorded.
 - The PHP worker's Windows latency fix is `['pipe' => ['blocking' => true]]` on `php://stdin` in

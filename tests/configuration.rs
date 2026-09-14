@@ -113,6 +113,15 @@ fn not_found_config(hosts: &str) -> String {
     format!("[server]\nlisten = \"127.0.0.1:8080\"\n{hosts}")
 }
 
+/// A php_worker location whose `env` table is whatever the caller supplies.
+/// The executable never has to exist: env is rejected during validation, which
+/// runs before any path is canonicalized.
+fn php_worker_config_with_env(env: &str) -> String {
+    format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = \"php.exe\"\nscript = \"worker.php\"\nworkers = 1\n\n[hosts.locations.php.env]\n{env}"
+    )
+}
+
 fn headers(host: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(HOST, host.parse().unwrap());
@@ -230,6 +239,40 @@ async fn compiled_static_route_keeps_traversal_protection() {
     assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
     assert!(!response.contains("\r\n\r\nsecret"));
     server.stop().await;
+}
+
+#[test]
+fn rejects_unusable_php_worker_environment_names() {
+    // An empty name or one carrying "=" cannot be expressed as a process
+    // environment entry, so it is refused at the configuration boundary rather
+    // than producing a worker that silently lacks the variable.
+    for env in ["\"\" = \"value\"\n", "\"A=B\" = \"value\"\n"] {
+        let error = config::compile_str(&php_worker_config_with_env(env), Path::new("."));
+        assert!(
+            matches!(error, Err(ConfigError::Validation(_))),
+            "expected a validation error for env {env:?}"
+        );
+    }
+}
+
+#[test]
+fn accepts_a_php_worker_environment_table() {
+    // Valid env passes validation; compilation then fails later on the missing
+    // executable, which is what proves env itself was not the objection.
+    let error = config::compile_str(
+        &php_worker_config_with_env("HAMSTER_LARAVEL_PATH = \"/srv/app\"\n"),
+        Path::new("."),
+    );
+    match error {
+        Err(ConfigError::Validation(message)) => {
+            assert!(
+                !message.contains("env"),
+                "valid env was rejected: {message}"
+            );
+        }
+        Err(_) => {}
+        Ok(_) => panic!("a missing executable should not compile"),
+    }
 }
 
 #[test]

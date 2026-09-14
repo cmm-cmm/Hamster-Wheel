@@ -147,6 +147,28 @@ fn php_runtime_with_script(
         .expect("PHP runtime config should compile")
 }
 
+fn php_runtime_with_env(
+    workers: usize,
+    script: &Path,
+    env: &[(&str, &str)],
+) -> config::RuntimeConfig {
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let mut source = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = 8\n\n[hosts.locations.php.env]\n",
+        toml_literal(&executable),
+        toml_literal(script)
+    );
+    for (name, value) in env {
+        source.push_str(&format!("{name} = \"{value}\"\n"));
+    }
+    config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("PHP runtime config with env should compile")
+}
+
 fn marker_path(name: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -265,6 +287,39 @@ fn json_number(body: &[u8], field: &str) -> u64 {
     body[start..end]
         .parse()
         .expect("state field should be numeric")
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn laravel_request_reconstruction_passes_its_own_checks() {
+    // The repository does not vendor a Laravel application, so the worker's
+    // request reconstruction is covered by a PHP script that checks itself
+    // against a stub UploadedFile. Cookie parsing, multipart splitting and
+    // PHP-style field names are where the defects were, and none of them needs
+    // a framework to test.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let executable = root.join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let output = tokio::process::Command::new(executable)
+        .arg(root.join("fixtures/php-worker/laravel_request_test.php"))
+        .output()
+        .await
+        .expect("php must be runnable");
+    assert!(
+        output.status.success(),
+        "request reconstruction checks failed:
+{}
+{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("checks passed"),
+        "the check script must report what it verified"
+    );
 }
 
 #[tokio::test]
@@ -717,8 +772,28 @@ async fn respawn_after_idle_crash_restores_target() {
     let initial = pool.snapshot().workers[0].clone();
     kill_process(initial.pid.unwrap()).await;
 
-    let detecting = server.request(&close_request("/hello")).await;
-    assert!(detecting.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+    // 0.4 supersedes the 0.3 expectation of a 502 here. The process was reaped
+    // before a byte of the request frame was written, which proves PHP never
+    // saw it, so the job is queued again instead of failing the client. The
+    // execution marker is what keeps that honest: a replay writes a second
+    // line, and this asserts there is exactly one.
+    let execution = marker_path("idle-crash-redispatch");
+    let path = format!(
+        "/state?execution_marker={}&execution_id=redispatched-once",
+        url_encode(&execution)
+    );
+    let detecting = server.request(&close_request(&path)).await;
+    let (detecting_headers, detecting_body) = split_response(&detecting);
+    assert!(
+        detecting_headers.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "a provably unstarted request must be redispatched, not failed"
+    );
+    assert_ne!(
+        json_number(detecting_body, "pid") as u32,
+        initial.pid.unwrap()
+    );
+    assert_eq!(marker_lines(&execution), ["redispatched-once"]);
+    let _ = tokio::fs::remove_file(execution).await;
     let recovered = wait_for_pool(pool, |snapshot| {
         snapshot.ready_workers == 1 && snapshot.workers[0].generation > initial.generation
     })
@@ -845,21 +920,59 @@ async fn all_workers_crash_then_pool_recovers() {
         kill_process(pid).await;
     }
 
+    // 0.4 made the status of these four requests genuinely non-deterministic,
+    // and asserting a specific one was always wrong. Each request is dispatched
+    // to a worker that is already dead, which proves PHP never saw it, so it is
+    // queued again once; whether the retry finds a replacement ready or another
+    // corpse is a race. What must hold is what this asserts: every request is
+    // answered, none hangs, no 5xx other than the two the pool can legitimately
+    // produce, and the request body executed at most once per client request.
+    let execution = marker_path("all-crash-execution");
     let mut detecting = Vec::new();
-    for _ in 0..4 {
+    for index in 0..4 {
         let address = server.address;
+        let path = format!(
+            "/hello?execution_marker={}&execution_id=client-{index}",
+            url_encode(&execution)
+        );
         detecting.push(tokio::spawn(async move {
-            request_at(address, &close_request("/hello")).await
+            request_at(address, &close_request(&path)).await
         }));
     }
+    let mut served = 0;
     for response in detecting {
+        let response = tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .expect("every request must be answered")
+            .unwrap();
+        let status = &response[..15.min(response.len())];
         assert!(
-            response
-                .await
-                .unwrap()
-                .starts_with(b"HTTP/1.1 502 Bad Gateway\r\n")
+            status.starts_with(b"HTTP/1.1 200 ")
+                || status.starts_with(b"HTTP/1.1 502 ")
+                || status.starts_with(b"HTTP/1.1 503 "),
+            "unexpected status: {}",
+            String::from_utf8_lossy(status)
         );
+        if status.starts_with(b"HTTP/1.1 200 ") {
+            served += 1;
+        }
     }
+    // At most once, not exactly once: a request answered 502 never ran, and a
+    // request answered 200 ran exactly one time.
+    let executions = marker_lines(&execution);
+    let unique: HashSet<&String> = executions.iter().collect();
+    assert_eq!(
+        executions.len(),
+        unique.len(),
+        "a request executed more than once: {executions:?}"
+    );
+    assert_eq!(
+        executions.len(),
+        served,
+        "every served request must have executed exactly once"
+    );
+    let _ = tokio::fs::remove_file(execution).await;
+
     let recovered = wait_for_pool(pool, |snapshot| {
         snapshot.ready_workers == 4 && snapshot.workers.iter().all(|worker| worker.generation > 1)
     })
@@ -1688,4 +1801,89 @@ async fn ctrl_c_stops_server_and_reaps_pool() {
         "unexpected diagnostics: {diagnostics:?}"
     );
     let _ = tokio::fs::remove_file(config_path).await;
+}
+
+/// The worker environment is how a worker script is told which application it
+/// serves, so the map has to arrive in the child process rather than merely
+/// parse. A pool that silently drops it would serve nothing at all.
+#[tokio::test]
+#[ignore = "requires php/8.5/php.exe"]
+async fn configured_environment_reaches_the_worker_process() {
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/env_worker.php");
+    let runtime = Arc::new(php_runtime_with_env(
+        1,
+        &script,
+        &[
+            ("HAMSTER_TEST_APP", "pms"),
+            ("HAMSTER_TEST_MODE", "targeted"),
+        ],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+
+    for (name, expected) in [
+        ("HAMSTER_TEST_APP", "pms"),
+        ("HAMSTER_TEST_MODE", "targeted"),
+        ("HAMSTER_TEST_ABSENT", "<unset>"),
+    ] {
+        let response = server
+            .request(&close_request(&format!("/env?name={name}")))
+            .await;
+        let (_, body) = split_response(&response);
+        assert_eq!(
+            std::str::from_utf8(body).unwrap(),
+            expected,
+            "worker reported the wrong value for {name}"
+        );
+    }
+
+    server.stop().await;
+}
+
+/// A replacement generation is a fresh process, so it has to be given the same
+/// environment. Without this a pool degrades after the first crash into workers
+/// that no longer know what to serve.
+#[tokio::test]
+#[ignore = "requires php/8.5/php.exe"]
+async fn replacement_generation_receives_the_configured_environment() {
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/env_worker.php");
+    let runtime = Arc::new(php_runtime_with_env(
+        1,
+        &script,
+        &[("HAMSTER_TEST_APP", "pms")],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    // Hold the runtime separately: `stop` consumes the server, and the pool is
+    // inspected while the server is still serving.
+    let runtime = Arc::clone(&server.runtime);
+    let pool = runtime.php_worker().unwrap();
+    let original = pool.snapshot().workers[0].pid;
+
+    let _ = server.request(&close_request("/crash")).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = pool.snapshot();
+        if snapshot.ready_workers == 1 && snapshot.workers[0].pid != original {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement generation never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let response = server
+        .request(&close_request("/env?name=HAMSTER_TEST_APP"))
+        .await;
+    let (_, body) = split_response(&response);
+    assert_eq!(
+        std::str::from_utf8(body).unwrap(),
+        "pms",
+        "replacement generation lost its environment"
+    );
+
+    server.stop().await;
 }

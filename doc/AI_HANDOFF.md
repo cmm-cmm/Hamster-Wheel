@@ -2,12 +2,14 @@
 
 ## Current Milestone
 
-0.3.1 — PHP Worker Lifecycle, retirement hardening. `v0.3.0` and `v0.3.1`
-are tagged on `dev`; the retirement-hardening pass sits uncommitted on top of
-`17af4d1` and is awaiting owner review. The accepted contract is
-`doc/WORKER_LIFECYCLE_0_3.md`, including its implementation amendments and the
-revised Backoff and Cooldown section. Milestone 0.2.0 is closed; its
-transaction-safety invariants remain mandatory.
+0.4.0 — Laravel Persistent Worker. Research is complete and the implementation
+is uncommitted on top of `616e4ee`, awaiting owner review. The findings,
+measurements and rejected alternatives are in `doc/LARAVEL_WORKER_0_4.md`.
+
+0.3.1 is closed: `v0.3.0` and `v0.3.1` are tagged on `dev` and the retirement
+hardening is committed as `616e4ee`. The accepted lifecycle contract remains
+`doc/WORKER_LIFECYCLE_0_3.md` and 0.4 reuses it unchanged. Milestone 0.2.0 is
+closed; its transaction-safety invariants remain mandatory.
 
 ## Current Status
 
@@ -61,23 +63,41 @@ make the respawn rate proportional to throughput.
 
 ## Known Limitations
 
-Idle worker death is detected passively on its next assignment. There is no
+Idle worker death is detected passively on its next assignment, but a request
+that finds a dead worker is now queued again rather than failed, because a
+process reaped before the frame write proves PHP never received it. There is no
 proactive stdout probe, adaptive sizing, memory-threshold recycle, or
 byte-based admission. Permanent slot retirement no longer exists: prolonged
 failure settles into a 300-second cooldown ceiling instead. HTTP bodies
 still buffer before pool admission. `max_requests` and `max_worker_age` default
 OFF; recycling is stop-then-spawn and permits one voluntary recycle at a time.
 Both recycle policies are thresholds rather than caps; see the recycling
-limitation in `doc/PHP_WORKER.md`. Application Reset moved to 0.4.0 Laravel
-Worker.
+limitation in `doc/PHP_WORKER.md`. Application Reset is implemented in 0.4.0
+for Laravel, in PHP, and so is `multipart/form-data` with file uploads, bounded
+by the protocol's 1 MiB body limit.
 
 ## Current Findings
 
-All Windows quality gates pass. The complete ignored suite includes the 18-test
-lifecycle matrix, the existing 0.2 cancellation/shutdown regressions, the
-100,000-request pool-level soak, a 10,000-request forced-failure HTTP soak, and
-the 60-second W4 continuous-load random-kill stress. PHP lint, protocol-v1
-diff, and post-test orphan checks pass.
+Windows quality gates: `fmt --check`, clippy with `-D warnings`, the default
+suite (34 unit, 16 configuration, 4 routing, 5 static), a release build and
+`cargo bench --no-run --features profiling` all pass. The ignored suite run
+single-threaded is 38 passed, 1 failed, and the one failure is
+`ctrl_c_stops_server_and_reaps_pool` under ConPTY, which is the documented
+harness gap that also fails on the unmodified tree. The complete ignored suite
+includes the 18-test lifecycle matrix, the existing 0.2 cancellation/shutdown
+regressions, the 100,000-request pool-level soak, a 10,000-request
+forced-failure HTTP soak, the 60-second W4 continuous-load random-kill stress,
+and the Laravel request-reconstruction checks. PHP lint over all 14 fixtures and
+post-test orphan checks pass.
+
+Protocol v1 is unchanged on the wire. `src/php_protocol.rs` differs from
+`v0.2.0` only inside the old `write_frame` body, which now delegates to
+`write_frame_tracked`; the constants, encoders and decoders are untouched and
+`fixtures/php-worker/protocol.php` is byte-identical.
+
+The Linux cross-target check could not be run on this machine: the
+`x86_64-unknown-linux-gnu` target is not installed in this rustup toolchain.
+Linux remains unverified, as before.
 
 `ctrl_c_stops_server_and_reaps_pool` needs a real conhost console. Its
 `GetConsoleCP` guard does not detect a ConPTY or pseudo-console session, so
@@ -111,12 +131,18 @@ The first item is done on `dev` after the `v0.3.0` tag.
   `MAX_CONSECUTIVE_FAILURES` and assert the resulting state.
 - Strengthen the `ctrl_c_stops_server_and_reaps_pool` console guard so a
   ConPTY session skips instead of failing.
-- Distinguish "the process exited before REQUEST was written" from a
-  possibly-started failure. That case proves PHP never received the frame, so
-  it may be redispatched without weakening the never-retry invariant.
-- `all_workers_crash_then_pool_recovers` asserts all four concurrent requests
-  receive 502; a fast replacement can answer one with 200. Make it
-  deterministic.
+- DONE: "the process exited before REQUEST was written" is distinguished from a
+  possibly-started failure. `PhpWorkerError::NotStarted` is returned when
+  `try_wait` reaps the process first or when the frame write transfers zero
+  bytes, and such a job is queued again once. `write_frame_tracked` reports the
+  transferred count, which `write_all` cannot.
+  `respawn_after_idle_crash_restores_target` now asserts a 200 and exactly one
+  execution.
+- DONE: `all_workers_crash_then_pool_recovers` is deterministic. It no longer
+  asserts a particular status, which was never knowable, and instead asserts
+  that every request is answered within ten seconds with 200, 502 or 503 and
+  that the number of executions equals the number of requests served, with no
+  duplicates. Five consecutive runs pass.
 - Smaller debt: `WorkerState` and `WorkerLifecycleState` duplicate each other;
   the pre-request exit path drops the worker without awaiting its stderr
   drain; `total_respawns` also counts planned recycles; the dispatcher's
@@ -153,10 +179,72 @@ four under a real console; it compares raw PIDs, and the new tests recycle PIDs
 much faster. Repository php.exe count was zero after every run, so no orphan
 was ever present.
 
+## 0.4.0 Laravel Persistent Worker (uncommitted, awaiting review)
+
+The server learned one generic thing: `php.env`, a `BTreeMap<String, String>`
+carried through all three configuration stages into `PhpWorkerConfig` and
+applied with `Command::envs`. Every generation, replacements included, receives
+it. All Laravel knowledge lives in PHP, in
+`fixtures/php-worker/laravel_worker.php` and `laravel_reset.php`.
+`fixtures/php-worker/env_worker.php` exists so the environment can be observed
+from an HTTP response.
+
+Verified on a Laravel 12 skeleton and on a real 305-route application with JWT,
+Redis sessions and remote MySQL. Persistent bootstrap is worth 19.4x on a
+trivial route, 10.8x on a Blade login page, and 1.31x on a 2.2 MB
+database-bound dashboard: the gain is inversely proportional to how much real
+work a request does. The request-boundary reset costs 0.018 ms.
+
+The reset is not optional. With one worker and no reset, an anonymous client
+sending no cookie at all was served another user's authenticated 2.2 MB
+dashboard. A four-worker pool hides this, so any isolation test must pin
+`workers = 1`.
+
+Two request-reconstruction defects were found by testing against the real
+application and fixed: `Request::create()` never parses `HTTP_COOKIE` into its
+cookie bag, and it ignores the body entirely, so sessions, authentication and
+every form POST were broken. The worker now builds the request directly.
+
+`multipart/form-data` and file uploads are implemented in
+`fixtures/php-worker/laravel_request.php`: the worker splits the body, applies
+PHP's `a[b][]` field-name rules, writes each file to a temporary and builds
+`UploadedFile` objects in test mode, which is required or every Laravel `file`
+validation rule rejects the upload. The worker deletes its own temporaries,
+because Laravel's `store()` copies rather than moves and relies on a SAPI
+request shutdown that never happens. Verified byte-exact over HTTP, and 600
+uploads left zero temporaries behind. Bodies are still capped at the protocol's
+1 MiB.
+
+A production-tuned measurement of the supplied application was taken without
+modifying it, by copying it and running `artisan optimize` against the copy. It
+reframes the headline: the persistent gain on a trivial route is 3.3x rather
+than 20x, and 7.6x on a Blade page. `artisan optimize` also made the persistent
+worker slower on `/up` and leaked 378 B/request there, because
+`withRouting(health: ...)` is a closure route and the route cache makes every
+dispatch unserialize it.
+
+Eight further probes covered Eloquent statics, the queue manager, forced URL
+origins, macros and connection callbacks. Four are now isolated by the reset.
+Three are deliberately not: global scopes cannot be restored without
+permanently unfiltering soft deletes, which is demonstrated rather than
+asserted, and macros cannot be enumerated.
+
+Known gaps: userland statics leak and cannot be fixed by a server; global
+scopes and macros registered during a request leak by design; cached closure
+routes leak memory inside Laravel itself.
+
 ## Next Action
 
-Owner review of the uncommitted retirement-hardening pass. After that, either
-close 0.3 or open the 0.4.0 Laravel Worker milestone. `NotStarted` redispatch
-for provably-before-first-write failures remains deliberately deferred, and is
-the highest-value remaining lifecycle item. Do not change protocol v1 outside a
-milestone that owns it.
+Owner review of the uncommitted 0.4 worker. The three items previously listed
+here are done: `multipart/form-data`, the production-tuned measurement, and the
+`NotStarted` redispatch. The highest-value remaining items, in order:
+
+- Raise the 1 MiB request body limit, or stream bodies, so uploads larger than
+  that work. This is a protocol change and needs a milestone that owns the
+  protocol; do not change protocol v1 outside one.
+- Exercise the supplied application's own import endpoints. Not done here
+  because they write to the owner's database.
+- Native Linux verification, still deferred.
+- Strengthen the `ctrl_c_stops_server_and_reaps_pool` console guard so a ConPTY
+  session skips instead of failing. It is now the only test that fails under
+  ConPTY.

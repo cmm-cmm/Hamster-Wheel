@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt,
     future::pending,
     io,
@@ -33,6 +33,7 @@ use crate::{
     php_protocol::{
         MAX_HEADERS, ProtocolError, WorkerRequest, WorkerResponse, decode_ready, decode_response,
         decode_shutdown_ack, encode_request, encode_shutdown, read_frame, write_frame,
+        write_frame_tracked,
     },
 };
 
@@ -67,11 +68,47 @@ const COOLDOWN_BASE: Duration = Duration::from_secs(30);
 /// operator restart after a transient host problem.
 const COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const RECYCLE_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// How many times a single job may be queued again after a worker proved it
+/// never received the request. One covers the case this exists for -- a worker
+/// that died while idle, detected by the next request -- while keeping a
+/// crash-looping pool from bouncing one job between dead generations.
+const MAX_NOT_STARTED_REDISPATCHES: u8 = 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Default)]
 pub struct PhpWorkerConfig {
     pub executable: PathBuf,
     pub script: PathBuf,
+    /// Extra environment for the child, on top of the server's own environment.
+    /// The pool never reads these; they exist so a worker script can be told
+    /// where its application lives without the server knowing what it is.
+    /// A `BTreeMap` keeps the spawn order deterministic.
+    pub env: BTreeMap<String, String>,
+}
+
+/// Redacts environment values. Operators put database and cache credentials in
+/// `php.env`, so a derived `Debug` would put them in whatever log or panic
+/// message first formats a configuration. Names stay visible because they are
+/// what makes a misconfiguration diagnosable.
+impl fmt::Debug for PhpWorkerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PhpWorkerConfig")
+            .field("executable", &self.executable)
+            .field("script", &self.script)
+            .field("env", &RedactedEnv(&self.env))
+            .finish()
+    }
+}
+
+struct RedactedEnv<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedEnv<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_map()
+            .entries(self.0.keys().map(|name| (name, "<redacted>")))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +219,19 @@ pub enum PhpWorkerError {
     Startup(String),
     Unavailable(String),
     Request(String),
+    /// The worker failed while it was provably still ignorant of the request:
+    /// the process was already gone before a byte was written, or the frame
+    /// write failed without transferring anything. The job may be dispatched
+    /// again; every other failure may not.
+    NotStarted(String),
     Shutdown(String),
+}
+
+/// A failed transaction plus the only fact that decides whether its job may be
+/// dispatched again.
+struct TransactionFailure {
+    started: bool,
+    message: String,
 }
 
 impl fmt::Display for PhpWorkerError {
@@ -198,6 +247,10 @@ impl fmt::Display for PhpWorkerError {
             Self::Startup(message) => write!(formatter, "PHP worker startup failed: {message}"),
             Self::Unavailable(message) => write!(formatter, "PHP worker unavailable: {message}"),
             Self::Request(message) => write!(formatter, "PHP worker request failed: {message}"),
+            Self::NotStarted(message) => write!(
+                formatter,
+                "PHP worker failed before the request started: {message}"
+            ),
             Self::Shutdown(message) => write!(formatter, "PHP worker shutdown failed: {message}"),
         }
     }
@@ -207,7 +260,11 @@ impl std::error::Error for PhpWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Spawn { source, .. } => Some(source),
-            Self::Startup(_) | Self::Unavailable(_) | Self::Request(_) | Self::Shutdown(_) => None,
+            Self::Startup(_)
+            | Self::Unavailable(_)
+            | Self::Request(_)
+            | Self::NotStarted(_)
+            | Self::Shutdown(_) => None,
         }
     }
 }
@@ -292,6 +349,7 @@ impl PhpWorker {
         let mut command = Command::new(&self.config.executable);
         command
             .arg(&self.config.script)
+            .envs(&self.config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -408,7 +466,7 @@ impl PhpWorker {
 
     pub(crate) async fn execute(
         &mut self,
-        request: WorkerRequest,
+        request: &WorkerRequest,
     ) -> Result<WorkerResponse, PhpWorkerError> {
         let prior_exit = match &mut self.inner {
             WorkerSlot::Running(worker) => worker.child.try_wait(),
@@ -433,9 +491,13 @@ impl PhpWorker {
             }
         };
         if let Some(status) = prior_exit {
+            // The process was reaped before a single byte of this request was
+            // written, so PHP demonstrably never saw it. This is the one class
+            // of failure the never-retry invariant permits to be dispatched
+            // again.
             let message = format!("process exited before request with status {status}");
             self.inner = WorkerSlot::Unavailable(message.clone());
-            return Err(PhpWorkerError::Unavailable(message));
+            return Err(PhpWorkerError::NotStarted(message));
         }
 
         let transaction = {
@@ -446,7 +508,7 @@ impl PhpWorker {
             worker.state = WorkerState::Busy;
             let request_id = worker.next_request_id;
             worker.next_request_id = worker.next_request_id.wrapping_add(1).max(1);
-            let payload = match encode_request(request_id, &request) {
+            let payload = match encode_request(request_id, request) {
                 Ok(payload) => payload,
                 Err(error) => {
                     worker.state = WorkerState::Ready;
@@ -454,23 +516,40 @@ impl PhpWorker {
                 }
             };
             let operation = async {
-                write_frame(&mut worker.stdin, &payload).await?;
-                let payload = read_frame(&mut worker.stdout).await?;
-                let response = decode_response(&payload)?;
-                if response.request_id != request_id {
-                    return Err(ProtocolError::Invalid(format!(
-                        "response ID {} does not match request ID {request_id}",
-                        response.request_id
-                    )));
+                // Everything past a frame write that moved bytes is
+                // possibly-started: PHP may already be executing, so those
+                // failures must never be dispatched again.
+                if let Err(error) = write_frame_tracked(&mut worker.stdin, &payload).await {
+                    return Err(TransactionFailure {
+                        started: error.transferred > 0,
+                        message: error.to_string(),
+                    });
                 }
-                Ok(response)
+                let read = async {
+                    let payload = read_frame(&mut worker.stdout).await?;
+                    let response = decode_response(&payload)?;
+                    if response.request_id != request_id {
+                        return Err(ProtocolError::Invalid(format!(
+                            "response ID {} does not match request ID {request_id}",
+                            response.request_id
+                        )));
+                    }
+                    Ok(response)
+                };
+                read.await
+                    .map_err(|error: ProtocolError| TransactionFailure {
+                        started: true,
+                        message: error.to_string(),
+                    })
             };
             match timeout(self.timeouts.request, operation).await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(_) => Err(format!(
-                    "timeout after {} ms",
-                    self.timeouts.request.as_millis()
-                )),
+                Ok(result) => result,
+                // A timeout says nothing about how far PHP got, so it is
+                // always treated as started.
+                Err(_) => Err(TransactionFailure {
+                    started: true,
+                    message: format!("timeout after {} ms", self.timeouts.request.as_millis()),
+                }),
             }
         };
 
@@ -481,9 +560,13 @@ impl PhpWorker {
                 }
                 Ok(response)
             }
-            Err(message) => {
-                fail_worker(&mut self.inner, &message).await;
-                Err(PhpWorkerError::Request(message))
+            Err(failure) => {
+                fail_worker(&mut self.inner, &failure.message).await;
+                Err(if failure.started {
+                    PhpWorkerError::Request(failure.message)
+                } else {
+                    PhpWorkerError::NotStarted(failure.message)
+                })
             }
         }
     }
@@ -588,6 +671,10 @@ struct PoolRuntime {
 struct PhpJob {
     request: WorkerRequest,
     response_tx: oneshot::Sender<Result<WorkerResponse, PoolJobError>>,
+    /// How many times this job has already been queued again after a worker
+    /// proved it never received the request. Bounds the retry so a pool that
+    /// is crash-looping cannot bounce one job forever.
+    redispatches: u8,
 }
 
 enum PoolJobError {
@@ -974,6 +1061,7 @@ impl PhpWorkerPool {
         let job = PhpJob {
             request,
             response_tx,
+            redispatches: 0,
         };
         match jobs_tx.try_send(job) {
             Ok(()) => {}
@@ -1326,7 +1414,7 @@ async fn run_worker_generation(
                     continue;
                 }
                 shared.mark_busy(slot, generation);
-                match worker.execute(job.request).await {
+                match worker.execute(&job.request).await {
                     Ok(response) => {
                         let request_count = shared.record_success(slot, generation, spawned_at);
                         let _ = job.response_tx.send(Ok(response));
@@ -1395,7 +1483,9 @@ async fn run_worker_generation(
                     }
                     Err(error) => {
                         let message = error.to_string();
-                        let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                        if let Some(job) = redispatch_not_started(&shared, &error, job) {
+                            let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                        }
                         shared.mark_unavailable(slot, generation);
                         eprintln!(
                             "PHP worker slot {slot} generation {generation} became unavailable: {error}"
@@ -1421,6 +1511,43 @@ async fn run_worker_generation(
     }
 }
 
+/// Queues a job again when, and only when, the worker proved it never received
+/// the request.
+///
+/// This is the second of the two provably-safe redispatch cases. The first is a
+/// closed generation mailbox, which the dispatcher already handles: a closed
+/// mailbox means the generation task is gone and never took the job. This one
+/// means the process was already dead before any byte of the frame was written,
+/// so PHP cannot have started executing. Every other failure, including a
+/// timeout and any failure after a partial write, stays a 502.
+///
+/// Returns the job when it must be failed instead, and `None` when it has been
+/// queued again or its client has already disconnected.
+fn redispatch_not_started(
+    shared: &PoolShared,
+    error: &PhpWorkerError,
+    mut job: PhpJob,
+) -> Option<PhpJob> {
+    if !matches!(error, PhpWorkerError::NotStarted(_)) {
+        return Some(job);
+    }
+    if job.redispatches >= MAX_NOT_STARTED_REDISPATCHES {
+        return Some(job);
+    }
+    if job.response_tx.is_closed() {
+        return None;
+    }
+    let Some(jobs_tx) = shared.jobs_tx.get() else {
+        return Some(job);
+    };
+    job.redispatches += 1;
+    match jobs_tx.try_send(job) {
+        Ok(()) => None,
+        Err(mpsc::error::TrySendError::Full(returned)) => Some(returned),
+        Err(mpsc::error::TrySendError::Closed(returned)) => Some(returned),
+    }
+}
+
 async fn drain_and_stop_generation(
     slot: usize,
     generation: u64,
@@ -1435,14 +1562,19 @@ async fn drain_and_stop_generation(
             continue;
         }
         shared.mark_busy(slot, generation);
-        match worker.execute(job.request).await {
+        match worker.execute(&job.request).await {
             Ok(response) => {
                 shared.record_success(slot, generation, spawned_at);
                 let _ = job.response_tx.send(Ok(response));
             }
             Err(error) => {
                 let message = error.to_string();
-                let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                // Admission is already closed by the time a drain runs, so the
+                // queue will refuse the job and it is failed exactly as before.
+                // The call is kept so there is one rule, not two.
+                if let Some(job) = redispatch_not_started(shared, &error, job) {
+                    let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                }
                 shared.mark_unavailable(slot, generation);
                 return GenerationOutcome::Failed(error.to_string());
             }
@@ -2128,6 +2260,7 @@ mod tests {
             script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures/php-worker")
                 .join(script),
+            ..Default::default()
         }
     }
 
@@ -2161,6 +2294,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_provably_unstarted_job_is_queued_again_and_only_once() {
+        let pool = pool("worker.php", 1, 1);
+        let (jobs_tx, mut jobs_rx) = mpsc::channel(1);
+        pool.shared.jobs_tx.set(jobs_tx).unwrap();
+
+        let job = |redispatches: u8| {
+            let (response_tx, response_rx) = oneshot::channel();
+            (
+                PhpJob {
+                    request: request("GET", "/hello", "", Vec::new()),
+                    response_tx,
+                    redispatches,
+                },
+                response_rx,
+            )
+        };
+        let started = PhpWorkerError::Request("timeout".to_owned());
+        let not_started = PhpWorkerError::NotStarted("process exited".to_owned());
+
+        // A failure that may have started execution is never queued again, no
+        // matter how many attempts are left.
+        let (candidate, _keep_alive) = job(0);
+        assert!(redispatch_not_started(&pool.shared, &started, candidate).is_some());
+
+        // A provably unstarted job goes back to the queue, carrying its spent
+        // attempt with it.
+        let (candidate, _keep_alive) = job(0);
+        assert!(redispatch_not_started(&pool.shared, &not_started, candidate).is_none());
+        let queued = jobs_rx.try_recv().expect("the job must be queued again");
+        assert_eq!(queued.redispatches, 1);
+
+        // The second unstarted failure for the same job is where it stops.
+        let (candidate, _keep_alive) = job(1);
+        assert!(redispatch_not_started(&pool.shared, &not_started, candidate).is_some());
+
+        // A full queue is refused rather than dropped, so the caller still
+        // answers the client.
+        let (filler, _filler_alive) = job(0);
+        assert!(redispatch_not_started(&pool.shared, &not_started, filler).is_none());
+        let (candidate, _keep_alive) = job(0);
+        assert!(redispatch_not_started(&pool.shared, &not_started, candidate).is_some());
+
+        // A client that has already disconnected is dropped, not queued.
+        let (candidate, response_rx) = job(0);
+        drop(response_rx);
+        assert!(redispatch_not_started(&pool.shared, &not_started, candidate).is_none());
+    }
+
+    #[tokio::test]
     async fn dispatcher_abort_releases_pending_and_future_callers() {
         let pool = pool("worker.php", 1, 8);
         let (jobs_tx, jobs_rx) = mpsc::channel(8);
@@ -2174,6 +2356,7 @@ mod tests {
             .send(PhpJob {
                 request: request("GET", "/hello", "", Vec::new()),
                 response_tx,
+                redispatches: 0,
             })
             .await
             .unwrap();
@@ -2205,12 +2388,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn worker_config_debug_hides_environment_values() {
+        let config = PhpWorkerConfig {
+            executable: PathBuf::from("php.exe"),
+            script: PathBuf::from("worker.php"),
+            env: BTreeMap::from([
+                ("HAMSTER_LARAVEL_PATH".to_owned(), "/srv/app".to_owned()),
+                ("DB_PASSWORD".to_owned(), "hunter2".to_owned()),
+            ]),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(
+            rendered.contains("DB_PASSWORD"),
+            "names must stay visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hunter2") && !rendered.contains("/srv/app"),
+            "values must not appear in Debug output: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn stale_generation_channel_cannot_receive_a_job() {
         let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
             worker: PhpWorkerConfig {
                 executable: PathBuf::from("unused-php"),
                 script: PathBuf::from("unused-worker.php"),
+                ..Default::default()
             },
             workers: 1,
             queue_capacity: 8,
@@ -2236,6 +2442,7 @@ mod tests {
             .send(PhpJob {
                 request: request("GET", "/hello", "", Vec::new()),
                 response_tx,
+                redispatches: 0,
             })
             .await
             .unwrap();
@@ -2254,6 +2461,7 @@ mod tests {
             worker: PhpWorkerConfig {
                 executable: PathBuf::from("unused-php"),
                 script: PathBuf::from("unused-worker.php"),
+                ..Default::default()
             },
             workers: 1,
             queue_capacity: 8,
@@ -2304,6 +2512,7 @@ mod tests {
             .send(PhpJob {
                 request: request("GET", "/hello", "", Vec::new()),
                 response_tx,
+                redispatches: 0,
             })
             .await
             .unwrap();
@@ -2391,6 +2600,7 @@ mod tests {
             .try_send(WorkerCommand::Job(PhpJob {
                 request: request("GET", "/", "", Vec::new()),
                 response_tx,
+                redispatches: 0,
             }))
             .expect("the live mailbox must accept the job");
         let WorkerCommand::Job(delivered) = live_rx.recv().await.expect("job must be delivered");
@@ -2510,7 +2720,7 @@ mod tests {
         assert_eq!(worker.pid(), Some(started.pid));
 
         let empty = worker
-            .execute(request("GET", "/state", "", Vec::new()))
+            .execute(&request("GET", "/state", "", Vec::new()))
             .await
             .unwrap();
         let state = String::from_utf8(empty.body).unwrap();
@@ -2519,7 +2729,7 @@ mod tests {
         assert!(state.contains("\"request\":1"));
 
         let inspected = worker
-            .execute(request(
+            .execute(&request(
                 "POST",
                 "/inspect",
                 "name=hamster&mode=worker",
@@ -2537,7 +2747,7 @@ mod tests {
 
         let binary = vec![0, 10, 13, 128, 255];
         let echoed = worker
-            .execute(request("POST", "/echo", "", binary.clone()))
+            .execute(&request("POST", "/echo", "", binary.clone()))
             .await
             .unwrap();
         assert_eq!(echoed.status, 201);
@@ -2553,7 +2763,7 @@ mod tests {
 
         let large = vec![b'x'; 256 * 1024];
         let echoed = worker
-            .execute(request("POST", "/large", "", large.clone()))
+            .execute(&request("POST", "/large", "", large.clone()))
             .await
             .unwrap();
         assert_eq!(echoed.body, large);
@@ -2641,14 +2851,14 @@ mod tests {
             worker.start().await.unwrap();
             assert!(
                 worker
-                    .execute(request("GET", path, "", Vec::new()))
+                    .execute(&request("GET", path, "", Vec::new()))
                     .await
                     .is_err()
             );
             assert_eq!(worker.state(), WorkerState::Unavailable);
             assert!(matches!(
                 worker
-                    .execute(request("GET", "/hello", "", Vec::new()))
+                    .execute(&request("GET", "/hello", "", Vec::new()))
                     .await,
                 Err(PhpWorkerError::Unavailable(_))
             ));
@@ -2664,7 +2874,7 @@ mod tests {
         );
         worker.start().await.unwrap();
         let error = worker
-            .execute(request("GET", "/delay", "ms=500", Vec::new()))
+            .execute(&request("GET", "/delay", "ms=500", Vec::new()))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("timeout"));
@@ -2681,7 +2891,7 @@ mod tests {
         worker.start().await.unwrap();
         assert!(
             worker
-                .execute(request("POST", "/large", "", vec![b'x'; MAX_REQUEST_BODY]))
+                .execute(&request("POST", "/large", "", vec![b'x'; MAX_REQUEST_BODY]))
                 .await
                 .is_err()
         );
@@ -2691,14 +2901,14 @@ mod tests {
         let mut worker = PhpWorker::new(fixture("worker.php"));
         worker.start().await.unwrap();
         let response = worker
-            .execute(request("GET", "/exit-after-response", "", Vec::new()))
+            .execute(&request("GET", "/exit-after-response", "", Vec::new()))
             .await
             .unwrap();
         assert_eq!(response.body, b"exiting");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             worker
-                .execute(request("GET", "/hello", "", Vec::new()))
+                .execute(&request("GET", "/hello", "", Vec::new()))
                 .await
                 .is_err()
         );
@@ -2714,7 +2924,7 @@ mod tests {
             worker.start().await.unwrap();
             if send_request {
                 worker
-                    .execute(request("GET", "/hello", "", Vec::new()))
+                    .execute(&request("GET", "/hello", "", Vec::new()))
                     .await
                     .unwrap();
             }
@@ -2726,7 +2936,7 @@ mod tests {
         let mut worker = PhpWorker::new(fixture("worker.php"));
         worker.start().await.unwrap();
         worker
-            .execute(request("GET", "/exit-after-response", "", Vec::new()))
+            .execute(&request("GET", "/exit-after-response", "", Vec::new()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;

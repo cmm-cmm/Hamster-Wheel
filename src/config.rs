@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     ffi::OsString,
     fmt, fs, io,
@@ -71,6 +71,11 @@ struct RawPhpWorker {
     queue_capacity: Option<usize>,
     max_requests: Option<u64>,
     max_worker_age: Option<u64>,
+    /// Extra environment for the worker process. The server never interprets
+    /// these; they let a worker script be told where its application lives
+    /// without the server needing to know what kind of application it is.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 const fn default_php_workers() -> usize {
@@ -309,6 +314,7 @@ enum ValidatedHandler {
         queue_capacity: usize,
         max_requests: Option<u64>,
         max_worker_age: Option<Duration>,
+        env: BTreeMap<String, String>,
     },
 }
 
@@ -471,6 +477,25 @@ pub(crate) fn validate_raw(
                             "{context}: milestone 0.3.0 permits exactly one php_worker location"
                         )));
                     }
+                    for name in php.env.keys() {
+                        if name.is_empty() {
+                            return Err(ConfigError::Validation(format!(
+                                "{context}.php.env has an empty variable name"
+                            )));
+                        }
+                        if name.contains('=') || name.contains('\0') {
+                            return Err(ConfigError::Validation(format!(
+                                "{context}.php.env name {name:?} must not contain \"=\" or NUL"
+                            )));
+                        }
+                    }
+                    for (name, value) in &php.env {
+                        if value.contains('\0') {
+                            return Err(ConfigError::Validation(format!(
+                                "{context}.php.env[{name:?}] must not contain NUL"
+                            )));
+                        }
+                    }
                     ValidatedHandler::PhpWorker {
                         executable: resolve_path(base_directory, php.executable),
                         script: resolve_path(base_directory, php.script),
@@ -478,6 +503,7 @@ pub(crate) fn validate_raw(
                         queue_capacity,
                         max_requests: php.max_requests,
                         max_worker_age: php.max_worker_age.map(Duration::from_secs),
+                        env: php.env,
                     }
                 }
                 handler => {
@@ -580,6 +606,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     queue_capacity,
                     max_requests,
                     max_worker_age,
+                    env,
                 } => {
                     let executable = canonical_file(
                         &executable,
@@ -596,7 +623,11 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         ),
                     )?;
                     let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
-                        worker: PhpWorkerConfig { executable, script },
+                        worker: PhpWorkerConfig {
+                            executable,
+                            script,
+                            env,
+                        },
                         workers,
                         queue_capacity,
                         max_requests,

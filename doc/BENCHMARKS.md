@@ -1272,3 +1272,115 @@ it already compared against, the new `cooldown_delay` runs only from
 `handle_serving_exit` on the failure path, and the `stash_idle` bound assertion is a
 `debug_assert!` that compiles out of the release profile, which sets no
 `[profile.release]` override and therefore leaves `debug-assertions` off.
+
+## 0.4 Laravel Persistent Worker — Bootstrap Cost
+
+Windows `x86_64-pc-windows-msvc`, PHP 8.5.10 NTS with OPcache, release build, four
+workers, concurrency 16, requests per second. Two applications:
+
+- **app12** — Laravel 12.69.2 skeleton with `artisan optimize` applied.
+- **PMS** — a real Laravel 12.66.0 application (305 routes, JWT, Redis sessions and
+  cache, remote MySQL, dompdf, PhpSpreadsheet), no config cache, supplied under the
+  git-ignored `www/`.
+
+The `cold` column rebuilds the Laravel application for every request **inside the same
+worker, through the same IPC path**, with the process alive and the OPcache warm. It is
+the best case a well-configured PHP-FPM deployment can reach, not `artisan serve`.
+The `no reset` column is faster than `reset` but is not a legitimate baseline: it is
+faster because it leaks authenticated identity between requests.
+
+| Application | Route | cold | no reset | reset | reset vs cold |
+| --- | --- | --- | --- | --- | --- |
+| PMS | /up | 347 | 7429 | 6721 | 19.4x |
+| PMS | /login (19 KB Blade) | 155 | 2090 | 1678 | 10.8x |
+| app12 | /c/json | 1628 | 4284 | 3781 | 2.32x |
+| app12 | /c/db | 1179 | 3291 | 2957 | 2.51x |
+| app12 | /c/view | 1500 | 3496 | 3192 | 2.13x |
+
+Authenticated PMS dashboard, 2,223,437 bytes, many queries against a remote MySQL,
+measured sequentially rather than at pool saturation: cold p50 312.90 ms / 3.2 rps,
+reset p50 238.27 ms / 4.2 rps, a gain of **1.31x**.
+
+The gain is inversely proportional to how much real work a request does. Bootstrap is a
+fixed cost of roughly 10 ms on PMS: the whole request on a trivial route, three percent
+of it on the dashboard. Both figures are real and a deployment will see the range.
+
+app12 has `artisan optimize` applied and PMS does not, so PMS's cold column re-reads
+every configuration file per request; a production-tuned PMS would land between the two
+applications, and that was not measured.
+
+For scale, the trivial 0.3 worker reached 5482 rps at concurrency 1 and 35,169 at 16 on
+the same host and build. Laravel, not Hamster's transport, is the limit.
+
+Reset cost, 400 iterations per step: 0.021 ms total on app12, 0.018 ms on PMS, dominated
+by `setLocale` at 0.010 ms. The reset itself is free; the measurable cost of correctness
+is rebuilding what it discarded, roughly 0.25-0.46 ms on a session-using route, which a
+per-request model pays as well.
+
+Memory, least-squares slope over the second half of each soak. Two-point slopes are
+unusable because PHP's cycle collector makes the series saw-tooth; an early two-point
+estimate reported 130 B/request that regression over 100,000 requests showed to be zero.
+
+| Soak | Slope |
+| --- | --- |
+| app12, controller routes, no reset, 100,000 requests | +0.0 B/request |
+| app12, controller routes, reset, 100,000 requests | -18.0 B/request |
+| app12 over HTTP, 237,477 requests, four routes | worker RSS pinned at 55.1 MB |
+
+One genuine leak was found and it is Laravel's, not Hamster's: a cached closure route
+leaks 786-1688 B per dispatch, scaling with the closure's source length, because
+`Route::runCallable()` unserializes the action on every dispatch and the serializer
+reconstructs it with an `include` of a stream whose op_array PHP never frees. Controller
+routes leak nothing. See `doc/LARAVEL_WORKER_0_4.md`.
+
+Bootstrap to READY: 58 ms median for app12, 71 ms for PMS, 403 ms worst observed, against
+a 5000 ms `STARTUP_TIMEOUT`.
+
+## 0.4 Laravel Persistent Worker — Production-Tuned Application
+
+Windows `x86_64-pc-windows-msvc`, PHP 8.5.10 NTS with OPcache, release build. Medians of
+three runs per cell, four workers, concurrency 16, minimum four seconds per run. The
+earlier 0.4 section measured PMS with no configuration or route cache, which flattered
+the persistent column; this measures both. The supplied application was not modified: it
+was copied to a scratch directory and `artisan optimize` was run against the copy.
+
+| Route | `artisan optimize` | cold rps | persistent rps | gain |
+| --- | --- | --- | --- | --- |
+| `/up` | no | 337 | 6,804 | 20.2x |
+| `/up` | yes | 1,618 | 5,359 | 3.3x |
+| `/login` | no | 158 | 1,703 | 10.8x |
+| `/login` | yes | 204 | 1,552 | 7.6x |
+
+Most of the twenty-fold figure was PMS being untuned. A production-tuned application
+keeps 3.3x on a trivial route and 7.6x on a Blade page.
+
+`artisan optimize` made the persistent worker slower on `/up`, and the cause is the
+cached-closure-route leak already documented meeting Laravel's own code:
+`withRouting(health: '/up')` registers the health endpoint as a closure, so the route
+cache makes every dispatch unserialize it. One worker, 30,003 requests to `/up`:
+
+| PMS build | rps | worker RSS before | worker RSS after | growth |
+| --- | --- | --- | --- | --- |
+| no route cache | 2,209 | 61.92 MB | 61.92 MB | 0 B/request |
+| `artisan optimize` | 1,773 | 64.16 MB | 74.97 MB | +377.9 B/request |
+
+Request-boundary reset, measured end to end after a real request rather than as a sum of
+per-step timings. The earlier 0.021 ms / 0.018 ms figures in the previous section are
+per-step sums and are not the cost of one call.
+
+| Reset | p50 | p95 |
+| --- | --- | --- |
+| app12 `/c/json`, n=800, full reset | 0.0524 ms | 0.0848 ms |
+| app12 `/c/json`, n=800, without the 0.4 Eloquent and url steps | 0.0492 ms | 0.0728 ms |
+| PMS `/login`, n=400, full reset | 0.0482 ms | 0.0865 ms |
+| PMS `/login`, n=400, without the 0.4 Eloquent and url steps | 0.0442 ms | 0.0694 ms |
+
+The added steps cost 0.003-0.004 ms per request, about 0.3 percent of a 1.1 ms request.
+An end-to-end throughput A/B could not resolve the difference: run-to-run variation
+within one server instance reached 23 percent, which is larger than the effect. As in
+0.3, this data can fail to detect a regression; it cannot prove there is none.
+
+Uploads, Laravel 12 over HTTP, four workers, 600 multipart requests across `/u/store`
+and `/u/inspect`: every response 200, and zero temporary files left in the system
+temporary directory. The request rate is not reported because the client is a serial
+`fsockopen` loop written to control the exact bytes on the wire, not a load driver.

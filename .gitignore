@@ -1,6 +1,9 @@
 /target/
 # Locally supplied PHP runtime; do not vendor binaries in Git.
 /php/
+# Locally supplied Laravel applications used for 0.4 worker measurement.
+# These are whole third-party projects with their own vendor trees.
+/www/
 .env
 .env.*
 !.env.example

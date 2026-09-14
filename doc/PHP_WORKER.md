@@ -118,6 +118,36 @@ This structurally fixes the known 0.1.2 cancellation availability limitation;
 it does not treat cancellation as worker failure and does not retry a possibly
 started transaction.
 
+### Provably unstarted redispatch (0.4)
+
+There are exactly two cases where a job may be dispatched again without
+weakening that invariant, and both are proofs that PHP never received the
+request rather than guesses that it probably did not.
+
+1. **A closed generation mailbox.** The dispatcher's `TrySendError::Closed`
+   means the generation task is gone and never took the job. This has existed
+   since 0.2.
+2. **A worker that was already dead, or that refused the first byte.** `execute`
+   now returns `PhpWorkerError::NotStarted` when `try_wait` reaps the process
+   before a byte of the frame is written, or when the frame write fails having
+   transferred **zero** bytes. `write_frame_tracked` exists to answer that
+   question, because `write_all` cannot.
+
+Everything else stays a `502`. A write that moved any number of bytes may have
+been read by PHP; a timeout says nothing about how far PHP got. Both are treated
+as started.
+
+A job carries a `redispatches` counter and `MAX_NOT_STARTED_REDISPATCHES` is 1.
+One retry covers the case this exists for -- a worker killed while idle, found
+by the next request -- while keeping a crash-looping pool from bouncing one job
+between dead generations. A requeue that cannot be admitted, because the queue
+is full or admission has closed, fails the job exactly as before.
+
+The visible change is that killing an idle worker no longer costs a client a
+`502`. `respawn_after_idle_crash_restores_target` asserts the `200` and, through
+the fixture's execution marker, that the request body ran exactly once.
+`possibly_started_request_is_never_retried` is untouched and still passes.
+
 ## Pool Configuration
 
 ```toml
@@ -175,6 +205,20 @@ spawns the executable directly with the script as its only argument; no shell,
 `php-cgi`, PHP-FPM, FastCGI, or command-string expansion is involved. Standard
 input and standard output carry only the protocol. Standard error is a separate
 pipe and is drained independently so diagnostics cannot corrupt framing.
+
+The optional `php.env` table adds environment variables to the child on top of
+the server's own environment, and every generation receives them, replacements
+included. The pool never reads them. They exist so a worker script can be told
+what application it serves without the server needing to know what kind of
+application that is, which is what keeps framework-specific logic out of Rust
+entirely; see `doc/LARAVEL_WORKER_0_4.md`.
+
+Because standard output is the frame stream, a worker script owns the whole of
+it. PHP's own diagnostics must be redirected to standard error before anything
+is loaded: PHP 8.5 emits deprecation notices for ordinary application code, and
+a single such line printed ahead of the first frame is read as a frame length.
+The shipped Laravel worker sets `display_errors = stderr` at its top and buffers
+both bootstrap and request handling for this reason.
 
 ## Lifecycle and Process Management
 
@@ -294,9 +338,35 @@ task whose lifetime is independent of the HTTP request. See
 
 Workers still use buffered messages, fixed timeout and size limits, and simple
 stderr diagnostics. There is no health polling, cancellation frame, streaming,
-respawn, recycle, adaptive sizing, or state reset. Respawn and advanced health
-management remain deferred to 0.3.0; FastCGI and Laravel integration remain
-separate later work.
+or adaptive sizing. FastCGI remains separate later work.
+
+### Laravel worker limitations (0.4)
+
+`fixtures/php-worker/laravel_worker.php` keeps a Laravel application alive
+across requests and resets request-scoped state at each boundary.
+`laravel_request.php` rebuilds the request, including cookies, urlencoded
+bodies and `multipart/form-data` uploads, because the SAPI layer that normally
+does that is not in the path. `laravel_reset.php` is the boundary reset.
+`laravel_request_test.php` checks the framework-free half of the reconstruction
+and is run by the ignored test
+`laravel_request_reconstruction_passes_its_own_checks`. What the worker does not
+do:
+
+- Request bodies are capped at the protocol's 1 MiB, uploads included. A larger
+  upload is `413` before the worker sees it.
+- Userland static properties survive the reset, and no server can prevent that.
+  Application code must not hold request state in statics.
+- `Model::addGlobalScope()` and macros registered during a request survive it,
+  deliberately. Restoring global scopes would permanently unfilter soft deletes,
+  which is demonstrated in `doc/LARAVEL_WORKER_0_4.md`.
+- `artisan optimize` is not unconditionally right for a persistent worker. It
+  turns closure routes into per-dispatch `unserialize` calls, and Laravel's own
+  `withRouting(health: ...)` endpoint is one.
+- Cached closure routes leak memory on every dispatch. That is a framework
+  behaviour affecting any persistent runtime; use controller routes.
+
+The full measurement, the reset's contents, and what was rejected are in
+`doc/LARAVEL_WORKER_0_4.md`.
 
 ## 0.1.1 Windows IPC Investigation
 
