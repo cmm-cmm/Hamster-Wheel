@@ -236,14 +236,14 @@ carry it without changing framing, while a typed solution requires v2. This is
 an owner decision. See
 `doc/research/LARAVEL_LIFECYCLE_0_4_REVIEW.md`.
 
-## Proposed 0.5-1.0 Production Spine (pending owner approval)
+## Accepted 0.5-1.0 Production Spine direction
 
 The old post-0.4 order is rejected: adaptive worker management and Morph no
 longer precede basic compatibility and production operation. Hamster Wheel is a
 general-purpose Web/Application Server; Laravel Octane remains confined to the
 Laravel persistent-worker adapter.
 
-The proposed dependency order is:
+The dependency order is:
 
 1. 0.5 HTTP/transport identity, bounded request/response policy, streaming
    static consumer, minimum instrumentation and native Linux bring-up;
@@ -261,12 +261,21 @@ No generic backend trait/plugin system is authorized in 0.5. FastCGI and proxy
 must first provide real additional backend shapes. Adaptive sizing and Morph
 are post-1.0 research unless production evidence changes their dependency.
 `doc/ROADMAP_0_5_TO_1_0.md` contains milestone exits, alternatives, hypotheses
-and owner decisions. No 0.5 implementation has begun.
+and owner decisions.
+
+The first 0.5.x working-tree slice now preserves the immediate peer returned by
+`accept()`, queries the accepted stream's concrete local endpoint, and passes
+immutable `TransportInfo` through routing to every handler. It deliberately
+does not copy request-owned HTTP version/authority into a second context, trust
+forwarding headers, or alter protocol v1. A real-socket unit test covers a
+wildcard listener, keep-alive, forged proxy headers and 32 concurrent clients.
+See `doc/HTTP_TRANSPORT_0_5.md`. The change awaits owner review and has not been
+committed or released.
 
 ## Next Action
 
-Owner closure review of the 0.4 worker and review of the proposed production
-spine. Remaining 0.4 decisions and out-of-scope qualifications:
+Owner review of the first 0.5.x transport-identity slice. Remaining 0.4
+decisions and out-of-scope qualifications:
 
 - Decide how the external PMS adopts Octane and resolves its PhpSpreadsheet
   PHP 8.5 constraint. The disposable scratch proves lifecycle compatibility,
@@ -287,12 +296,8 @@ spine. Remaining 0.4 decisions and out-of-scope qualifications:
 
 Roadmap decisions, due at their relevant design gates:
 
-- approve the production-spine direction and keeping Morph off the pre-1.0
-  critical path;
-- decide whether 0.5 owns the full static opened-handle investigation or is
-  split into a 0.5.x sequence;
 - select the protocol-v1 compatibility and typed transport-metadata policy
-  during 0.5 design;
+  before any backend wire mapping ships;
 - choose managed versus externally managed Windows FastCGI before 0.6 is
   finalized;
 - choose edge-capable versus origin-only and the HTTP/2 gate before 0.9;

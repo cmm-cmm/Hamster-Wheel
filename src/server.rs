@@ -4,7 +4,9 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
-use crate::{config::RuntimeConfig, php_worker::PhpWorkerError, router::HostRouter};
+use crate::{
+    config::RuntimeConfig, php_worker::PhpWorkerError, router::HostRouter, transport::TransportInfo,
+};
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -91,12 +93,20 @@ where
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
-                let (stream, _) = accept_result?;
+                let (stream, peer_addr) = accept_result?;
+                let local_addr = match stream.local_addr() {
+                    Ok(local_addr) => local_addr,
+                    Err(error) => {
+                        eprintln!("failed to identify accepted connection: {error}");
+                        continue;
+                    }
+                };
+                let transport = TransportInfo::new(peer_addr, local_addr);
                 let shutdown_rx = shutdown_rx.clone();
                 let router = Arc::clone(&router);
 
                 connections.spawn(async move {
-                    serve_connection(stream, router, shutdown_rx).await;
+                    serve_connection(stream, transport, router, shutdown_rx).await;
                 });
             }
             join_result = connections.join_next(), if !connections.is_empty() => {
@@ -123,12 +133,13 @@ where
 
 async fn serve_connection(
     stream: tokio::net::TcpStream,
+    transport: TransportInfo,
     router: Arc<HostRouter>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let service = hyper::service::service_fn(move |request| {
         let router = Arc::clone(&router);
-        async move { router.serve(request).await }
+        async move { router.serve(request, transport).await }
     });
     let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
@@ -136,14 +147,22 @@ async fn serve_connection(
     tokio::select! {
         result = &mut connection => {
             if let Err(error) = result {
-                eprintln!("failed to serve connection: {error}");
+                eprintln!(
+                    "failed to serve connection from {} to {}: {error}",
+                    transport.peer_addr(),
+                    transport.local_addr()
+                );
             }
         }
         changed = shutdown.changed() => {
             if changed.is_ok() && *shutdown.borrow() {
                 connection.as_mut().graceful_shutdown();
                 if let Err(error) = connection.await {
-                    eprintln!("failed to gracefully close connection: {error}");
+                    eprintln!(
+                        "failed to gracefully close connection from {} to {}: {error}",
+                        transport.peer_addr(),
+                        transport.local_addr()
+                    );
                 }
             }
         }
@@ -164,4 +183,163 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
     Ok(async move {
         let _ = signal.recv().await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        sync::oneshot,
+    };
+
+    use super::*;
+    use crate::router::{Handler, HostRouter, LocationRouter, VirtualHost};
+
+    fn transport_router() -> HostRouter {
+        let locations = Arc::new(
+            LocationRouter::new(Vec::new(), Handler::transport_echo()).expect("valid locations"),
+        );
+        HostRouter::new(vec![
+            VirtualHost::new("127.0.0.1", locations).expect("valid host"),
+        ])
+        .expect("valid router")
+    }
+
+    async fn read_response_body(stream: &mut TcpStream) -> String {
+        let mut response = Vec::new();
+        let header_end = loop {
+            if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let mut chunk = [0_u8; 512];
+            let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+                .await
+                .expect("response header timeout")
+                .expect("read response");
+            assert_ne!(count, 0, "connection closed before response headers");
+            response.extend_from_slice(&chunk[..count]);
+        };
+
+        let headers = std::str::from_utf8(&response[..header_end]).expect("ASCII response headers");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length").then(|| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("numeric content length")
+                    })
+                })
+            })
+            .expect("content-length header");
+
+        while response.len() - header_end < content_length {
+            let mut chunk = [0_u8; 512];
+            let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+                .await
+                .expect("response body timeout")
+                .expect("read response body");
+            assert_ne!(count, 0, "connection closed before response body");
+            response.extend_from_slice(&chunk[..count]);
+        }
+
+        String::from_utf8(response[header_end..header_end + content_length].to_vec())
+            .expect("UTF-8 response body")
+    }
+
+    #[tokio::test]
+    async fn carries_actual_socket_identity_across_keep_alive_requests() {
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        assert!(listen_addr.ip().is_unspecified());
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(transport_router()),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut malformed = TcpStream::connect((Ipv4Addr::LOCALHOST, listen_addr.port()))
+            .await
+            .expect("connect malformed client");
+        malformed
+            .write_all(b"GET / NOT-HTTP\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write malformed request");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut discard = [0_u8; 512];
+            while malformed.read(&mut discard).await.expect("read close") != 0 {}
+        })
+        .await
+        .expect("malformed connection must be closed");
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, listen_addr.port()))
+            .await
+            .expect("connect client");
+        let peer_addr = client.local_addr().expect("client address");
+        let local_addr = client.peer_addr().expect("server address");
+        assert!(!local_addr.ip().is_unspecified());
+        let expected = format!("peer={peer_addr};local={local_addr}");
+
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                  Forwarded: for=203.0.113.7\r\n\
+                  X-Forwarded-For: 198.51.100.9\r\n\r\n",
+            )
+            .await
+            .expect("write first request");
+        let first = read_response_body(&mut client).await;
+        assert_eq!(first, expected);
+        assert!(!first.contains("203.0.113.7"));
+        assert!(!first.contains("198.51.100.9"));
+
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                  X-Forwarded-For: 192.0.2.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write second request");
+        assert_eq!(read_response_body(&mut client).await, expected);
+        drop(client);
+
+        let mut clients = JoinSet::new();
+        for _ in 0..32 {
+            clients.spawn(async move {
+                let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, listen_addr.port()))
+                    .await
+                    .expect("connect concurrent client");
+                let peer_addr = client.local_addr().expect("concurrent client address");
+                let local_addr = client.peer_addr().expect("concurrent server address");
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                          X-Forwarded-For: 203.0.113.200\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("write concurrent request");
+                assert_eq!(
+                    read_response_body(&mut client).await,
+                    format!("peer={peer_addr};local={local_addr}")
+                );
+            });
+        }
+        while let Some(result) = clients.join_next().await {
+            result.expect("join concurrent client");
+        }
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
 }

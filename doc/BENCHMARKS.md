@@ -1419,3 +1419,35 @@ Uploads, Laravel 12 over HTTP, four workers, 600 multipart requests across `/u/s
 and `/u/inspect`: every response 200, and zero temporary files left in the system
 temporary directory. The request rate is not reported because the client is a serial
 `fsockopen` loop written to control the exact bytes on the wire, not a load driver.
+
+## 0.5.x Immediate Transport Identity
+
+Windows 11 Pro build 26200, Intel Core i5-12400 (6 cores / 12 logical), 32 GiB,
+`x86_64-pc-windows-msvc` release build based on `9a0bb0c`. The checked-in static
+HTTP driver ran three fresh-server samples per tree, concurrency 4, 1,000 warm-up
+and 50,000 measured requests per sample. The baseline was built immediately
+before the source edit; the candidate was rebuilt after it.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+./benchmarks/static_http.ps1 -Runs 3 -Requests 50000 -WarmupRequests 1000 -Concurrency 4
+```
+
+| Tree | median RPS | p50 | p95 | p99 | CPU us/request | working set |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 8,035 | 0.487 ms | 0.633 ms | 0.743 ms | 343.125 | 7.1 MiB |
+| transport identity | 8,272 | 0.479 ms | 0.597 ms | 0.678 ms | 330.312 | 6.9 MiB |
+
+Baseline RPS ranged 7,946–8,126 (2.2 percent); candidate RPS ranged
+8,151–8,384 (2.8 percent). Candidate median RPS was 3.0 percent higher, but this
+is not claimed as an improvement: it is close to host variation and the
+baseline p99 range was 13.3 percent. The evidence rules out a material
+steady-state regression under this workload, not a small cost.
+
+The source-level result is narrower and stronger. The change queries
+`TcpStream::local_addr()` once per accepted connection, then copies two
+`SocketAddr` values through dispatch. It creates no per-request allocation,
+lock, syscall or proxy-header parsing. A design using request `Extensions` was
+not benchmarked because inspecting `http` 1.5.0 showed that the first insertion
+would allocate its lazy type map on every request; it was rejected before
+implementation.

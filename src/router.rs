@@ -7,7 +7,10 @@ use hyper::{
 };
 
 pub use crate::handler::{Handler, HandlerKind};
-use crate::handler::{HandlerResponse, simple_response};
+use crate::{
+    handler::{HandlerResponse, simple_response},
+    transport::TransportInfo,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteError {
@@ -172,15 +175,16 @@ impl HostRouter {
         self.find_host(headers)?.route(path)
     }
 
-    pub async fn serve(
+    pub(crate) async fn serve(
         &self,
         request: Request<Incoming>,
+        transport: TransportInfo,
     ) -> Result<HandlerResponse, std::convert::Infallible> {
         let handler = match self.route(request.headers(), request.uri().path()) {
             Ok(handler) => handler,
             Err(error) => return Ok(simple_response(error.status(), error.message())),
         };
-        handler.serve(request).await
+        handler.serve(request, transport).await
     }
 
     #[cfg(feature = "profiling")]

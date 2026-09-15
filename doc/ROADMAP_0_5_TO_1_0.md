@@ -1,8 +1,9 @@
-# Hamster Wheel 0.5 to 1.0 Roadmap Proposal
+# Hamster Wheel 0.5 to 1.0 Roadmap
 
-Status: proposed after the 0.4 investigation; pending owner approval. This is
-not authorization to begin 0.5 and is not a promise that every candidate below
-will ship unchanged.
+Status: the Production Spine direction and a 0.5.x delivery sequence are owner
+approved. Milestone details remain evidence-driven rather than an implementation
+specification. The first 0.5.x transport-identity slice is described in
+`HTTP_TRANSPORT_0_5.md` and awaits owner review.
 
 ## Product boundary
 
@@ -147,12 +148,20 @@ Cross-cutting rules apply at every milestone:
 Goal: define a correct, bounded request/response contract that every later
 handler can consume.
 
+The milestone is delivered as separately reviewable 0.5.x slices. The first
+slice captures immediate TCP peer/local identity and carries it to handlers
+without changing protocol v1. Source review falsified the need to copy HTTP
+version and authority into a parallel context: Hyper's request already owns
+them. Scheme and trusted-proxy-derived client identity wait for authoritative
+listener/policy inputs. Later 0.5.x boundaries remain owner decisions.
+
 Scope:
 
-- Introduce one internal request context containing immediate peer, local
-  listener, scheme, HTTP version and authority. Keep transport peer identity
-  distinct from a client address derived through an explicit trusted-proxy
-  policy.
+- Use one internal dispatch contract consisting of Hyper's request plus
+  server-established transport facts. Keep HTTP version and authority in their
+  existing request representation; add scheme only when a listener can
+  establish it. Keep immediate peer identity distinct from a client address
+  derived through an explicit trusted-proxy policy.
 - Decide the persistent protocol compatibility mechanism for typed metadata.
   Protocol v1 must remain deterministic; a versioned v2 or a rigorously
   reserved server-owned extension requires its own compatibility tests.

@@ -1269,7 +1269,11 @@ Real PMS validation
 Laravel Octane is not a Hamster core dependency and does not define lifecycle
 semantics for other frameworks.
 
-### Proposed 0.5.0 - HTTP and Transport Foundation
+### 0.5.x - HTTP and Transport Foundation
+
+Status: Production Spine direction and incremental 0.5.x delivery accepted.
+The first working-tree slice carries immediate TCP peer/local identity to
+handlers; it awaits owner review. See `doc/HTTP_TRANSPORT_0_5.md`.
 
 ``` text
 Typed transport/request context
