@@ -1,6 +1,7 @@
 # Laravel Persistent Worker 0.4
 
-Status: implementation under review; **not release-ready**.
+Status: investigation and implementation committed at `6e961d5`; milestone
+closure, tag and release remain owner decisions.
 
 The current worker uses Laravel Octane for application/container lifecycle and
 keeps Hamster's Rust pool and protocol framework-agnostic. The previous

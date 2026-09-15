@@ -1024,46 +1024,38 @@ Use specialized IPC where measurement proves it matters.
 
 ## 22. Interaction with Hamster Wheel Roadmap
 
-Recommended relationship with the core roadmap:
+The 0.0-0.4 investigations invalidated the original version mapping below.
+Morph depends on a production request context, multiple qualified execution
+modes, stable configuration generations, transactional reload, bounded
+observability and safe deoptimization. Those foundations are now planned for
+the 0.5-1.0 production spine; Morph must not define them or block 1.0.
+
+Revised relationship with the core roadmap:
 
 ```text
-0.2.0
-Fixed Worker Pool + Cancellation Safety
-✓ foundation
-
-0.3.0
-Worker Lifecycle + Recovery
-↓
-
-0.4.0
-Laravel Persistent Feasibility
-+ telemetry foundation
-↓
-
-0.5.x
-Morph M0/M1
-Workload profiling
-↓
-
-0.6.x
-Morph M2/M3
-Capsules + canary specialization
-↓
-
-0.7.x
-StateFence integration
-Adaptive promotion/deoptimization
-↓
-
-0.8.x
-HamsterLink experiments
-↓
-
-1.0+
-Production Morph runtime
+0.2-0.4
+transaction ownership + worker lifecycle + one real adapter
+                         ↓
+0.5-1.0
+production HTTP/backends/reload/observability/platform contracts
+                         ↓
+post-1.0 evidence
+offline workload and worker-sizing analysis
+                         ↓
+optional experiments
+deterministic recommendations / opt-in autoscaling
+                         ↓
+only after measurable incremental benefit
+capsules / canary / StateFence / HamsterLink
 ```
 
-Morph should not block basic PHP server functionality.
+Pre-1.0 metrics and traces are operational requirements, not "Morph M0". They
+must remain useful if no adaptive system is ever built. No post-1.0 version is
+reserved for Morph until production traces establish a falsifiable benefit.
+
+Morph must not block HTTP correctness, FastCGI, persistent adapters, static
+serving, reverse proxying, reload, TLS or production platform operation. See
+`doc/ROADMAP_0_5_TO_1_0.md` for the current proposal and alternatives.
 
 ---
 

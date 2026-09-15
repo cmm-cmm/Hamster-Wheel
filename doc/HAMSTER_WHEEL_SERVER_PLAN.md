@@ -2,9 +2,10 @@
 
 ## 1. Tổng quan
 
-**Hamster Wheel** là dự án web server hiệu suất cao viết bằng **Rust**,
-hướng tới một kiến trúc web hiện đại, cross-platform và đặc biệt mạnh
-cho PHP/Laravel.
+**Hamster Wheel** là dự án Web/Application Server hiệu suất cao viết bằng
+**Rust**, hướng tới một kiến trúc web hiện đại và cross-platform. Static,
+reverse proxy và application backends là các capability ngang hàng; PHP là
+workload first-class và Laravel là một framework adapter được hỗ trợ.
 
 Tên **Hamster Wheel** lấy cảm hứng từ hình ảnh **hamster running on a
 wheel**: một worker được khởi động một lần, chạy trong vòng lặp, liên
@@ -179,8 +180,8 @@ Nguyên tắc:
                                │
                     ┌──────────┴──────────┐
                     │                     │
-               Worker Mode            FastCGI
-                DEFAULT              COMPATIBILITY
+          Persistent Adapter          FastCGI
+       APPLICATION-SPECIFIC        COMPATIBILITY
                     │                     │
               Worker Pool           PHP-FPM/php-cgi
                     │
@@ -402,7 +403,7 @@ Hamster Wheel tự chuẩn bị runtime configuration tương ứng.
 PHP Execution Engine
 │
 ├── Worker Mode
-│      DEFAULT / PERFORMANCE
+│      PERSISTENT ADAPTER / PERFORMANCE
 │
 └── FastCGI Mode
        COMPATIBILITY / FALLBACK
@@ -584,35 +585,41 @@ Engine.
 
 ## 16. Laravel Mode
 
-Ví dụ:
+Laravel support is one explicit persistent-worker adapter. The application
+installs Laravel Octane; the PHP adapter owns Laravel bootstrap, sandbox
+lifecycle, request reconstruction and cleanup. Rust owns only the generic
+worker pool, protocol and process lifecycle.
+
+Current configuration shape:
 
 ``` toml
-[[hosts]]
-name = "pms.local"
-root = "C:/Projects/PMS/public"
-framework = "laravel"
+[[hosts.locations]]
+path = "/"
+handler = "php_worker"
 
-[hosts.php]
-version = "8.5"
-mode = "worker"
-min_workers = 2
-max_workers = 8
+[hosts.locations.php]
+executable = "php/8.5/php.exe"
+script = "fixtures/php-worker/laravel_worker.php"
+workers = 4
+queue_capacity = 32
+
+[hosts.locations.php.env]
+HAMSTER_LARAVEL_PATH = "www/pms"
 ```
 
-Hamster Wheel có thể tự động:
+The core does not:
 
 ``` text
-detect public/
-load PHP runtime
-bootstrap application
-start worker pool
-route static files
-route dynamic requests
-monitor workers
-reload workers khi source/config thay đổi
+detect Laravel
+parse Laravel routes
+infer framework state ownership
+provide a generic application reset
+start Octane transports such as RoadRunner or Swoole
 ```
 
-Không parse Laravel routes.
+Future project-detection or config-generation UX requires a separate concrete
+use case. It must generate ordinary Hamster configuration rather than couple
+the core router to Laravel.
 
 ------------------------------------------------------------------------
 
@@ -1226,13 +1233,13 @@ work của 0.3.0 nếu chưa có design review.
 
 ### 0.3.0 - Worker Lifecycle
 
-Status: implemented on the current `dev` worktree; Windows qualification and
-limited regression benchmarks must pass before review.
+Status: implemented and accepted on `dev`; the lifecycle contract and Windows
+qualification are recorded in `doc/WORKER_LIFECYCLE_0_3.md`.
 
 ``` text
 Permanent worker slots + generation identity
 Automatic respawn
-Per-slot repeated-failure backoff and retirement
+Per-slot repeated-failure backoff and bounded cooldown
 Optional max-requests/max-age recycle (default OFF)
 Lifecycle telemetry
 Coordinated drain and shutdown
@@ -1240,75 +1247,105 @@ Crash recovery
 ```
 
 0.3.0 owns process lifecycle only. Idle crashes use passive/lazy detection;
-there is no proactive stdout probe. Application Reset moved to the 0.4.0
-Laravel Worker milestone. Memory-threshold recycling, adaptive sizing, and
-protocol changes remain out of scope. The accepted contract is persisted in
-`doc/WORKER_LIFECYCLE_0_3.md`.
+there is no proactive stdout probe. Application lifecycle integration moved to
+the 0.4.0 Laravel Worker milestone. Memory-threshold recycling, adaptive
+sizing, and protocol changes remain out of scope. The accepted contract is
+persisted in `doc/WORKER_LIFECYCLE_0_3.md`.
 
 ### 0.4.0 - Laravel Worker Mode
 
+Status: investigation and implementation committed at `6e961d5`; milestone
+closure, tag and release remain owner decisions.
+
 ``` text
 Laravel bootstrap once
-Request lifecycle
-State reset integration
-Static fallback
-Project reload
+Laravel Octane request lifecycle inside the adapter
+Request reconstruction and response staging
+Cross-request isolation and cleanup failure handling
+Real PMS validation
 ```
 
-### 0.5.0 - Adaptive Worker Manager
+0.4 validates the persistent-worker architecture against one real framework.
+Laravel Octane is not a Hamster core dependency and does not define lifecycle
+semantics for other frameworks.
+
+### Proposed 0.5.0 - HTTP and Transport Foundation
 
 ``` text
-min/max workers
-idle timeout
-adaptive scaling
-worker metrics
-slow request detector
+Typed transport/request context
+HTTP/1.1 limits, timeouts and bounded memory
+Streaming-capable response body with a real static-file consumer
+Static correctness and containment investigation
+Minimum request/stage instrumentation
+Native Linux core qualification
 ```
 
-### 0.6.0 - FastCGI Compatibility
+### Proposed 0.6.0 - PHP Compatibility and Adapter Contract
 
 ``` text
 FastCGI protocol
-TCP transport
-Unix Socket
-PHP-FPM/php-cgi fallback
+Windows php-cgi and Linux PHP-FPM transports
+Multiple independent PHP backends
+Generic persistent-worker adapter contract
+Transport metadata mapping
+At-most-once failure semantics
 ```
 
-### 0.7+ - Production Features
+### Proposed 0.7.0 - Reverse Proxy and General-Purpose Data Plane
 
 ``` text
-TLS
-Reverse Proxy
-WebSocket
-HTTP/2
-Automatic HTTPS
-Advanced static optimization
-GUI integration
-Service integration
-Container images
+HTTP upstream connection pool
+Streaming and backpressure
+Forwarded-header trust policy
+Bounded timeouts
+Provably-safe retry boundary
+Mixed static/PHP/proxy virtual hosts
 ```
 
-### 1.0 - Production PHP Application Server
+### Proposed 0.8.0 - Reload, Observability and Production Operation
+
+``` text
+Transactional config publication and old-generation drain
+Structured access/error/lifecycle logging
+Metrics, health and readiness
+Windows Service operation and child containment
+Linux systemd operation
+Operational CLI
+```
+
+### Proposed 0.9.0 - Secure Edge and Release Qualification
+
+``` text
+TLS 1.2 / 1.3
+SNI and certificate reload
+HTTP/2 when edge-capable 1.0 is selected
+Windows and Linux release qualification
+Security/fault/soak matrix
+Packaging, upgrade and rollback documentation
+```
+
+### Proposed 1.0 - Production Web/Application Server
 
 Mục tiêu:
 
 ``` text
-HTTP/1.1 + HTTP/2
-HTTPS
-Static
-Persistent PHP Worker Mode
-FastCGI fallback
-Laravel Mode
-Virtual Hosts
-Reverse Proxy
-Worker Supervisor
-Metrics
-Logging
-Windows Service
-Linux service support
-CLI
-Hamster Manager integration
+Bounded HTTP core and correct transport metadata
+Secure static serving
+FastCGI PHP compatibility
+Persistent-worker adapter contract and qualified Laravel adapter
+Minimal reliable reverse proxy
+Transactional reload and graceful drain
+Logs, metrics, health and readiness
+Windows Service and Linux systemd support
+TLS/HTTP2 for an edge-capable product profile
+Stable configuration and protocol compatibility policy
 ```
+
+Adaptive worker sizing and Hamster Morph are no longer on the pre-1.0 critical
+path. Automatic HTTPS, HTTP/3, GUI, advanced proxy policies, specialized static
+I/O, service discovery and additional framework adapters also remain post-1.0
+unless a concrete workload changes the evidence. The detailed proposal,
+alternatives and owner decisions are in `doc/ROADMAP_0_5_TO_1_0.md`.
 
 ------------------------------------------------------------------------
 
@@ -1325,6 +1362,11 @@ Benchmark phải thực hiện sau từng milestone.
 0.2.0 Fixed Worker Pool + Cancellation Safety
 0.3.0 Worker Lifecycle / Respawn / Recycle
 0.4.0 Laravel Worker
+0.5.0 HTTP / Transport / Static Foundation
+0.6.0 FastCGI and Persistent Adapter Contract
+0.7.0 Reverse Proxy
+0.8.0 Reload / Observability / Service Operation
+0.9.0 TLS / HTTP2 / Release Qualification
 ```
 
 Nếu performance giảm, phải biết feature nào gây regression.
@@ -1593,8 +1635,8 @@ Rust native core
 Cross-platform
 Persistent PHP Worker Mode
 Adaptive Worker Pool
-Multi-PHP
-Laravel-first experience
+Multiple PHP execution modes
+Framework adapters, including Laravel
 FastCGI fallback
 Windows-first-class support
 Linux production support
@@ -1751,29 +1793,20 @@ Hamster Wheel bắt đầu từ một nhu cầu thực tế: vượt khỏi gi�
 stack Apache/FastCGI hiện tại và nghiên cứu một cách phục vụ PHP hiện
 đại hơn.
 
-Kiến trúc trung tâm không còn là:
+Hamster Wheel không bị định nghĩa bởi một application framework hay một PHP
+execution mode. Kiến trúc sản phẩm là:
 
 ``` text
-Rust Web Server
- ↓
-FastCGI
- ↓
-PHP
+HTTP / TLS / Transport Context
+              ↓
+Compiled Routing and Resource Policy
+              ↓
+Static | FastCGI | Persistent Adapter | Reverse Proxy
 ```
 
-mà là:
-
-``` text
-Rust Web Server
- ↓
-Persistent PHP Worker Manager
- ↓
-Persistent Application
- ↓
-Request Loop
-```
-
-FastCGI được giữ như compatibility layer thay vì giới hạn kiến trúc.
+FastCGI là PHP compatibility layer. Persistent workers là application-server
+contract có lifecycle adapter riêng. Laravel Octane chỉ thuộc Laravel adapter.
+Reverse proxy là đường tích hợp general-purpose cho các runtime khác.
 
 Hamster Wheel sẽ học những điểm mạnh của các web server lớn nhưng giữ
 triết lý riêng:
@@ -1782,13 +1815,17 @@ triết lý riêng:
 
 Mục tiêu ngắn hạn là xây một HTTP core đúng, nhỏ và đo được.
 
-Mục tiêu trung hạn là xây **PHP Worker Mode và Laravel Worker Mode** ổn
-định.
+Mục tiêu trung hạn là hoàn thiện production spine: HTTP/transport correctness,
+static, FastCGI, persistent adapters, reverse proxy, reload, observability và
+cross-platform operation.
 
-Mục tiêu dài hạn là biến Hamster Wheel thành một **cross-platform PHP
-Application Server/Web Server** đủ mạnh để cạnh tranh với các stack web
-hiện đại --- và dùng benchmark thực tế để trả lời câu hỏi tham vọng
-nhất:
+Mục tiêu dài hạn là biến Hamster Wheel thành một **cross-platform
+Web/Application Server** đủ mạnh để cạnh tranh với các stack web hiện đại.
+Morph và adaptive execution chỉ được nghiên cứu trên nền production đã ổn định
+và dữ liệu workload thật.
+
+Hiệu năng PHP persistent vẫn là một workload research question quan trọng,
+không phải định nghĩa sản phẩm:
 
 > **PHP + Hamster Wheel có thể đấu ngang với Node.js trong workload web
 > thực tế hay không?**

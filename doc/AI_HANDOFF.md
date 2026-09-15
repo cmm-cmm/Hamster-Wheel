@@ -2,9 +2,10 @@
 
 ## Current Milestone
 
-0.4.0 — Laravel Persistent Worker. Research is complete and the implementation
-is uncommitted on top of `616e4ee`, awaiting owner review. The findings,
-measurements and rejected alternatives are in `doc/LARAVEL_WORKER_0_4.md`.
+0.4.0 — Laravel Persistent Worker. The investigation and Octane adapter are
+committed on `dev` at `6e961d5`. They are not tagged or released, and milestone
+closure remains an owner decision. Findings, measurements and rejected
+alternatives are in `doc/LARAVEL_WORKER_0_4.md`.
 
 0.3.1 is closed: `v0.3.0` and `v0.3.1` are tagged on `dev` and the retirement
 hardening is committed as `616e4ee`. The accepted lifecycle contract remains
@@ -161,7 +162,7 @@ The first item is done on `dev` after the `v0.3.0` tag.
   bound was held only by the shape of `run_worker_generation`. Cloning is now
   a type error rather than a silent way to break it.
 
-## 0.3.1 Retirement Hardening (uncommitted, awaiting review)
+## 0.3.1 Retirement Hardening (committed at `616e4ee`)
 
 `STABILITY_RESET_PERIOD` is 15 s (was 60 s), measured from READY.
 `WorkerLifecycleState::Retired` and `retire_slot` are gone; `replacement_delay`
@@ -187,7 +188,7 @@ four under a real console; it compares raw PIDs, and the new tests recycle PIDs
 much faster. Repository php.exe count was zero after every run, so no orphan
 was ever present.
 
-## 0.4.0 Laravel Persistent Worker (uncommitted, architecture revised)
+## 0.4.0 Laravel Persistent Worker (implemented at `6e961d5`)
 
 The independent review rejected the in-place targeted reset. Its
 `warmInstanceKeys` snapshot made binding lifetime depend on warm-up resolution,
@@ -235,10 +236,37 @@ carry it without changing framing, while a typed solution requires v2. This is
 an owner decision. See
 `doc/research/LARAVEL_LIFECYCLE_0_4_REVIEW.md`.
 
+## Proposed 0.5-1.0 Production Spine (pending owner approval)
+
+The old post-0.4 order is rejected: adaptive worker management and Morph no
+longer precede basic compatibility and production operation. Hamster Wheel is a
+general-purpose Web/Application Server; Laravel Octane remains confined to the
+Laravel persistent-worker adapter.
+
+The proposed dependency order is:
+
+1. 0.5 HTTP/transport identity, bounded request/response policy, streaming
+   static consumer, minimum instrumentation and native Linux bring-up;
+2. 0.6 FastCGI on Windows/Linux, multiple PHP backends and the explicit generic
+   persistent-adapter contract;
+3. 0.7 minimal reliable reverse proxy with streaming, backpressure, forwarding
+   trust and an at-most-once retry boundary;
+4. 0.8 transactional reload/drain, logs/metrics/health, Windows Service, systemd
+   and operational CLI;
+5. 0.9 TLS/SNI/certificate reload, optional HTTP/2 product gate and full release
+   qualification;
+6. 1.0 stable Web/Application Server contract.
+
+No generic backend trait/plugin system is authorized in 0.5. FastCGI and proxy
+must first provide real additional backend shapes. Adaptive sizing and Morph
+are post-1.0 research unless production evidence changes their dependency.
+`doc/ROADMAP_0_5_TO_1_0.md` contains milestone exits, alternatives, hypotheses
+and owner decisions. No 0.5 implementation has begun.
+
 ## Next Action
 
-Owner review of the revised uncommitted 0.4 worker. Remaining decisions and
-out-of-scope qualifications:
+Owner closure review of the 0.4 worker and review of the proposed production
+spine. Remaining 0.4 decisions and out-of-scope qualifications:
 
 - Decide how the external PMS adopts Octane and resolves its PhpSpreadsheet
   PHP 8.5 constraint. The disposable scratch proves lifecycle compatibility,
@@ -256,3 +284,16 @@ out-of-scope qualifications:
 - Strengthen the `ctrl_c_stops_server_and_reaps_pool` console guard so a ConPTY
   session skips instead of failing. It is now the only test that fails under
   ConPTY.
+
+Roadmap decisions, due at their relevant design gates:
+
+- approve the production-spine direction and keeping Morph off the pre-1.0
+  critical path;
+- decide whether 0.5 owns the full static opened-handle investigation or is
+  split into a 0.5.x sequence;
+- select the protocol-v1 compatibility and typed transport-metadata policy
+  during 0.5 design;
+- choose managed versus externally managed Windows FastCGI before 0.6 is
+  finalized;
+- choose edge-capable versus origin-only and the HTTP/2 gate before 0.9;
+- identify 1.0-stable config/protocol surfaces before the release candidate.
