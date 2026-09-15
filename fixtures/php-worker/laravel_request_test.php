@@ -35,7 +35,15 @@ namespace Illuminate\Http {
 
     class Request
     {
-        public function __construct(...$arguments) {}
+        public function __construct(
+            public array $query = [],
+            public array $request = [],
+            public array $attributes = [],
+            public array $cookies = [],
+            public array $files = [],
+            public array $server = [],
+            public mixed $content = null
+        ) {}
     }
 }
 
@@ -72,6 +80,30 @@ namespace {
         ['token' => 'abc=def==']
     );
 
+    $built = hamster_build_request([
+        'method' => 'POST',
+        'uri' => '/submit?q=two%20words',
+        'query' => 'q=two%20words',
+        'headers' => [
+            ['content-type', 'application/x-www-form-urlencoded'],
+            ['cookie', 'session=abc%3Ddef; theme=dark'],
+            ['x-review', 'present'],
+        ],
+        'body' => 'name=Alice+Example&nested%5Ba%5D=1',
+    ]);
+    check('the request builder populates the query bag', $built->query, ['q' => 'two words']);
+    check('the request builder populates the form bag', $built->request, [
+        'name' => 'Alice Example',
+        'nested' => ['a' => '1'],
+    ]);
+    check('the request builder populates the cookie bag', $built->cookies, [
+        'session' => 'abc=def',
+        'theme' => 'dark',
+    ]);
+    check('the request builder preserves the raw body', $built->content, 'name=Alice+Example&nested%5Ba%5D=1');
+    check('the request builder maps content type to the SAPI key', $built->server['CONTENT_TYPE'], 'application/x-www-form-urlencoded');
+    check('the request builder maps ordinary headers to HTTP keys', $built->server['HTTP_X_REVIEW'], 'present');
+
     // --- field names -----------------------------------------------------
     $target = [];
     hamster_assign_nested($target, 'plain', 'v');
@@ -90,7 +122,14 @@ namespace {
 
     $malformed = [];
     hamster_assign_nested($malformed, 'broken[', 'v');
-    check('an unterminated bracket keeps the whole name', $malformed, ['broken[' => 'v']);
+    check('an unterminated bracket follows parse_str normalization', $malformed, ['broken_' => 'v']);
+
+    foreach (['a.b', 'space name', 'n.d[e.f]', 'a[b]ignored'] as $phpName) {
+        $actual = [];
+        hamster_assign_nested($actual, $phpName, 'v');
+        parse_str(rawurlencode($phpName) . '=v', $expected);
+        check("field name {$phpName} matches parse_str", $actual, $expected);
+    }
 
     // --- content disposition --------------------------------------------
     check(
@@ -155,11 +194,46 @@ namespace {
     check('an empty file input is UPLOAD_ERR_NO_FILE', $files['slot']->error, UPLOAD_ERR_NO_FILE);
     check('an empty file input has no path', $files['slot']->path, '');
 
+    $looksLikeClosingDelimiter = "alpha\r\n--B--not-a-close\r\nomega";
+    $body = "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"boundary.bin\"\r\n"
+        . "Content-Type: application/octet-stream\r\n\r\n{$looksLikeClosingDelimiter}\r\n"
+        . "--B--\r\n";
+    [, $filesWithBoundaryPrefix] = hamster_parse_multipart(
+        $body,
+        'multipart/form-data; boundary=B'
+    );
+    check(
+        'a boundary prefix with an invalid suffix remains file content',
+        $filesWithBoundaryPrefix['file']->contents(),
+        $looksLikeClosingDelimiter
+    );
+
     $temporaries = hamster_upload_temporaries();
-    check('one temporary exists per real upload', count($temporaries), 1);
+    check('one temporary exists per real upload', count($temporaries), 2);
     hamster_discard_uploads();
     check('cleanup removes every temporary', is_file($temporaries[0]), false);
     check('cleanup empties the list', hamster_upload_temporaries(), []);
+
+    $locked = tempnam(sys_get_temp_dir(), 'hamster-locked-upload-');
+    if ($locked === false) {
+        throw new RuntimeException('cannot create upload cleanup failure probe');
+    }
+    $paths = &hamster_upload_temporaries();
+    $paths[] = $locked;
+    $cleanupRejected = null;
+    try {
+        hamster_discard_uploads(static fn (string $path): bool => false);
+    } catch (RuntimeException $error) {
+        $cleanupRejected = $error->getMessage();
+    }
+    check(
+        'an upload deletion failure makes cleanup fail closed',
+        $cleanupRejected,
+        'failed to remove 1 upload temporary file(s)'
+    );
+    check('failed upload cleanup retains ownership for retry', hamster_upload_temporaries(), [$locked]);
+    hamster_discard_uploads();
+    check('a retried upload cleanup removes the file', is_file($locked), false);
 
     // An empty preamble and a CRLF-prefixed first delimiter are both legal.
     [$parameters] = hamster_parse_multipart(
@@ -178,11 +252,29 @@ namespace {
 
     $rejected = null;
     try {
-        hamster_parse_multipart("--B\r\nno header terminator", 'multipart/form-data; boundary=B');
+        hamster_parse_multipart(
+            "--B\r\nno header terminator\r\n--B--\r\n",
+            'multipart/form-data; boundary=B'
+        );
     } catch (HamsterBadRequest $error) {
         $rejected = $error->getMessage();
     }
     check('a part without a header block is rejected', $rejected, 'multipart part has no header block');
+
+    $rejected = null;
+    try {
+        hamster_parse_multipart(
+            "--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\n1",
+            'multipart/form-data; boundary=B'
+        );
+    } catch (HamsterBadRequest $error) {
+        $rejected = $error->getMessage();
+    }
+    check(
+        'a multipart body without its closing boundary is rejected',
+        $rejected,
+        'multipart body has no closing boundary'
+    );
 
     hamster_discard_uploads();
 

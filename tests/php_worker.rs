@@ -17,7 +17,7 @@ use hamster_wheel::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::{Mutex, oneshot},
     task::JoinHandle,
 };
 
@@ -27,6 +27,12 @@ struct TestServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<std::io::Result<()>>,
 }
+
+// External Laravel/PMS probes share one optimized scratch application and can
+// perform real database/session work. Serializing only those probes prevents
+// concurrent bootstrap from turning the fixed five-second product timeout into
+// a harness artifact; ordinary PHP worker integration tests remain parallel.
+static LARAVEL_APP_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 impl TestServer {
     async fn start() -> Self {
@@ -277,6 +283,19 @@ fn split_response(response: &[u8]) -> (&[u8], &[u8]) {
     (&response[..boundary + 4], &response[boundary + 4..])
 }
 
+fn response_cookie_header(headers: &[u8]) -> String {
+    std::str::from_utf8(headers)
+        .expect("response headers should be UTF-8")
+        .split("\r\n")
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("set-cookie")
+                .then(|| value.trim().split(';').next().unwrap().to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn json_number(body: &[u8], field: &str) -> u64 {
     let body = std::str::from_utf8(body).expect("state response should be UTF-8");
     let marker = format!("\"{field}\":");
@@ -320,6 +339,476 @@ async fn laravel_request_reconstruction_passes_its_own_checks() {
         String::from_utf8_lossy(&output.stdout).contains("checks passed"),
         "the check script must report what it verified"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn laravel_octane_adapter_stages_response_until_cleanup_commit() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let executable = root.join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let output = tokio::process::Command::new(executable)
+        .arg(root.join("fixtures/php-worker/laravel_octane_client_test.php"))
+        .output()
+        .await
+        .expect("php must be runnable");
+    assert!(
+        output.status.success(),
+        "Octane protocol adapter checks failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("10 checks passed"),
+        "the check script must report every verified boundary"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn laravel_worker_reserves_stdout_for_protocol_only() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let executable = root.join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let output = tokio::process::Command::new(executable)
+        .arg(root.join("fixtures/php-worker/laravel_stdout_test.php"))
+        .output()
+        .await
+        .expect("php must be runnable");
+    assert!(
+        output.status.success(),
+        "stdout reservation checks failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"4 checks passed\n");
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn unsafe_laravel_reset_modes_fail_before_ready() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let executable = root.join("php/8.5/php.exe");
+    for strategy in ["none", "targeted"] {
+        let output = tokio::process::Command::new(&executable)
+            .arg(root.join("fixtures/php-worker/laravel_worker.php"))
+            .env("HAMSTER_LARAVEL_PATH", &root)
+            .env("HAMSTER_LARAVEL_RESET", strategy)
+            .output()
+            .await
+            .expect("php must be runnable");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no longer accepts unsafe reset strategies"),
+            "unsafe strategy {strategy} must fail explicitly before READY: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "failure must not emit protocol bytes"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires HAMSTER_LARAVEL_TEST_PATH pointing to an Octane-enabled Laravel app"]
+async fn one_worker_enforces_laravel_octane_ownership_contract() {
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let executable = root.join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let app = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the Octane-enabled test app"),
+    );
+    let php_ini = std::env::var_os("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| app.join("php.ini"));
+    let output = tokio::process::Command::new(executable)
+        .arg(root.join("fixtures/php-worker/laravel_lifecycle_test.php"))
+        .env("HAMSTER_LARAVEL_TEST_PATH", &app)
+        .env("HAMSTER_PMS_PROBE", "1")
+        .env("PHPRC", php_ini)
+        .output()
+        .await
+        .expect("php must be runnable");
+    assert!(
+        output.status.success(),
+        "Laravel ownership checks failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("checks passed"),
+        "the lifecycle test must report every checked ownership boundary"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires HAMSTER_LARAVEL_TEST_PATH pointing to an Octane-enabled Laravel app with /up"]
+async fn laravel_worker_serves_repeated_requests_through_protocol_v1() {
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("fixtures/php-worker/laravel_worker.php");
+    let app = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the Octane-enabled test app"),
+    );
+    let php_ini = std::env::var_os("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| app.join("php.ini"));
+    let app = app.to_string_lossy().replace('\\', "/");
+    let php_ini = php_ini.to_string_lossy().replace('\\', "/");
+    let runtime = Arc::new(php_runtime_with_env(
+        1,
+        &script,
+        &[
+            ("HAMSTER_LARAVEL_PATH", &app),
+            ("PHPRC", &php_ini),
+            ("HAMSTER_PMS_PROBE", "1"),
+        ],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    let initial = server.runtime.php_worker().unwrap().snapshot().workers[0].clone();
+
+    for _ in 0..2 {
+        let response = server
+            .request(b"GET /up HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "Laravel health request failed: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    let after = server.runtime.php_worker().unwrap().snapshot().workers[0].clone();
+    assert_eq!(after.generation, initial.generation);
+    assert_eq!(after.pid, initial.pid);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an Octane-enabled scratch PMS with HamsterPmsProbeServiceProvider"]
+async fn laravel_fresh_benchmark_baseline_serves_controller_requests() {
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("fixtures/php-worker/laravel_fresh_worker.php");
+    let app = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the prepared scratch PMS"),
+    )
+    .to_string_lossy()
+    .replace('\\', "/");
+    let php_ini = std::env::var("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .unwrap_or_else(|_| format!("{app}/php.ini"))
+        .replace('\\', "/");
+    let runtime = Arc::new(php_runtime_with_env(
+        1,
+        &script,
+        &[
+            ("HAMSTER_LARAVEL_PATH", app.as_str()),
+            ("PHPRC", php_ini.as_str()),
+            ("APP_ENV", "production"),
+            ("APP_DEBUG", "false"),
+            ("PERF_MONITOR_ENABLED", "false"),
+            ("HAMSTER_PMS_PROBE", "1"),
+        ],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    let initial = server.runtime.php_worker().unwrap().snapshot().workers[0].clone();
+
+    for _ in 0..2 {
+        let response = server.request(&close_request("/__hamster/light")).await;
+        let (headers, body) = split_response(&response);
+        assert!(
+            headers.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "fresh baseline failed: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(json_number(body, "pid"), initial.pid.unwrap() as u64);
+        assert_eq!(json_number(body, "controller_calls"), 1);
+    }
+
+    let after = server.runtime.php_worker().unwrap().snapshot().workers[0].clone();
+    assert_eq!(after.generation, initial.generation);
+    assert_eq!(after.pid, initial.pid);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an Octane-enabled scratch PMS with HamsterPmsProbeServiceProvider"]
+async fn pms_w1_isolates_auth_and_retires_after_cleanup_failure() {
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("fixtures/php-worker/laravel_worker.php");
+    let app = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the prepared scratch PMS"),
+    );
+    let provider_manifest = std::fs::read_to_string(app.join("bootstrap/providers.php"))
+        .expect("scratch PMS should have a provider manifest");
+    assert!(
+        provider_manifest.contains("HamsterPmsProbeServiceProvider"),
+        "scratch PMS must register the checked-in probe provider"
+    );
+    let app = app.to_string_lossy().replace('\\', "/");
+    let php_ini = std::env::var("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .unwrap_or_else(|_| format!("{app}/php.ini"))
+        .replace('\\', "/");
+    let failure_marker = marker_path("pms-cleanup-failure");
+    let failure_marker_env = failure_marker.to_string_lossy().replace('\\', "/");
+    let runtime = Arc::new(php_runtime_with_env(
+        1,
+        &script,
+        &[
+            ("HAMSTER_LARAVEL_PATH", app.as_str()),
+            ("PHPRC", php_ini.as_str()),
+            ("SESSION_DRIVER", "file"),
+            ("CACHE_STORE", "array"),
+            ("QUEUE_CONNECTION", "sync"),
+            ("APP_ENV", "production"),
+            ("APP_DEBUG", "false"),
+            ("PERF_MONITOR_ENABLED", "false"),
+            ("HAMSTER_PMS_PROBE", "1"),
+            ("HAMSTER_PMS_FAILURE_MARKER", failure_marker_env.as_str()),
+        ],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    let pool = server.runtime.php_worker().unwrap();
+    let initial = pool.snapshot().workers[0].clone();
+
+    let seed = server.request(&close_request("/__hamster/auth-seed")).await;
+    let (seed_headers, seed_body) = split_response(&seed);
+    assert!(
+        seed_headers.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "PMS auth seed failed: {}",
+        String::from_utf8_lossy(&seed)
+    );
+    let user_id = json_number(seed_body, "id");
+    let cookies = response_cookie_header(seed_headers);
+    assert!(!cookies.is_empty(), "auth seed must issue a session cookie");
+
+    for _ in 0..50 {
+        let authenticated = server
+            .request(
+                format!(
+                    "GET /__hamster/auth-state HTTP/1.1\r\nHost: localhost\r\nCookie: {cookies}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+        let (headers, body) = split_response(&authenticated);
+        assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(json_number(body, "id"), user_id);
+
+        let anonymous = server
+            .request(&close_request("/__hamster/auth-state"))
+            .await;
+        let (headers, _) = split_response(&anonymous);
+        assert!(
+            headers.starts_with(b"HTTP/1.1 302 Found\r\n"),
+            "anonymous request inherited authentication: {}",
+            String::from_utf8_lossy(&anonymous)
+        );
+        assert!(
+            String::from_utf8_lossy(headers).lines().any(|line| line
+                .to_ascii_lowercase()
+                .starts_with("location: http://localhost/login")),
+            "anonymous request did not redirect to login: {}",
+            String::from_utf8_lossy(headers)
+        );
+    }
+
+    for _ in 0..2 {
+        let light = server.request(&close_request("/__hamster/light")).await;
+        let (headers, body) = split_response(&light);
+        assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(json_number(body, "pid"), initial.pid.unwrap() as u64);
+        assert_eq!(
+            json_number(body, "controller_calls"),
+            1,
+            "the route must not retain its controller instance"
+        );
+    }
+
+    let before_failure = pool.snapshot().workers[0].clone();
+    assert_eq!(before_failure.generation, initial.generation);
+    assert_eq!(before_failure.pid, initial.pid);
+    let failed = server
+        .request(
+            b"GET /__hamster/fail-cleanup HTTP/1.1\r\nHost: localhost\r\nX-Hamster-Fail-Cleanup: 1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    assert!(
+        failed.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "cleanup failure must withhold the staged response: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(
+        marker_lines(&failure_marker),
+        ["executed"],
+        "a request which reached PHP must execute exactly once"
+    );
+
+    let recovered = wait_for_pool(pool, |snapshot| {
+        snapshot.ready_workers == 1 && snapshot.workers[0].generation > initial.generation
+    })
+    .await;
+    assert_eq!(recovered.workers[0].generation, initial.generation + 1);
+    assert_ne!(recovered.workers[0].pid, initial.pid);
+    let healthy = server.request(&close_request("/__hamster/light")).await;
+    assert!(healthy.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert_eq!(marker_lines(&failure_marker), ["executed"]);
+
+    let _ = tokio::fs::remove_file(failure_marker).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an Octane-enabled scratch PMS with HamsterPmsProbeServiceProvider"]
+async fn pms_w4_isolates_controllers_and_recovers_only_failed_slot() {
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("fixtures/php-worker/laravel_worker.php");
+    let app = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the prepared scratch PMS"),
+    );
+    let provider_manifest = std::fs::read_to_string(app.join("bootstrap/providers.php"))
+        .expect("scratch PMS should have a provider manifest");
+    assert!(
+        provider_manifest.contains("HamsterPmsProbeServiceProvider"),
+        "scratch PMS must register the checked-in probe provider"
+    );
+    let app = app.to_string_lossy().replace('\\', "/");
+    let php_ini = std::env::var("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .unwrap_or_else(|_| format!("{app}/php.ini"))
+        .replace('\\', "/");
+    let failure_marker = marker_path("pms-w4-cleanup-failure");
+    let failure_marker_env = failure_marker.to_string_lossy().replace('\\', "/");
+    let runtime = Arc::new(php_runtime_with_env(
+        4,
+        &script,
+        &[
+            ("HAMSTER_LARAVEL_PATH", app.as_str()),
+            ("PHPRC", php_ini.as_str()),
+            ("SESSION_DRIVER", "file"),
+            ("CACHE_STORE", "array"),
+            ("QUEUE_CONNECTION", "sync"),
+            ("APP_ENV", "production"),
+            ("APP_DEBUG", "false"),
+            ("PERF_MONITOR_ENABLED", "false"),
+            ("HAMSTER_PMS_PROBE", "1"),
+            ("HAMSTER_PMS_FAILURE_MARKER", failure_marker_env.as_str()),
+        ],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    let pool = server.runtime.php_worker().unwrap();
+    let initial = pool.snapshot();
+    assert_eq!(initial.ready_workers, 4);
+    assert!(all_workers_live(&initial));
+
+    let exercise_all_workers = |address| async move {
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            tasks.push(tokio::spawn(async move {
+                request_at(
+                    address,
+                    b"GET /__hamster/light HTTP/1.1\r\nHost: localhost\r\nX-Hamster-Probe-Delay-Ms: 100\r\nConnection: close\r\n\r\n",
+                )
+                .await
+            }));
+        }
+
+        let mut pids = HashSet::new();
+        for task in tasks {
+            let response = task.await.unwrap();
+            let (headers, body) = split_response(&response);
+            assert!(
+                headers.starts_with(b"HTTP/1.1 200 OK\r\n"),
+                "PMS W4 request failed: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_eq!(
+                json_number(body, "controller_calls"),
+                1,
+                "each Octane sandbox must receive a fresh route controller"
+            );
+            pids.insert(json_number(body, "pid") as u32);
+        }
+        pids
+    };
+
+    let initial_pids = initial
+        .workers
+        .iter()
+        .map(|worker| worker.pid.unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(exercise_all_workers(server.address).await, initial_pids);
+    assert_eq!(exercise_all_workers(server.address).await, initial_pids);
+
+    let failed = server
+        .request(
+            b"GET /__hamster/fail-cleanup HTTP/1.1\r\nHost: localhost\r\nX-Hamster-Fail-Cleanup: 1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    assert!(
+        failed.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+        "cleanup failure must withhold the staged response: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert_eq!(marker_lines(&failure_marker), ["executed"]);
+
+    let recovered = wait_for_pool(pool, |snapshot| {
+        snapshot.ready_workers == 4
+            && snapshot
+                .workers
+                .iter()
+                .zip(&initial.workers)
+                .filter(|(current, previous)| current.generation > previous.generation)
+                .count()
+                == 1
+    })
+    .await;
+    assert!(all_workers_live(&recovered));
+    let changed_slots = recovered
+        .workers
+        .iter()
+        .zip(&initial.workers)
+        .filter(|(current, previous)| current.generation != previous.generation)
+        .collect::<Vec<_>>();
+    assert_eq!(changed_slots.len(), 1);
+    let (replacement, failed_worker) = changed_slots[0];
+    assert_eq!(replacement.generation, failed_worker.generation + 1);
+    assert_ne!(replacement.pid, failed_worker.pid);
+    for (current, previous) in recovered.workers.iter().zip(&initial.workers) {
+        if current.slot != replacement.slot {
+            assert_eq!(current.generation, previous.generation);
+            assert_eq!(current.pid, previous.pid);
+        }
+    }
+
+    let recovered_pids = recovered
+        .workers
+        .iter()
+        .map(|worker| worker.pid.unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(exercise_all_workers(server.address).await, recovered_pids);
+    assert_eq!(marker_lines(&failure_marker), ["executed"]);
+
+    let _ = tokio::fs::remove_file(failure_marker).await;
+    server.stop().await;
 }
 
 #[tokio::test]

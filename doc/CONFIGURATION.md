@@ -48,7 +48,6 @@ max_worker_age = 3600
 # Optional extra environment for the worker process.
 [hosts.locations.php.env]
 HAMSTER_LARAVEL_PATH = "www/pms"
-HAMSTER_LARAVEL_RESET = "targeted"
 ```
 
 `server.listen` must be a numeric IP socket address. Host names and aliases use
@@ -70,9 +69,10 @@ so a worker script can be told what application it serves without the server
 needing to know what kind of application that is. A variable name must be
 non-empty and must not contain `=` or NUL, and no value may contain NUL. Values
 are redacted from the configuration's `Debug` output, because credentials
-belong here and logs do not. `doc/LARAVEL_WORKER_0_4.md` describes the variables
-the Laravel worker reads: `HAMSTER_LARAVEL_PATH` (required),
-`HAMSTER_LARAVEL_RESET` and `HAMSTER_LARAVEL_WARMUP`.
+belong here and logs do not. `doc/LARAVEL_WORKER_0_4.md` describes the Laravel
+adapter. It reads `HAMSTER_LARAVEL_PATH` and requires the application to install
+Laravel Octane. The former `none` and `targeted` reset modes are rejected;
+warm and flush bindings are configured through Octane's application config.
 
 Both recycle policies are thresholds, not hard caps. Voluntary recycling holds
 one pool-wide permit, so a generation that reaches `max_requests` while another

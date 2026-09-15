@@ -72,23 +72,31 @@ failure settles into a 300-second cooldown ceiling instead. HTTP bodies
 still buffer before pool admission. `max_requests` and `max_worker_age` default
 OFF; recycling is stop-then-spawn and permits one voluntary recycle at a time.
 Both recycle policies are thresholds rather than caps; see the recycling
-limitation in `doc/PHP_WORKER.md`. Application Reset is implemented in 0.4.0
-for Laravel, in PHP, and so is `multipart/form-data` with file uploads, bounded
-by the protocol's 1 MiB body limit.
+limitation in `doc/PHP_WORKER.md`. Laravel request ownership is implemented in
+0.4.0 with Octane's sandbox/lifecycle plus a narrow Hamster resource boundary.
+`multipart/form-data` with file uploads remains bounded by the protocol's 1 MiB
+body limit.
 
 ## Current Findings
 
 Windows quality gates: `fmt --check`, clippy with `-D warnings`, the default
 suite (34 unit, 16 configuration, 4 routing, 5 static), a release build and
-`cargo bench --no-run --features profiling` all pass. The ignored suite run
-single-threaded is 38 passed, 1 failed, and the one failure is
-`ctrl_c_stops_server_and_reaps_pool` under ConPTY, which is the documented
-harness gap that also fails on the unmodified tree. The complete ignored suite
-includes the 18-test lifecycle matrix, the existing 0.2 cancellation/shutdown
+`cargo bench --no-run --features profiling` all pass. The final Octane
+regression pass ran the complete ignored suite in its default parallel mode:
+eight PHP pool unit tests and 47 process/HTTP integration tests passed. It
+includes the accepted worker lifecycle and 0.2 cancellation/shutdown
 regressions, the 100,000-request pool-level soak, a 10,000-request
 forced-failure HTTP soak, the 60-second W4 continuous-load random-kill stress,
-and the Laravel request-reconstruction checks. PHP lint over all 14 fixtures and
-post-test orphan checks pass.
+and all Laravel/PMS paths. A new real-PMS W4 regression forces all workers to
+serve fresh controllers, injects one cleanup failure, and proves only that slot
+advances generation before W4 recovers. No project PHP process remains after
+the suite.
+
+The first complete run exposed a deterministic harness regression: two
+external Laravel tests omitted the scratch application's `PHPRC`, so repository
+PHP lacked `mbstring`. The tests now derive the ini path themselves; both pass
+with the parent shell's `PHPRC` removed and the complete matrix passes. This
+was configuration dependence in the new tests, not a product race.
 
 Protocol v1 is unchanged on the wire. `src/php_protocol.rs` differs from
 `v0.2.0` only inside the old `write_frame` body, which now delegates to
@@ -179,65 +187,65 @@ four under a real console; it compares raw PIDs, and the new tests recycle PIDs
 much faster. Repository php.exe count was zero after every run, so no orphan
 was ever present.
 
-## 0.4.0 Laravel Persistent Worker (uncommitted, awaiting review)
+## 0.4.0 Laravel Persistent Worker (uncommitted, architecture revised)
 
-The server learned one generic thing: `php.env`, a `BTreeMap<String, String>`
-carried through all three configuration stages into `PhpWorkerConfig` and
-applied with `Command::envs`. Every generation, replacements included, receives
-it. All Laravel knowledge lives in PHP, in
-`fixtures/php-worker/laravel_worker.php` and `laravel_reset.php`.
-`fixtures/php-worker/env_worker.php` exists so the environment can be observed
-from an HTTP response.
+The independent review rejected the in-place targeted reset. Its
+`warmInstanceKeys` snapshot made binding lifetime depend on warm-up resolution,
+retained a bootstrap-resolved scoped binding, and could not see a controller
+cached on a shared `Route`. More reflection/list entries would not establish a
+real ownership boundary.
 
-Verified on a Laravel 12 skeleton and on a real 305-route application with JWT,
-Redis sessions and remote MySQL. Persistent bootstrap is worth 19.4x on a
-trivial route, 10.8x on a Blade login page, and 1.31x on a 2.2 MB
-database-bound dashboard: the gain is inversely proportional to how much real
-work a request does. The request-boundary reset costs 0.018 ms.
+The PHP worker now requires Laravel Octane 2.x and uses its application factory,
+per-request sandbox, manager rewiring and lifecycle listeners. Hamster supplies
+only the protocol-v1 client and a narrow resource boundary: abandoned DB
+transactions, Eloquent guard/strict statics, Carbon test time, cwd/default
+timezone and worker-created upload temporaries. The old `none` and `targeted`
+modes fail before READY.
 
-The reset is not optional. With one worker and no reset, an anonymous client
-sending no cookie at all was served another user's authenticated 2.2 MB
-dashboard. A four-worker pool hides this, so any isolation test must pin
-`workers = 1`.
+Responses are staged in PHP until kernel termination, Octane cleanup and the
+Hamster resource boundary all succeed. A terminating-listener fault injection
+initially exposed that sending a synthetic 500 made Rust briefly mark an exited
+generation READY. The final worker emits no frame on lifecycle failure: Rust
+receives EOF for a possibly-started request, returns 502 without replay,
+immediately marks the generation unavailable, boots generation 2 and returns
+200 there. The handler marker remains exactly one.
 
-Two request-reconstruction defects were found by testing against the real
-application and fixed: `Request::create()` never parses `HTTP_COOKIE` into its
-cookie bag, and it ignores the body entirely, so sessions, authentication and
-every form POST were broken. The worker now builds the request directly.
+Checked-in probes now cover bootstrap-resolved scoped state, scoped separation,
+lazy versus warm singleton ownership, cloned config, cached controllers,
+deferred providers, listener ordering, framework/runtime baselines, transaction
+and upload cleanup failure, response commit ordering, and stdout descriptor
+isolation. The real lifecycle test deliberately needs an Octane-enabled Laravel
+app and W1. A PMS-specific checked-in test drives 50 authenticated/anonymous
+pairs through the Rust server on one PID, checks cached-controller ownership,
+then fault-injects termination and requires exact-once recovery.
 
-`multipart/form-data` and file uploads are implemented in
-`fixtures/php-worker/laravel_request.php`: the worker splits the body, applies
-PHP's `a[b][]` field-name rules, writes each file to a temporary and builds
-`UploadedFile` objects in test mode, which is required or every Laravel `file`
-validation rule rejects the upload. The worker deletes its own temporaries,
-because Laravel's `store()` copies rather than moves and relies on a SAPI
-request shutdown that never happens. Verified byte-exact over HTTP, and 600
-uploads left zero temporaries behind. Bodies are still capped at the protocol's
-1 MiB.
+The actual Octane 2.19.1 package was installed in a no-hardlink scratch PMS,
+with package discovery and `artisan optimize`; no source injection was used.
+The ownership suite passed 25 checks. A release same-HTTP/IPC fresh-bootstrap
+comparison measured 1.51x on controller JSON, 1.49x on Blade login and 1.08x
+on the remote-MySQL dashboard. A W1 soak passed 20,000 alternating auth/guest
+requests on one PID and measured 0 B/request RSS slope over the second half.
+Raw results and reproduction scripts are under `benchmarks/`.
 
-A production-tuned measurement of the supplied application was taken without
-modifying it, by copying it and running `artisan optimize` against the copy. It
-reframes the headline: the persistent gain on a trivial route is 3.3x rather
-than 20x, and 7.6x on a Blade page. `artisan optimize` also made the persistent
-worker slower on `/up` and leaked 378 B/request there, because
-`withRouting(health: ...)` is a closure route and the route cache makes every
-dispatch unserialize it.
-
-Eight further probes covered Eloquent statics, the queue manager, forced URL
-origins, macros and connection callbacks. Four are now isolated by the reset.
-Three are deliberately not: global scopes cannot be restored without
-permanently unfiltering soft deletes, which is demonstrated rather than
-asserted, and macros cannot be enumerated.
-
-Known gaps: userland statics leak and cannot be fixed by a server; global
-scopes and macros registered during a request leak by design; cached closure
-routes leak memory inside Laravel itself.
+The original PMS remains untouched and does not declare Octane. Its pinned
+PhpSpreadsheet 1.30.6 declares PHP `<8.5`, so the scratch dependency install
+needed an explicit platform-ignore. Protocol v1 also lacks typed peer metadata,
+leaving `REMOTE_ADDR=127.0.0.1`; a stripped server-owned pseudo-header could
+carry it without changing framing, while a typed solution requires v2. This is
+an owner decision. See
+`doc/research/LARAVEL_LIFECYCLE_0_4_REVIEW.md`.
 
 ## Next Action
 
-Owner review of the uncommitted 0.4 worker. The three items previously listed
-here are done: `multipart/form-data`, the production-tuned measurement, and the
-`NotStarted` redispatch. The highest-value remaining items, in order:
+Owner review of the revised uncommitted 0.4 worker. Remaining decisions and
+out-of-scope qualifications:
+
+- Decide how the external PMS adopts Octane and resolves its PhpSpreadsheet
+  PHP 8.5 constraint. The disposable scratch proves lifecycle compatibility,
+  not that ignoring Composer platform requirements is a production policy.
+- Decide whether correct client IP reconstruction is a 0.4 blocker, and if a
+  reserved v1 metadata header or typed protocol-v2 field is the accepted
+  contract. Do not infer it from an untrusted forwarded header.
 
 - Raise the 1 MiB request body limit, or stream bodies, so uploads larger than
   that work. This is a protocol change and needs a milestone that owns the

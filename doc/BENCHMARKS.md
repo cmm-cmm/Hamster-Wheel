@@ -1380,6 +1380,41 @@ An end-to-end throughput A/B could not resolve the difference: run-to-run variat
 within one server instance reached 23 percent, which is larger than the effect. As in
 0.3, this data can fail to detect a regression; it cannot prove there is none.
 
+## 0.4 Laravel Persistent Worker — Octane Lifecycle
+
+This additive result supersedes the old reset implementation for current 0.4
+decisions; it does not rewrite either historical table. Windows release build,
+PHP 8.5.10 NTS with CLI OPcache, Laravel 12.66.0 PMS scratch clone at commit
+`552e27525b1161ed10b36bdd726d203ecfa3ccff`, Laravel Octane 2.19.1 and
+`artisan optimize`. Both candidates used the same Rust HTTP server, protocol-v1
+IPC, pool size, routes and fully consumed responses. `fresh` rebuilt Laravel on
+every request while keeping PHP and OPcache alive; it is an optimistic
+bootstrap baseline rather than a complete PHP-FPM emulation.
+
+Light and login cells are medians of three fresh server runs, W4/C16, 500
+warm-up and at least 5,000 measured requests. Dashboard cells are three W1/C1
+runs of 10 warm-up and 100 measured authenticated requests against the real
+remote MySQL dependency.
+
+| Route | fresh RPS | Octane RPS | gain | fresh p50 | Octane p50 |
+|---|---:|---:|---:|---:|---:|
+| controller JSON | 751.1 | 1137.0 | 1.51x | 20.609 ms | 13.209 ms |
+| Blade `/login` | 623.1 | 931.3 | 1.49x | 24.637 ms | 15.832 ms |
+| authenticated dashboard | 3.28 | 3.54 | 1.08x | 301.828 ms | 273.423 ms |
+
+The W4 persistent ranges were 1044.2–1150.4 RPS for the controller and
+865.2–976.5 for login, so exact multipliers have material machine variance;
+the fresh ranges did not overlap them. Remote-DB variance was larger on the
+dashboard and supports only a modest-benefit conclusion. The old 3.3x, 7.6x
+and 1.31x figures must not be attributed to this lifecycle.
+
+A W1 20,000-request authenticated/anonymous alternating soak held one PID,
+produced no wrong response, and had 0 B/request least-squares RSS slope over
+its second half. A final cleanup-failure injection returned 502, executed its
+marker once, replaced the process and served 200 on the new generation. Raw
+measurements, exact conditions and reproduction commands are in
+`benchmarks/results/laravel_pms_octane_0_4_20260915.md`.
+
 Uploads, Laravel 12 over HTTP, four workers, 600 multipart requests across `/u/store`
 and `/u/inspect`: every response 200, and zero temporary files left in the system
 temporary directory. The request rate is not reported because the client is a serial

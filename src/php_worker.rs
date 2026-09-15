@@ -2889,11 +2889,13 @@ mod tests {
             },
         );
         worker.start().await.unwrap();
+        let error = worker
+            .execute(&request("POST", "/large", "", vec![b'x'; MAX_REQUEST_BODY]))
+            .await
+            .expect_err("a worker exiting after the frame prefix must fail the request");
         assert!(
-            worker
-                .execute(&request("POST", "/large", "", vec![b'x'; MAX_REQUEST_BODY]))
-                .await
-                .is_err()
+            matches!(error, PhpWorkerError::Request(_)),
+            "a partial frame write is possibly started and must not be retry-safe: {error}"
         );
         assert_eq!(worker.state(), WorkerState::Unavailable);
         worker.shutdown().await.unwrap();

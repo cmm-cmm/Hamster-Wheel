@@ -5,38 +5,31 @@ declare(strict_types=1);
 /**
  * Persistent Laravel worker for Hamster protocol v1.
  *
- * Laravel boots once, before READY is sent, so the pool never reports a worker
- * ready until it can actually serve. Every request afterwards reuses that
- * application and is followed by a request-boundary reset.
+ * Laravel Octane owns application/container request isolation. Hamster owns
+ * protocol framing, request reconstruction, upload temporaries and the final
+ * external-resource boundary. The response remains staged until every cleanup
+ * step succeeds, so Rust cannot redispatch work to a contaminated generation.
  *
- * Configured entirely through the worker's environment, so the server needs no
- * knowledge of Laravel:
- *
- *   HAMSTER_LARAVEL_PATH   required; the application root holding
- *                          vendor/autoload.php and bootstrap/app.php
- *   HAMSTER_LARAVEL_RESET  optional; "targeted" (default) or "none"
- *   HAMSTER_LARAVEL_WARMUP optional; warm-up requests before READY, default 2
- *
- * Protocol v1 is used exactly as it is: no new frame kinds and no new limits.
+ * HAMSTER_LARAVEL_PATH is required. The application must require
+ * laravel/octane and retain Octane's default lifecycle listeners.
  */
 
-// Standard output carries protocol frames and nothing else. PHP's own
-// diagnostics go to stderr, which Hamster drains, because a single deprecation
-// notice printed before the first frame corrupts the stream and the pool sees a
-// nonsense frame length. PHP 8.5 emits such notices for real application code.
 ini_set('display_errors', 'stderr');
 ini_set('log_errors', '0');
 ini_set('html_errors', '0');
 
+require __DIR__ . '/laravel_stdout.php';
+$stdout = hamster_open_protocol_stdout();
 require __DIR__ . '/protocol.php';
 require __DIR__ . '/laravel_request.php';
-require __DIR__ . '/laravel_reset.php';
 
-use Illuminate\Contracts\Http\Kernel as HttpKernel;
+use Illuminate\Support\Once;
+use Laravel\Octane\ApplicationFactory;
+use Laravel\Octane\RequestContext;
+use Laravel\Octane\Worker;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
-/** Headers the server owns; a worker that sends them is rejected with 502. */
 const HAMSTER_FORBIDDEN_RESPONSE_HEADERS = [
     'connection' => true,
     'content-length' => true,
@@ -56,23 +49,6 @@ function hamster_fail(string $message): never
     exit(2);
 }
 
-$appPath = getenv('HAMSTER_LARAVEL_PATH');
-if ($appPath === false || $appPath === '') {
-    hamster_fail('HAMSTER_LARAVEL_PATH is not set');
-}
-$appPath = rtrim($appPath, "/\\");
-foreach (['/vendor/autoload.php', '/bootstrap/app.php'] as $required) {
-    if (! is_file($appPath . $required)) {
-        hamster_fail("HAMSTER_LARAVEL_PATH is missing {$required}");
-    }
-}
-
-$strategy = getenv('HAMSTER_LARAVEL_RESET') ?: 'targeted';
-// At least one warm-up request is mandatory, not a tuning knob: it is what
-// boots the application and what makes the reset snapshot describe the state
-// the worker actually returns to between requests.
-$warmupRequests = max(1, (int) (getenv('HAMSTER_LARAVEL_WARMUP') ?: '2'));
-
 /** @return list<array{0:string,1:string}> */
 function hamster_response_headers($response): array
 {
@@ -91,22 +67,23 @@ function hamster_response_headers($response): array
 
 function hamster_response_body($response): string
 {
-    // A streamed or file-backed response has no content to read: its bytes
-    // only exist while sendContent() runs. Capturing that is also what keeps
-    // a download honest after Router::prepareResponse() has applied a Range
-    // header, because sendContent() sends exactly the range it computed while
-    // the file itself is the whole file.
-    if ($response instanceof StreamedResponse || $response instanceof BinaryFileResponse) {
-        ob_start();
-        $response->sendContent();
-
-        return (string) ob_get_clean();
+    if (! $response instanceof StreamedResponse && ! $response instanceof BinaryFileResponse) {
+        return (string) $response->getContent();
     }
 
-    return (string) $response->getContent();
+    $level = ob_get_level();
+    ob_start();
+    try {
+        $response->sendContent();
+
+        return (string) ob_get_contents();
+    } finally {
+        while (ob_get_level() > $level) {
+            ob_end_clean();
+        }
+    }
 }
 
-/** Encodes a response the worker produced itself, without involving Laravel. */
 function hamster_worker_response(int $id, int $status, string $body): string
 {
     return hamster_encode_response([
@@ -117,64 +94,91 @@ function hamster_worker_response(int $id, int $status, string $body): string
     ]);
 }
 
-require $appPath . '/vendor/autoload.php';
-
-$app = require $appPath . '/bootstrap/app.php';
-$kernel = $app->make(HttpKernel::class);
-
-/**
- * Warm before READY, and let the first warm-up request perform the bootstrap.
- *
- * Bootstrapping eagerly here instead would run every service provider with no
- * request bound in the container, which `public/index.php` never does: it binds
- * the request first and bootstraps inside `handle()`. An application whose
- * providers touch `request` during boot fails outright under the eager order.
- *
- * Nothing is allowed to reach standard output during this phase either. A
- * bootstrap exception renders to stdout by default, and those bytes would be
- * read as a frame length.
- */
-ob_start();
-try {
-    for ($index = 0; $index < $warmupRequests; $index++) {
-        $warmRequest = hamster_build_request([
-            'method' => 'GET', 'uri' => '/up', 'query' => '', 'headers' => [], 'body' => '',
-        ]);
-        $warmResponse = $kernel->handle($warmRequest);
-        $warmStatus = $warmResponse->getStatusCode();
-        $kernel->terminate($warmRequest, $warmResponse);
-        unset($warmRequest, $warmResponse);
+/** Run code behind an output guard and return bytes it attempted to print. */
+function hamster_guard_output(callable $operation): string
+{
+    $level = ob_get_level();
+    ob_start();
+    try {
+        $operation();
+    } finally {
+        $chunks = [];
+        while (ob_get_level() > $level) {
+            $chunk = ob_get_clean();
+            if (is_string($chunk) && $chunk !== '') {
+                $chunks[] = $chunk;
+            }
+        }
     }
-} catch (Throwable $error) {
-    $strayBoot = (string) ob_get_clean();
+
+    return implode('', array_reverse($chunks));
+}
+
+$appPath = getenv('HAMSTER_LARAVEL_PATH');
+if ($appPath === false || $appPath === '') {
+    hamster_fail('HAMSTER_LARAVEL_PATH is not set');
+}
+$appPath = rtrim($appPath, "/\\");
+if (($legacyReset = getenv('HAMSTER_LARAVEL_RESET')) !== false && $legacyReset !== '' && $legacyReset !== 'octane') {
+    hamster_fail('HAMSTER_LARAVEL_RESET no longer accepts unsafe reset strategies; remove it or use "octane"');
+}
+foreach (['/vendor/autoload.php', '/bootstrap/app.php'] as $required) {
+    if (! is_file($appPath . $required)) {
+        hamster_fail("HAMSTER_LARAVEL_PATH is missing {$required}");
+    }
+}
+
+require $appPath . '/vendor/autoload.php';
+if (! class_exists(Worker::class)) {
+    hamster_fail('laravel/octane is required by the persistent Laravel worker');
+}
+require __DIR__ . '/laravel_lifecycle.php';
+require __DIR__ . '/laravel_octane_client.php';
+
+$client = new HamsterOctaneClient($stdout);
+$worker = new Worker(new ApplicationFactory($appPath), $client);
+$startupError = null;
+$strayBoot = hamster_guard_output(static function () use ($worker, &$startupError): void {
+    try {
+        $worker->boot();
+    } catch (Throwable $error) {
+        $startupError = $error;
+    }
+});
+if ($startupError !== null) {
     hamster_fail(
-        'warm-up failed: ' . get_class($error) . ': ' . $error->getMessage()
+        'bootstrap failed: ' . get_class($startupError) . ': ' . $startupError->getMessage()
         . ($strayBoot === '' ? '' : "\n" . substr($strayBoot, 0, 2000))
     );
 }
-$strayBoot = (string) ob_get_clean();
 if ($strayBoot !== '') {
-    fwrite(STDERR, 'laravel worker: discarded ' . strlen($strayBoot) . " bytes printed during warm-up\n");
-}
-if ($warmStatus >= 500) {
-    hamster_fail("warm-up request to /up returned {$warmStatus}; the application is not serving");
+    fwrite(STDERR, 'laravel worker: discarded ' . strlen($strayBoot) . " bytes printed during bootstrap\n");
 }
 
-$reset = hamster_make_reset($strategy, $app);
-$reset();
+// Symfony Console needs stdout while the application boots. From this point
+// onward fd 1 is a null sink and only the private duplicate can carry frames.
+hamster_disable_application_stdout();
+
+$app = $worker->application();
+try {
+    hamster_validate_octane_lifecycle($app);
+    $lifecycle = new HamsterLaravelLifecycle($app);
+    Once::flush();
+} catch (Throwable $error) {
+    hamster_fail('invalid Laravel lifecycle: ' . $error->getMessage());
+}
 
 $stdin = hamster_open_worker_stdin();
-$stdout = fopen('php://stdout', 'wb');
-if ($stdout === false) {
-    hamster_fail('cannot open standard output');
-}
-
 hamster_send_ready($stdout);
 
 while (($frame = hamster_read_frame($stdin)) !== null) {
     if (ord($frame[0]) === HAMSTER_SHUTDOWN) {
         if (strlen($frame) !== 1) {
             throw new RuntimeException('shutdown frame has trailing bytes');
+        }
+        $stray = hamster_guard_output(static fn () => $worker->terminate());
+        if ($stray !== '') {
+            fwrite(STDERR, 'laravel worker: discarded output during worker termination\n');
         }
         hamster_send_shutdown_ack($stdout);
         exit(0);
@@ -184,45 +188,55 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
     try {
         $request = hamster_build_request($decoded);
     } catch (HamsterBadRequest $error) {
-        // A body this worker cannot parse is the client's error, not a reason
-        // to lose a booted application. Answer it and keep serving.
         hamster_discard_uploads();
-        fwrite(STDERR, 'laravel worker: rejected a malformed request: ' . $error->getMessage() . "\n");
+        fwrite(STDERR, 'laravel worker: rejected malformed request: ' . $error->getMessage() . "\n");
         hamster_write_frame($stdout, hamster_worker_response($decoded['id'], 400, 'Bad Request'));
-        $reset();
         continue;
+    } catch (Throwable $error) {
+        hamster_discard_uploads();
+        throw $error;
     }
 
-    // Anything the application prints belongs in the response body or nowhere;
-    // it must never reach the frame stream.
+    $stray = '';
+    $guardLevel = ob_get_level();
     ob_start();
     try {
-        $response = $kernel->handle($request);
-        $headers = hamster_response_headers($response);
-        $body = hamster_response_body($response);
-        $status = $response->getStatusCode();
+        $worker->handle($request, new RequestContext([
+            'id' => $decoded['id'],
+            'request' => $request,
+        ]));
+        $lifecycle->completeRequest();
+        hamster_discard_uploads();
+        if (! $client->shouldStop()) {
+            // The response is the commit point visible to Rust. Everything
+            // which can poison this application generation has completed
+            // first. A retiring client deliberately leaves the response
+            // uncommitted; EOF makes Rust return 502 without replaying the
+            // possibly-started request.
+            $client->markCleanupCompleted();
+            $client->flushResponse();
+        }
     } finally {
-        $stray = (string) ob_get_clean();
+        hamster_discard_uploads();
+        $chunks = [];
+        while (ob_get_level() > $guardLevel) {
+            $chunk = ob_get_clean();
+            if (is_string($chunk) && $chunk !== '') {
+                $chunks[] = $chunk;
+            }
+        }
+        $stray = implode('', array_reverse($chunks));
+        unset($request, $decoded);
     }
     if ($stray !== '') {
-        fwrite(STDERR, 'laravel worker: discarded ' . strlen($stray) . " bytes written to stdout\n");
+        fwrite(STDERR, 'laravel worker: discarded ' . strlen($stray) . " bytes written during lifecycle cleanup\n");
     }
+    if ($client->shouldStop()) {
+        hamster_fail('Octane retired the worker after a lifecycle error');
+    }
+}
 
-    // Answer the client first, then clean up. This generation owns the worker
-    // exclusively, so the reset always completes before the next request can be
-    // assigned and never overlaps one.
-    hamster_write_frame($stdout, hamster_encode_response([
-        'id' => $decoded['id'],
-        'status' => $status,
-        'headers' => $headers,
-        'body' => $body,
-    ]));
-
-    $kernel->terminate($request, $response);
-    // PHP deletes its own upload temporaries when the SAPI ends a request.
-    // Nothing ends here, so a worker that skipped this would leak one file per
-    // upload for the life of the process.
-    hamster_discard_uploads();
-    unset($request, $response, $decoded, $headers, $body, $stray);
-    $reset();
+$stray = hamster_guard_output(static fn () => $worker->terminate());
+if ($stray !== '') {
+    fwrite(STDERR, 'laravel worker: discarded output during worker termination\n');
 }

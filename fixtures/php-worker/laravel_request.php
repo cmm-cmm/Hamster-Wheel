@@ -50,17 +50,30 @@ function &hamster_upload_temporaries(): array
     return $paths;
 }
 
-/** Removes any upload temporary the application did not move away. */
-function hamster_discard_uploads(): void
+/**
+ * Removes any upload temporary the application did not move away.
+ *
+ * The optional remover is a fault-injection seam for the standalone test.
+ * Production callers always use unlink.
+ */
+function hamster_discard_uploads(?callable $remove = null): void
 {
     $paths = &hamster_upload_temporaries();
+    $failures = [];
     foreach ($paths as $path) {
         // A moved upload is renamed, so a missing file is the normal case.
-        if (is_file($path)) {
-            @unlink($path);
+        $removed = ! is_file($path)
+            || ($remove === null ? @unlink($path) : $remove($path));
+        if (! $removed && is_file($path)) {
+            $failures[] = $path;
         }
     }
-    $paths = [];
+    $paths = $failures;
+    if ($failures !== []) {
+        throw new RuntimeException(
+            'failed to remove ' . count($failures) . ' upload temporary file(s)'
+        );
+    }
 }
 
 /**
@@ -153,26 +166,56 @@ function hamster_parse_multipart(string $body, string $contentType): array
 
     $parameters = [];
     $files = [];
-    // Prefixing the body with CRLF lets the first delimiter be matched by the
-    // same rule as every later one, and splitting on the delimiter keeps each
-    // part's trailing CRLF out of its content.
-    $segments = explode("\r\n--" . $boundary, "\r\n" . $body);
-    array_shift($segments);
+    // A boundary prefix inside file content is not a delimiter unless the
+    // remainder of its line is valid too. Splitting on the prefix alone would
+    // silently truncate an upload containing, for example,
+    // "\r\n--boundary--not-a-close". Match complete delimiter lines and use
+    // their offsets so the CRLF before each delimiter stays out of the part.
+    $delimiter = '/(?:\A|\r\n)--' . preg_quote($boundary, '/')
+        . '(?:(--)[\x20\t]*(?:\r\n|\z)|[\x20\t]*\r\n)/';
+    $matched = preg_match_all(
+        $delimiter,
+        $body,
+        $matches,
+        PREG_OFFSET_CAPTURE | PREG_UNMATCHED_AS_NULL
+    );
+    if ($matched === false || $matched === 0) {
+        throw new HamsterBadRequest('multipart body has no parts');
+    }
+
+    $segments = [];
+    $contentStart = null;
+    $closed = false;
+    foreach ($matches[0] as $index => [$wholeDelimiter, $offset]) {
+        $closing = $matches[1][$index][0] !== null;
+        if ($contentStart === null) {
+            if ($closing) {
+                break;
+            }
+            $contentStart = $offset + strlen($wholeDelimiter);
+            continue;
+        }
+        $segments[] = substr($body, $contentStart, $offset - $contentStart);
+        if ($closing) {
+            $closed = true;
+            break;
+        }
+        $contentStart = $offset + strlen($wholeDelimiter);
+    }
+    if ($contentStart === null) {
+        throw new HamsterBadRequest('multipart body has no parts');
+    }
+    if (! $closed) {
+        throw new HamsterBadRequest('multipart body has no closing boundary');
+    }
     if ($segments === []) {
         throw new HamsterBadRequest('multipart body has no parts');
     }
 
     $parsed = 0;
     foreach ($segments as $segment) {
-        // The closing delimiter ends the body; anything after it is epilogue.
-        if ($segment === '' || str_starts_with($segment, '--')) {
-            break;
-        }
         if (++$parsed > HAMSTER_MAX_MULTIPART_PARTS) {
             throw new HamsterBadRequest('multipart body has too many parts');
-        }
-        if (str_starts_with($segment, "\r\n")) {
-            $segment = substr($segment, 2);
         }
         $split = strpos($segment, "\r\n\r\n");
         if ($split === false) {
@@ -286,19 +329,21 @@ function hamster_assign_nested(array &$target, string $name, mixed $value): void
 {
     $open = strpos($name, '[');
     if ($open === false) {
-        $target[$name] = $value;
+        // PHP normalizes dots and spaces in the top-level variable name. Keys
+        // inside brackets are deliberately left alone.
+        $target[strtr($name, ['.' => '_', ' ' => '_'])] = $value;
 
         return;
     }
 
-    $keys = [substr($name, 0, $open)];
+    $keys = [strtr(substr($name, 0, $open), ['.' => '_', ' ' => '_'])];
     $rest = substr($name, $open);
     while ($rest !== '' && $rest[0] === '[') {
         $close = strpos($rest, ']');
         if ($close === false) {
-            // Malformed names are stored whole, which is what parse_str does
-            // rather than discarding the value.
-            $target[$name] = $value;
+            // `parse_str` treats an unmatched opening bracket as part of the
+            // top-level name and normalizes it to an underscore.
+            $target[strtr($name, ['.' => '_', ' ' => '_', '[' => '_'])] = $value;
 
             return;
         }

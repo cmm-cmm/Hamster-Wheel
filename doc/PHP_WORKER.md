@@ -342,31 +342,46 @@ or adaptive sizing. FastCGI remains separate later work.
 
 ### Laravel worker limitations (0.4)
 
-`fixtures/php-worker/laravel_worker.php` keeps a Laravel application alive
-across requests and resets request-scoped state at each boundary.
-`laravel_request.php` rebuilds the request, including cookies, urlencoded
-bodies and `multipart/form-data` uploads, because the SAPI layer that normally
-does that is not in the path. `laravel_reset.php` is the boundary reset.
-`laravel_request_test.php` checks the framework-free half of the reconstruction
-and is run by the ignored test
-`laravel_request_reconstruction_passes_its_own_checks`. What the worker does not
-do:
+`fixtures/php-worker/laravel_worker.php` adapts protocol v1 to Laravel Octane's
+application sandbox. `laravel_request.php` rebuilds the request, including
+cookies, urlencoded bodies and `multipart/form-data` uploads, because the SAPI
+layer that normally does that is not in the path. `laravel_lifecycle.php` owns
+only external/process-global cleanup which a cloned application cannot own.
+The response is staged until termination and cleanup succeed, so a contaminated
+generation is never made reusable by an early response frame. The adapter also
+reserves a private duplicate of stdout for protocol frames and redirects fd 1
+to the null device after bootstrap. Output buffering alone cannot contain
+`fwrite(STDOUT, ...)`; after READY, direct application or cleanup writes no
+longer reach the protocol pipe.
+
+If Octane reports an uncaught lifecycle error, the staged response is not
+written. PHP exits, Rust receives EOF, returns 502 for the possibly-started
+request without replaying it, marks the generation unavailable and starts a
+replacement. Sending a synthetic 500 before exit was tested and rejected
+because Rust briefly advertised the dead generation as READY after accepting
+the valid frame.
+
+What the worker does not do:
 
 - Request bodies are capped at the protocol's 1 MiB, uploads included. A larger
   upload is `413` before the worker sees it.
-- Userland static properties survive the reset, and no server can prevent that.
-  Application code must not hold request state in statics.
-- `Model::addGlobalScope()` and macros registered during a request survive it,
-  deliberately. Restoring global scopes would permanently unfilter soft deletes,
-  which is demonstrated in `doc/LARAVEL_WORKER_0_4.md`.
-- `artisan optimize` is not unconditionally right for a persistent worker. It
-  turns closure routes into per-dispatch `unserialize` calls, and Laravel's own
-  `withRouting(health: ...)` endpoint is one.
-- Cached closure routes leak memory on every dispatch. That is a framework
-  behaviour affecting any persistent runtime; use controller routes.
+- Userland globals/statics, runtime listeners and macros remain process state.
+  Request-sensitive data must use scoped bindings or an explicit compatible
+  Octane lifecycle hook.
+- A singleton resolved in the base application or listed in `octane.warm` is
+  worker-owned. It must not capture request, user or tenant state. A legacy
+  singleton that must be rebuilt belongs in `octane.flush`.
+- Streamed/file responses are captured into one frame; this is response-semantic
+  support, not transport streaming.
+- The protocol does not carry typed peer address metadata, so Laravel currently
+  sees `REMOTE_ADDR=127.0.0.1`. Rust receives the address from `accept()` but
+  drops it before routing. A reserved server-owned pseudo-header can fit the
+  existing header list without changing framing; protocol v2 would provide a
+  typed metadata field. Neither owner-reserved option is implemented.
 
-The full measurement, the reset's contents, and what was rejected are in
-`doc/LARAVEL_WORKER_0_4.md`.
+The lifecycle, falsification evidence and current blockers are in
+`doc/LARAVEL_WORKER_0_4.md` and
+`doc/research/LARAVEL_LIFECYCLE_0_4_REVIEW.md`.
 
 ## 0.1.1 Windows IPC Investigation
 
