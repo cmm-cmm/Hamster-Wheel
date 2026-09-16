@@ -1617,3 +1617,121 @@ period. Replacing it with a service-wide timeout would be incorrect because it
 could cancel a possibly-started backend transaction. A custom shared timer or
 I/O wrapper was not introduced without evidence that roughly 1.2 us/request on
 the smallest response justifies new synchronization and lifecycle risk.
+
+## 0.5.x Bounded PHP body reconstruction — working tree
+
+The body-read deadline A/B is recorded in
+[`benchmarks/results/http_body_0_5_20260916.md`](../benchmarks/results/http_body_0_5_20260916.md).
+It used seven fresh Windows MSVC release servers per binary, 20,000 measured
+requests, 2,000 warm-up requests and one client connection against the local
+PHP 8.5 worker. The candidate adds no timer to empty bodies: it checks the
+Hyper end-stream fast path before entering `tokio::time::timeout`.
+
+| Scenario | baseline median RPS | candidate median RPS | baseline combined CPU us/request | candidate combined CPU us/request |
+|---|---:|---:|---:|---:|
+| PHP hello, empty body | 5,942 | 5,867 | 195.312 | 210.938 |
+| PHP echo, small body | 5,483 | 5,546 | 228.125 | 224.219 |
+
+FACT: the empty-body result is a 1.3% lower candidate median with substantial
+run-to-run CPU variance; it is not a release-grade regression claim. The body
+carrying result is 1.1% higher RPS and 1.7% lower combined CPU. The in-memory
+`/api` control had 19.8-20.5% RPS spread across three runs and cannot resolve a
+small core-path effect. These numbers support retaining the simple fast path and
+do not justify an optimization pass before a larger body-size matrix.
+
+## 0.5.x aggregate body-memory investigation — working tree
+
+The bounded-body memory probe is recorded in
+[`benchmarks/results/body_memory_0_5_20260916.md`](../benchmarks/results/body_memory_0_5_20260916.md).
+It uses a Windows MSVC release binary, the fixture PHP worker, 1 MiB declared
+bodies and a delayed endpoint. Hamster private-memory deltas for one worker and
+`queue_capacity=128` were 6.52, 10.93, 21.32, 37.52 and 73.71 MiB at 4, 8, 16,
+32 and 64 accepted connections respectively. With 32 connections, changing the
+queue from 1 to 8 to 128 changed the delta from 6.17 to 14.78 to 37.62 MiB.
+
+An incomplete-body probe sent only 0.5 MiB of a declared 1 MiB body on 32
+connections with `queue_capacity=1`; Hamster private memory still rose 37.58 MiB
+while PHP memory did not change. FACT: queue capacity cannot bound bodies that
+have not reached pool admission. INFERENCE: the current aggregate bound is
+primarily `max_connections * body_limit`, plus parser/frame/allocator overhead.
+No byte semaphore was added because the measurement establishes the risk but not
+yet the best rejection/backpressure semantics or a justified hot-path trade-off.
+
+## 0.5.x aggregate body-memory budget prototype — working tree
+
+Full conditions are recorded in
+[`benchmarks/results/body_budget_0_5_20260916.md`](../benchmarks/results/body_budget_0_5_20260916.md).
+Both arms are the same Windows MSVC release binary; `server.max_body_memory = 0`
+disables the budget and restores the previous code path, so this is an A/B of
+one binary rather than of two builds.
+
+Slow-upload flood, 1 MiB declared bodies with half sent, one worker,
+`queue_capacity=128`, Hamster private-memory delta:
+
+| accepted connections | budget off | budget 16 MiB |
+|---:|---:|---:|
+| 32 | 36.52 MiB | 18.23 MiB |
+| 64 | 72.41 MiB | 18.93 MiB |
+| 128 | 140.59 MiB | 18.87 MiB |
+| 256 | 278.50 MiB | 18.79 MiB |
+
+FACT: off, the delta is linear at 1.09 MiB per accepted connection. On, it is
+flat across an eightfold change in connection count, a 14.8x reduction at 256
+connections.
+
+At a fixed 128 connections the delta tracked the configured budget: 4.48 MiB at
+4 MiB, 18.36 MiB at 16 MiB, 70.07 MiB at 64 MiB, against 140.59 MiB disabled —
+1.09 to 1.15 times the budget. The excess is Hyper per-connection buffers and
+the worker's protocol frame, which the budget deliberately does not cover.
+
+With all 128 bodies sent whole so they sit in the bounded queue, the delta was
+20.06 MiB with a 16 MiB budget against 143.93 MiB disabled.
+
+Hot-path A/B, `php_worker.ps1`, one worker, concurrency 1, 20,000 measured
+requests after 1,000 warm-up requests:
+
+| Scenario | budget 64 MiB | budget off |
+|---|---:|---:|
+| PHP hello, no body (5 runs) | 7,086 rps | 7,097 rps |
+| PHP echo, 12 B body (5 runs) | 6,728 rps | 6,514 rps |
+| PHP echo, 12 B body (interleaved pass 1) | 6,524 rps | 6,803 rps |
+| PHP echo, 12 B body (interleaved pass 2) | 6,694 rps | 6,745 rps |
+| PHP echo, 64 KiB body (interleaved pass 1) | 3,703 rps | 3,733 rps |
+| PHP echo, 64 KiB body (interleaved pass 2) | 3,722 rps | 3,686 rps |
+
+FACT: the sign of the difference flips between passes and within-arm spread
+reached 16% on the 12-byte POST. HONEST LIMIT: this harness can fail to detect a
+regression below roughly 5%; it shows no visible cost and does not prove there
+is none. The same change removed a full `Vec` copy of every reconstructed body,
+which plausibly offsets the added atomics on this workload.
+
+## 0.5 milestone review resource probes — working tree
+
+Full procedures are recorded in
+[`benchmarks/results/review_0_5_20260916.md`](../benchmarks/results/review_0_5_20260916.md).
+These are resource-bound observations taken while reviewing the four 0.5 slices
+as a milestone candidate, not throughput benchmarks. The probe scripts were
+throwaway and are not checked in; each procedure is written out instead.
+
+FACT: four clients that requested a 256 MiB static file and then stopped reading
+held 1026.4 MiB of process-private memory against a 1.47 MiB idle baseline —
+256.6 MiB per in-flight request, one complete copy of the file each. Response
+bodies are outside `max_body_memory` and outside every other 0.5 limit. This is
+sixteen times the entire default request-body budget, reached by four ordinary
+requests.
+
+FACT: the hold is bounded in time but not in size. With one connection slot and a
+stalled 256 MiB response, a second client was served after 3.1 s at a 5-second
+`header_read_timeout` and after 7.0 s at a 10-second one, and process memory
+returned to 1.6 MiB. INFERENCE: Hyper's header deadline reclaims a stalled
+response write, which is more than the second slice documents for it, is load
+bearing, and is pinned by no test.
+
+FACT: with `max_body_memory = 4194304` and `body_read_timeout = 20`, four clients
+that declared 1 MiB each and sent one byte held the whole budget; other POSTs
+received 503 for the duration while GET requests were answered 200. At the 64 MiB
+default the same denial costs 64 connections.
+
+An earlier eight-client run against a 64 MiB file measured only a 0.75 MiB delta
+and is recorded as a sampling failure, not a contrary result: loopback drained
+those responses faster than the 250 ms sampling interval.

@@ -70,6 +70,14 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             return Err(ServerError::Io(error));
         }
     };
+    // Printed once at startup, beside the other readiness lines. A refused
+    // request is only explainable if the operator can see what the ceiling was
+    // set to, and a configured limit is not something a running server should
+    // have to be asked for.
+    match config.http_limits().max_body_memory() {
+        0 => println!("Request body memory budget disabled (server.max_body_memory = 0)"),
+        limit => println!("Request body memory budget {limit} bytes"),
+    }
     println!("Hamster Wheel listening on http://{address}");
 
     let router = config.router_arc();
@@ -144,7 +152,11 @@ async fn serve_connection(
 ) {
     let service = hyper::service::service_fn(move |request| {
         let router = Arc::clone(&router);
-        async move { router.serve(request, transport).await }
+        async move {
+            router
+                .serve(request, transport, http_limits.body_read_timeout())
+                .await
+        }
     });
     let mut builder = http1::Builder::new();
     builder
@@ -217,11 +229,23 @@ mod tests {
     };
 
     use super::*;
+    use crate::body_budget::BodyBudget;
     use crate::router::{Handler, HostRouter, LocationRouter, VirtualHost};
 
     fn transport_router() -> HostRouter {
         let locations = Arc::new(
             LocationRouter::new(Vec::new(), Handler::transport_echo()).expect("valid locations"),
+        );
+        HostRouter::new(vec![
+            VirtualHost::new("127.0.0.1", locations).expect("valid host"),
+        ])
+        .expect("valid router")
+    }
+
+    fn body_router(budget: Arc<BodyBudget>, hold: Option<Duration>) -> HostRouter {
+        let locations = Arc::new(
+            LocationRouter::new(Vec::new(), Handler::body_echo(budget, hold))
+                .expect("valid locations"),
         );
         HostRouter::new(vec![
             VirtualHost::new("127.0.0.1", locations).expect("valid host"),
@@ -244,6 +268,29 @@ mod tests {
         let server = tokio::spawn(serve_with_router(
             listener,
             Arc::new(transport_router()),
+            http_limits,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        (listen_addr, shutdown_tx, server)
+    }
+
+    async fn start_body_server(
+        http_limits: HttpLimits,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(body_router(BodyBudget::disabled(), None)),
             http_limits,
             async move {
                 let _ = shutdown_rx.await;
@@ -300,6 +347,22 @@ mod tests {
 
         String::from_utf8(response[header_end..header_end + content_length].to_vec())
             .expect("UTF-8 response body")
+    }
+
+    async fn read_response_head(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        loop {
+            if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+                return response[..index + 4].to_vec();
+            }
+            let mut chunk = [0_u8; 512];
+            let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+                .await
+                .expect("response header timeout")
+                .expect("read response header");
+            assert_ne!(count, 0, "connection closed before response headers");
+            response.extend_from_slice(&chunk[..count]);
+        }
     }
 
     #[tokio::test]
@@ -396,7 +459,12 @@ mod tests {
 
     #[tokio::test]
     async fn header_timeout_bounds_partial_and_idle_connections() {
-        let limits = HttpLimits::for_test(4, Duration::from_millis(200), 8 * 1_024);
+        let limits = HttpLimits::for_test(
+            4,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            8 * 1_024,
+        );
         let (listen_addr, shutdown_tx, server) = start_test_server(limits).await;
 
         let mut partial = connect(listen_addr).await;
@@ -439,7 +507,12 @@ mod tests {
         // Hyper's graceful shutdown finishes a request head already being read;
         // the header deadline, rather than cancellation of a possible service
         // future, is what bounds this case.
-        let limits = HttpLimits::for_test(1, Duration::from_millis(250), 8 * 1_024);
+        let limits = HttpLimits::for_test(
+            1,
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+            8 * 1_024,
+        );
         let (listen_addr, shutdown_tx, server) = start_test_server(limits).await;
 
         let mut first = connect(listen_addr).await;
@@ -493,8 +566,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_timeout_releases_connection_and_preserves_keep_alive() {
+        let limits = HttpLimits::for_test(
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(300),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) = start_body_server(limits).await;
+
+        let mut slow = connect(listen_addr).await;
+        slow.write_all(
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n",
+        )
+        .await
+        .expect("write incomplete body headers");
+        let interim = read_response_head(&mut slow).await;
+        assert!(
+            interim.starts_with(b"HTTP/1.1 100 Continue\r\n"),
+            "body consumer should receive an interim continue response: {:?}",
+            String::from_utf8_lossy(&interim)
+        );
+        slow.write_all(b"x").await.expect("write first body byte");
+
+        let mut queued = connect(listen_addr).await;
+        queued
+            .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\n\r\ndone")
+            .await
+            .expect("write queued request");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_response_head(&mut queued))
+                .await
+                .is_err(),
+            "queued connection must wait while the slow body owns the only slot"
+        );
+
+        // Bytes arrive more often than the deadline. This distinguishes a total
+        // body-read deadline from an inactivity timer that is reset per chunk.
+        let slow_started = tokio::time::Instant::now();
+        let slow_writer = tokio::spawn(async move {
+            let (mut reader, mut writer) = slow.into_split();
+            let reader_task = tokio::spawn(async move {
+                let mut response = Vec::new();
+                let result =
+                    tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut response))
+                        .await;
+                (result, response)
+            });
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                if writer.write_all(b"x").await.is_err() {
+                    break;
+                }
+            }
+            reader_task.await.expect("slow response reader task")
+        });
+        let (result, slow_response) = slow_writer.await.expect("slow client task");
+        let elapsed = slow_started.elapsed();
+        let read_result = result.expect("body timeout should close the slow connection");
+        assert!(
+            read_result.is_ok(),
+            "timed-out body response should be readable, got {read_result:?}"
+        );
+        assert!(
+            slow_response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"),
+            "slow body must receive 408, got {:?}",
+            String::from_utf8_lossy(&slow_response)
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "body timeout should close before the slow writer finishes: {elapsed:?}"
+        );
+
+        assert_eq!(read_response_body(&mut queued).await, "done");
+        queued
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            )
+            .await
+            .expect("write keep-alive recovery request");
+        assert_eq!(read_response_body(&mut queued).await, "ok");
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_body_deadline_but_not_forever() {
+        let limits = HttpLimits::for_test(
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) = start_body_server(limits).await;
+        let mut slow = connect(listen_addr).await;
+        slow.write_all(
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n",
+        )
+        .await
+        .expect("write incomplete body headers");
+        assert!(
+            read_response_head(&mut slow)
+                .await
+                .starts_with(b"HTTP/1.1 100 Continue\r\n")
+        );
+        slow.write_all(b"x").await.expect("write first body byte");
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("shutdown should wait only for body deadline")
+            .expect("join server")
+            .expect("server result");
+        drop(slow);
+    }
+
+    #[tokio::test]
     async fn http1_buffer_limit_rejects_oversized_head_and_server_recovers() {
-        let limits = HttpLimits::for_test(4, Duration::from_secs(1), 8 * 1_024);
+        let limits =
+            HttpLimits::for_test(4, Duration::from_secs(1), Duration::from_secs(1), 8 * 1_024);
         let (listen_addr, shutdown_tx, server) = start_test_server(limits).await;
 
         let mut oversized = connect(listen_addr).await;
@@ -544,6 +735,276 @@ mod tests {
             .await
             .expect("write recovery request");
         assert!(read_response_body(&mut healthy).await.starts_with("peer="));
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    async fn start_budget_server(
+        http_limits: HttpLimits,
+        budget: Arc<BodyBudget>,
+        hold: Option<Duration>,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(body_router(budget, hold)),
+            http_limits,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        (listen_addr, shutdown_tx, server)
+    }
+
+    /// Waits on the budget counter rather than on a duration, so the test
+    /// asserts the state it cares about instead of guessing how long a
+    /// loaded machine needs to reach it.
+    async fn wait_for_reserved(budget: &Arc<BodyBudget>, expected: usize, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while budget.reserved() != expected {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: reserved stayed at {} instead of reaching {expected}",
+                budget.reserved()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn write_sized_body(stream: &mut TcpStream, bytes: usize) {
+        let head = format!("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {bytes}\r\n\r\n");
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request head");
+        stream
+            .write_all(&vec![b'x'; bytes])
+            .await
+            .expect("write request body");
+    }
+
+    #[tokio::test]
+    async fn the_body_budget_caps_concurrent_bodies_and_releases_every_one() {
+        const BODY: usize = 64 * 1_024;
+        const ADMITTED: usize = 3;
+
+        let budget = BodyBudget::new(BODY * ADMITTED);
+        let limits = HttpLimits::for_test(
+            16,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) = start_budget_server(
+            limits,
+            Arc::clone(&budget),
+            Some(Duration::from_millis(750)),
+        )
+        .await;
+
+        // Saturate the budget with bodies the handler is still holding.
+        let mut held = Vec::new();
+        for _ in 0..ADMITTED {
+            let mut stream = connect(listen_addr).await;
+            write_sized_body(&mut stream, BODY).await;
+            held.push(stream);
+        }
+        wait_for_reserved(&budget, BODY * ADMITTED, "saturating the budget").await;
+
+        // One more body of the same, individually legal, size must be refused
+        // now, and refused without waiting for anything to be released.
+        let mut refused = connect(listen_addr).await;
+        write_sized_body(&mut refused, BODY).await;
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), refused.read_to_end(&mut answer))
+            .await
+            .expect("an over-budget request must be answered immediately, not queued")
+            .expect("read the refusal");
+        assert!(
+            answer.starts_with(b"HTTP/1.1 503 "),
+            "over-budget body should be refused with 503, got {:?}",
+            String::from_utf8_lossy(&answer[..answer.len().min(64)])
+        );
+        // The reason is carried in the body, because Hyper writes the canonical
+        // reason phrase for the status. This is the signal that separates a
+        // budget refusal from the pool's own 503s, so it is asserted rather
+        // than left to change silently.
+        assert!(
+            answer.ends_with(b"Request Body Memory Budget"),
+            "a budget refusal must name itself, got {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(
+            budget.reserved(),
+            BODY * ADMITTED,
+            "a refusal must not consume or release budget"
+        );
+        assert_eq!(budget.rejections(), 1);
+
+        // Every admitted body was served whole, and returning them returns the
+        // budget.
+        for mut stream in held {
+            let body = read_response_body(&mut stream).await;
+            assert_eq!(body.len(), BODY, "an admitted body must be echoed whole");
+        }
+        wait_for_reserved(&budget, 0, "releasing served bodies").await;
+
+        // The ceiling is a ceiling, not a fuse: the server serves again.
+        let mut recovered = connect(listen_addr).await;
+        write_sized_body(&mut recovered, BODY).await;
+        assert_eq!(read_response_body(&mut recovered).await.len(), BODY);
+        wait_for_reserved(&budget, 0, "releasing the recovery body").await;
+
+        assert!(
+            budget.peak() <= budget.limit(),
+            "peak {} crossed the {} byte ceiling",
+            budget.peak(),
+            budget.limit()
+        );
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_times_out_or_disconnects_returns_its_reservation() {
+        const BODY: usize = 64 * 1_024;
+
+        let budget = BodyBudget::new(BODY * 4);
+        let limits = HttpLimits::for_test(
+            16,
+            Duration::from_secs(10),
+            Duration::from_millis(300),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) =
+            start_budget_server(limits, Arc::clone(&budget), None).await;
+
+        // A declared body charges the budget before a byte of it arrives, so
+        // sending slowly cannot be the cheap way past the ceiling.
+        let mut slow = connect(listen_addr).await;
+        slow.write_all(
+            format!("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {BODY}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("write head only");
+        slow.write_all(b"x").await.expect("write one body byte");
+        wait_for_reserved(&budget, BODY, "charging a declared body up front").await;
+
+        let head = tokio::time::timeout(Duration::from_secs(2), read_response_head(&mut slow))
+            .await
+            .expect("the body deadline must fire");
+        assert!(
+            head.starts_with(b"HTTP/1.1 408 "),
+            "a stalled body should still time out, got {:?}",
+            String::from_utf8_lossy(&head[..head.len().min(64)])
+        );
+        wait_for_reserved(&budget, 0, "a timed-out body").await;
+        drop(slow);
+
+        // The same, but the client vanishes instead of waiting for the 408.
+        let mut vanishing = connect(listen_addr).await;
+        vanishing
+            .write_all(
+                format!("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {BODY}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write head only");
+        vanishing
+            .write_all(b"x")
+            .await
+            .expect("write one body byte");
+        wait_for_reserved(&budget, BODY, "charging the vanishing client").await;
+        drop(vanishing);
+        wait_for_reserved(&budget, 0, "a disconnected body").await;
+
+        // And the budget is still usable afterwards.
+        let mut healthy = connect(listen_addr).await;
+        write_sized_body(&mut healthy, BODY).await;
+        assert_eq!(read_response_body(&mut healthy).await.len(), BODY);
+        wait_for_reserved(&budget, 0, "the recovery body").await;
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_body_is_charged_as_it_grows_and_refused_when_it_cannot_grow() {
+        // No Content-Length, so nothing can be charged up front. The reader
+        // must acquire budget as the buffer grows, and give it all back.
+        const CHUNK: usize = 16 * 1_024;
+
+        let budget = BodyBudget::new(32 * 1_024);
+        let limits = HttpLimits::for_test(
+            16,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) =
+            start_budget_server(limits, Arc::clone(&budget), None).await;
+
+        let mut small = connect(listen_addr).await;
+        small
+            .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .expect("write chunked head");
+        small
+            .write_all(format!("{:x}\r\n", CHUNK).as_bytes())
+            .await
+            .expect("write chunk size");
+        small
+            .write_all(&vec![b'y'; CHUNK])
+            .await
+            .expect("write chunk data");
+        small
+            .write_all(b"\r\n0\r\n\r\n")
+            .await
+            .expect("write last chunk");
+        assert_eq!(read_response_body(&mut small).await.len(), CHUNK);
+        wait_for_reserved(&budget, 0, "a completed chunked body").await;
+        assert_eq!(budget.rejections(), 0, "a body that fits is not refused");
+
+        // Now one that outgrows the whole budget mid-stream. It must be
+        // refused rather than allowed to allocate past the ceiling.
+        let mut large = connect(listen_addr).await;
+        large
+            .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .expect("write chunked head");
+        let oversized = 128 * 1_024;
+        large
+            .write_all(format!("{:x}\r\n", oversized).as_bytes())
+            .await
+            .expect("write chunk size");
+        let _ = large.write_all(&vec![b'z'; oversized]).await;
+        let _ = large.write_all(b"\r\n0\r\n\r\n").await;
+        let head = tokio::time::timeout(Duration::from_secs(2), read_response_head(&mut large))
+            .await
+            .expect("an over-budget chunked body must be answered");
+        assert!(
+            head.starts_with(b"HTTP/1.1 503 "),
+            "a chunked body that outgrows the budget should be refused with 503, got {:?}",
+            String::from_utf8_lossy(&head[..head.len().min(64)])
+        );
+        wait_for_reserved(&budget, 0, "a refused chunked body").await;
+        assert!(
+            budget.peak() <= budget.limit(),
+            "peak {} crossed the {} byte ceiling",
+            budget.peak(),
+            budget.limit()
+        );
 
         shutdown_tx.send(()).expect("signal shutdown");
         server.await.expect("join server").expect("server result");

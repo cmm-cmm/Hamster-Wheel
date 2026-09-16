@@ -1,4 +1,4 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -8,6 +8,8 @@ use hyper::{
     header::{CONTENT_TYPE, HeaderValue, SERVER},
 };
 
+#[cfg(test)]
+use crate::body_budget::BodyBudget;
 use crate::{
     config::SERVER_NAME, php_worker::PhpWorkerPool, static_files, transport::TransportInfo,
 };
@@ -21,6 +23,8 @@ pub enum HandlerKind {
     PhpWorker,
     #[cfg(test)]
     TransportEcho,
+    #[cfg(test)]
+    BodyEcho,
 }
 
 #[derive(Clone)]
@@ -37,6 +41,15 @@ pub enum Handler {
     },
     #[cfg(test)]
     TransportEcho,
+    /// Reconstructs a request body through the production PHP body path and
+    /// echoes it, without needing a PHP distribution. `hold` keeps the body
+    /// budget reservation alive after the response, so a test can observe the
+    /// aggregate ceiling over real sockets.
+    #[cfg(test)]
+    BodyEcho {
+        budget: Arc<BodyBudget>,
+        hold: Option<Duration>,
+    },
 }
 
 impl Handler {
@@ -61,6 +74,11 @@ impl Handler {
         Self::TransportEcho
     }
 
+    #[cfg(test)]
+    pub(crate) fn body_echo(budget: Arc<BodyBudget>, hold: Option<Duration>) -> Self {
+        Self::BodyEcho { budget, hold }
+    }
+
     pub const fn kind(&self) -> HandlerKind {
         match self {
             Self::Static { .. } => HandlerKind::Static,
@@ -68,6 +86,8 @@ impl Handler {
             Self::PhpWorker { .. } => HandlerKind::PhpWorker,
             #[cfg(test)]
             Self::TransportEcho => HandlerKind::TransportEcho,
+            #[cfg(test)]
+            Self::BodyEcho { .. } => HandlerKind::BodyEcho,
         }
     }
 
@@ -75,15 +95,26 @@ impl Handler {
         &self,
         request: Request<Incoming>,
         _transport: TransportInfo,
+        body_read_timeout: Duration,
     ) -> Result<HandlerResponse, Infallible> {
         match self {
             Self::Static { document_root } => {
                 static_files::serve(request, Arc::clone(document_root)).await
             }
             Self::Simple { status, body } => Ok(simple_response(*status, body)),
-            Self::PhpWorker { pool } => Ok(pool.serve_http(request).await),
+            Self::PhpWorker { pool } => Ok(pool.serve_http(request, body_read_timeout).await),
             #[cfg(test)]
             Self::TransportEcho => Ok(transport_response(_transport)),
+            #[cfg(test)]
+            Self::BodyEcho { budget, hold } => {
+                Ok(crate::php_worker::PhpWorkerPool::test_body_echo(
+                    request,
+                    body_read_timeout,
+                    budget,
+                    *hold,
+                )
+                .await)
+            }
         }
     }
 
@@ -95,6 +126,8 @@ impl Handler {
             Self::PhpWorker { .. } => simple_response(StatusCode::OK, "PHP Worker"),
             #[cfg(test)]
             Self::TransportEcho => simple_response(StatusCode::OK, "Transport Echo"),
+            #[cfg(test)]
+            Self::BodyEcho { .. } => simple_response(StatusCode::OK, "Body Echo"),
         }
     }
 }

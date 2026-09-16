@@ -2,8 +2,14 @@ param(
     [int]$Runs = 3,
     [int]$Requests = 20000,
     [int]$WarmupRequests = 1000,
-    [ValidateSet('all', 'simple', 'php_hello', 'php_json')]
-    [string]$ScenarioFilter = 'all'
+    [ValidateSet('all', 'simple', 'php_hello', 'php_json', 'php_echo')]
+    [string]$ScenarioFilter = 'all',
+    # -1 leaves each scenario's own config untouched. Any other value
+    # rewrites server.max_body_memory in a temporary copy of it, which is
+    # how the body budget is A/B-ed without editing a checked-in config.
+    [long]$MaxBodyMemory = -1,
+    [int]$EchoBodyBytes = 12,
+    [string]$Executable = '.\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,35 +41,45 @@ public sealed class PhpBenchClient : IDisposable
         this.expectedStatus = expectedStatus;
     }
 
-    private async Task Request(string path)
+    private async Task Request(string path, byte[] body)
     {
-        using (HttpResponseMessage response = await client.GetAsync(path, HttpCompletionOption.ResponseContentRead))
+        HttpResponseMessage response;
+        if (body.Length == 0)
+        {
+            response = await client.GetAsync(path, HttpCompletionOption.ResponseContentRead);
+        }
+        else
+        {
+            using var content = new ByteArrayContent(body);
+            response = await client.PostAsync(path, content);
+        }
+        using (response)
         {
             if (response.StatusCode != expectedStatus)
                 throw new InvalidOperationException("Unexpected HTTP status: " + response.StatusCode);
         }
     }
 
-    public async Task<double> First(string path)
+    public async Task<double> First(string path, byte[] body)
     {
         long started = Stopwatch.GetTimestamp();
-        await Request(path);
+        await Request(path, body);
         return Stopwatch.GetElapsedTime(started).TotalMilliseconds;
     }
 
-    public async Task Warmup(string path, int requests)
+    public async Task Warmup(string path, byte[] body, int requests)
     {
-        for (int i = 0; i < requests; i++) await Request(path);
+        for (int i = 0; i < requests; i++) await Request(path, body);
     }
 
-    public async Task<PhpBenchOutput> Run(string path, int requests)
+    public async Task<PhpBenchOutput> Run(string path, byte[] body, int requests)
     {
         var milliseconds = new double[requests];
         var elapsed = Stopwatch.StartNew();
         for (int i = 0; i < requests; i++)
         {
             long started = Stopwatch.GetTimestamp();
-            await Request(path);
+            await Request(path, body);
             milliseconds[i] = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
         elapsed.Stop();
@@ -120,15 +136,45 @@ function Get-WorkerBootstrapMilliseconds([string]$StdoutPath) {
     return [double]::Parse($match.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
 }
 
-$executable = (Resolve-Path -LiteralPath '.\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe').Path
+$executable = (Resolve-Path -LiteralPath $Executable).Path
+$emptyBody = [byte[]]::new(0)
+$echoBody = if ($EchoBodyBytes -eq 12) {
+    [Text.Encoding]::ASCII.GetBytes('hamster-body')
+}
+else {
+    $filled = [byte[]]::new($EchoBodyBytes)
+    for ($index = 0; $index -lt $EchoBodyBytes; $index++) { $filled[$index] = 120 }
+    $filled
+}
+
+function Resolve-ScenarioConfig([string]$ConfigPath, [string]$Name) {
+    if ($MaxBodyMemory -lt 0) { return $ConfigPath }
+    $source = Get-Content -Raw -LiteralPath $ConfigPath
+    $stripped = ($source -split "`r?`n" | Where-Object { $_ -notmatch '^\s*max_body_memory\s*=' }) -join "`n"
+    $patched = $stripped -replace '(?m)^\[server\]$', "[server]`nmax_body_memory = $MaxBodyMemory"
+    if ($patched -eq $stripped) { throw "config $ConfigPath has no [server] table" }
+    # Beside the original and still relative. These configs resolve their own
+    # relative paths against the config file's directory, and Start-Process
+    # joins an ArgumentList array without quoting, so an absolute path
+    # containing a space would be split into two arguments.
+    $target = Join-Path (Split-Path -Parent $ConfigPath) "hamster-bench-$PID-$Name-budget.toml"
+    Set-Content -LiteralPath $target -Value $patched -Encoding utf8
+    return $target
+}
 $scenarios = @(
-    [PSCustomObject]@{ Name = 'simple'; Config = '.\benchmarks\php_simple.toml'; Path = '/'; Status = [Net.HttpStatusCode]::NotFound; Php = $false },
-    [PSCustomObject]@{ Name = 'php_hello'; Config = '.\benchmarks\php_worker.toml'; Path = '/hello'; Status = [Net.HttpStatusCode]::OK; Php = $true },
-    [PSCustomObject]@{ Name = 'php_json'; Config = '.\benchmarks\php_worker.toml'; Path = '/json'; Status = [Net.HttpStatusCode]::OK; Php = $true }
+    [PSCustomObject]@{ Name = 'simple'; Config = '.\benchmarks\php_simple.toml'; Path = '/'; Body = $emptyBody; Status = [Net.HttpStatusCode]::NotFound; Php = $false },
+    [PSCustomObject]@{ Name = 'php_hello'; Config = '.\benchmarks\php_worker.toml'; Path = '/hello'; Body = $emptyBody; Status = [Net.HttpStatusCode]::OK; Php = $true },
+    [PSCustomObject]@{ Name = 'php_json'; Config = '.\benchmarks\php_worker.toml'; Path = '/json'; Body = $emptyBody; Status = [Net.HttpStatusCode]::OK; Php = $true },
+    [PSCustomObject]@{ Name = 'php_echo'; Config = '.\benchmarks\php_worker.toml'; Path = '/echo'; Body = $echoBody; Status = [Net.HttpStatusCode]::Created; Php = $true }
 )
+foreach ($scenario in $scenarios) {
+    $scenario.Config = Resolve-ScenarioConfig $scenario.Config $scenario.Name
+}
 if ($ScenarioFilter -ne 'all') {
     $scenarios = @($scenarios | Where-Object Name -eq $ScenarioFilter)
 }
+
+try {
 
 foreach ($scenario in $scenarios) {
     $results = @()
@@ -177,13 +223,13 @@ foreach ($scenario in $scenarios) {
             }
 
             $client = [PhpBenchClient]::new('localhost', $scenario.Status)
-            $firstMs = $client.First($scenario.Path).GetAwaiter().GetResult()
-            $null = $client.Warmup($scenario.Path, $WarmupRequests).GetAwaiter().GetResult()
+            $firstMs = $client.First($scenario.Path, $scenario.Body).GetAwaiter().GetResult()
+            $null = $client.Warmup($scenario.Path, $scenario.Body, $WarmupRequests).GetAwaiter().GetResult()
             $serverProcess.Refresh()
             if ($null -ne $phpProcess) { $phpProcess.Refresh() }
             $serverCpuBefore = $serverProcess.TotalProcessorTime.TotalSeconds
             $phpCpuBefore = if ($null -eq $phpProcess) { 0.0 } else { $phpProcess.TotalProcessorTime.TotalSeconds }
-            $result = $client.Run($scenario.Path, $Requests).GetAwaiter().GetResult()
+            $result = $client.Run($scenario.Path, $scenario.Body, $Requests).GetAwaiter().GetResult()
             $serverProcess.Refresh()
             if ($null -ne $phpProcess) { $phpProcess.Refresh() }
             $serverCpu = $serverProcess.TotalProcessorTime.TotalSeconds - $serverCpuBefore
@@ -231,8 +277,10 @@ foreach ($scenario in $scenarios) {
             }
             if ($null -ne $phpProcess) {
                 $phpProcess.Refresh()
+                # HasExited is a snapshot: the worker can exit between the
+                # refresh and the kill, which used to abort the whole run.
                 if (-not $phpProcess.HasExited) {
-                    Stop-Process -Id $phpProcess.Id
+                    Stop-Process -Id $phpProcess.Id -ErrorAction SilentlyContinue
                     Wait-Process -Id $phpProcess.Id -ErrorAction SilentlyContinue
                 }
             }
@@ -251,4 +299,14 @@ foreach ($scenario in $scenarios) {
         (Get-Median $results.PhpCpuUs), (Get-Median $results.CombinedCpuUs),
         (Get-Median $results.ServerWorkingMiB), (Get-Median $results.ServerPeakMiB),
         (Get-Median $results.PhpWorkingMiB), (Get-Median $results.PhpPeakMiB))
+}
+
+}
+finally {
+    # Runs abort on unrelated failures often enough that end-of-script cleanup
+    # is not good enough; the generated configs sit beside checked-in ones.
+    if ($MaxBodyMemory -ge 0) {
+        Get-ChildItem -LiteralPath './benchmarks' -Filter "hamster-bench-$PID-*-budget.toml" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
 }

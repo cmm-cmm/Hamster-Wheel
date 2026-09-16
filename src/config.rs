@@ -11,9 +11,10 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::body_budget::BodyBudget;
 use crate::php_worker::{
-    MAX_QUEUE_CAPACITY, MAX_WORKERS, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool,
-    PhpWorkerPoolConfig, WorkerStart,
+    MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY, MAX_WORKERS, PhpWorkerConfig, PhpWorkerError,
+    PhpWorkerPool, PhpWorkerPoolConfig, WorkerStart,
 };
 use crate::router::{
     Handler, HostRouter, LocationRouter, RouterBuildError, VirtualHost, normalize_location,
@@ -28,6 +29,17 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
 const MAX_CONNECTIONS: usize = 65_536;
 const DEFAULT_HEADER_READ_TIMEOUT_SECONDS: u64 = 30;
 const MAX_HEADER_READ_TIMEOUT_SECONDS: u64 = 3_600;
+const DEFAULT_BODY_READ_TIMEOUT_SECONDS: u64 = 30;
+const MAX_BODY_READ_TIMEOUT_SECONDS: u64 = 3_600;
+/// Request-body bytes Hamster may have buffered process-wide at one time.
+///
+/// Zero disables the budget and restores the pre-budget path exactly, where
+/// the only aggregate bound is `max_connections * MAX_REQUEST_BODY`.
+const DEFAULT_MAX_BODY_MEMORY: u64 = 64 * 1_024 * 1_024;
+/// Anything below one maximum body would make some legal requests impossible
+/// no matter how idle the server is, so the floor is that body limit.
+const MIN_MAX_BODY_MEMORY: u64 = MAX_REQUEST_BODY as u64;
+const MAX_MAX_BODY_MEMORY: u64 = 64 * 1_024 * 1_024 * 1_024;
 const MIN_HTTP1_MAX_BUFFER_SIZE: usize = 8 * 1_024;
 const DEFAULT_HTTP1_MAX_BUFFER_SIZE: usize = 64 * 1_024;
 const MAX_HTTP1_MAX_BUFFER_SIZE: usize = 1024 * 1_024;
@@ -52,6 +64,10 @@ struct RawServer {
     max_connections: usize,
     #[serde(default = "default_header_read_timeout")]
     header_read_timeout: u64,
+    #[serde(default = "default_body_read_timeout")]
+    body_read_timeout: u64,
+    #[serde(default = "default_max_body_memory")]
+    max_body_memory: u64,
     #[serde(default = "default_http1_max_buffer_size")]
     http1_max_buffer_size: usize,
 }
@@ -62,6 +78,14 @@ const fn default_max_connections() -> usize {
 
 const fn default_header_read_timeout() -> u64 {
     DEFAULT_HEADER_READ_TIMEOUT_SECONDS
+}
+
+const fn default_body_read_timeout() -> u64 {
+    DEFAULT_BODY_READ_TIMEOUT_SECONDS
+}
+
+const fn default_max_body_memory() -> u64 {
+    DEFAULT_MAX_BODY_MEMORY
 }
 
 const fn default_http1_max_buffer_size() -> usize {
@@ -118,6 +142,8 @@ pub struct RuntimeConfig {
 pub struct HttpLimits {
     max_connections: usize,
     header_read_timeout: Duration,
+    body_read_timeout: Duration,
+    max_body_memory: usize,
     http1_max_buffer_size: usize,
 }
 
@@ -126,6 +152,8 @@ impl Default for HttpLimits {
         Self {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             header_read_timeout: Duration::from_secs(DEFAULT_HEADER_READ_TIMEOUT_SECONDS),
+            body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECONDS),
+            max_body_memory: DEFAULT_MAX_BODY_MEMORY as usize,
             http1_max_buffer_size: DEFAULT_HTTP1_MAX_BUFFER_SIZE,
         }
     }
@@ -140,6 +168,15 @@ impl HttpLimits {
         self.header_read_timeout
     }
 
+    pub const fn body_read_timeout(self) -> Duration {
+        self.body_read_timeout
+    }
+
+    /// Zero means the budget is disabled.
+    pub const fn max_body_memory(self) -> usize {
+        self.max_body_memory
+    }
+
     pub const fn http1_max_buffer_size(self) -> usize {
         self.http1_max_buffer_size
     }
@@ -148,11 +185,14 @@ impl HttpLimits {
     pub(crate) const fn for_test(
         max_connections: usize,
         header_read_timeout: Duration,
+        body_read_timeout: Duration,
         http1_max_buffer_size: usize,
     ) -> Self {
         Self {
             max_connections,
             header_read_timeout,
+            body_read_timeout,
+            max_body_memory: DEFAULT_MAX_BODY_MEMORY as usize,
             http1_max_buffer_size,
         }
     }
@@ -316,6 +356,8 @@ fn builtin_raw_config() -> RawConfig {
             listen: DEFAULT_LISTEN.to_owned(),
             max_connections: default_max_connections(),
             header_read_timeout: default_header_read_timeout(),
+            body_read_timeout: default_body_read_timeout(),
+            max_body_memory: default_max_body_memory(),
             http1_max_buffer_size: default_http1_max_buffer_size(),
         },
         hosts: vec![RawHost {
@@ -422,6 +464,18 @@ pub(crate) fn validate_raw(
             "server.header_read_timeout must be between 1 and {MAX_HEADER_READ_TIMEOUT_SECONDS} seconds"
         )));
     }
+    if !(1..=MAX_BODY_READ_TIMEOUT_SECONDS).contains(&raw.server.body_read_timeout) {
+        return Err(ConfigError::Validation(format!(
+            "server.body_read_timeout must be between 1 and {MAX_BODY_READ_TIMEOUT_SECONDS} seconds"
+        )));
+    }
+    if raw.server.max_body_memory != 0
+        && !(MIN_MAX_BODY_MEMORY..=MAX_MAX_BODY_MEMORY).contains(&raw.server.max_body_memory)
+    {
+        return Err(ConfigError::Validation(format!(
+            "server.max_body_memory must be 0 (disabled) or between {MIN_MAX_BODY_MEMORY} and {MAX_MAX_BODY_MEMORY} bytes"
+        )));
+    }
     if !(MIN_HTTP1_MAX_BUFFER_SIZE..=MAX_HTTP1_MAX_BUFFER_SIZE)
         .contains(&raw.server.http1_max_buffer_size)
     {
@@ -432,6 +486,8 @@ pub(crate) fn validate_raw(
     let http_limits = HttpLimits {
         max_connections: raw.server.max_connections,
         header_read_timeout: Duration::from_secs(raw.server.header_read_timeout),
+        body_read_timeout: Duration::from_secs(raw.server.body_read_timeout),
+        max_body_memory: raw.server.max_body_memory as usize,
         http1_max_buffer_size: raw.server.http1_max_buffer_size,
     };
     if raw.hosts.is_empty() {
@@ -674,6 +730,9 @@ fn register_hostname(
 pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeConfig, ConfigError> {
     let mut virtual_hosts = Vec::new();
     let mut php_pools = Vec::new();
+    // One budget for the whole process. Every PHP pool shares it, because the
+    // resource it protects is this process's memory, not a pool's queue.
+    let body_budget = BodyBudget::new(validated.http_limits.max_body_memory());
     for (host_index, host) in validated.hosts.into_iter().enumerate() {
         let mut locations = Vec::with_capacity(host.locations.len());
         for (location_index, location) in host.locations.into_iter().enumerate() {
@@ -736,6 +795,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         queue_capacity,
                         max_requests,
                         max_worker_age,
+                        body_budget: Arc::clone(&body_budget),
                     }));
                     php_pools.push(Arc::clone(&pool));
                     Handler::php_worker(pool)
@@ -904,13 +964,31 @@ mod tests {
         let current = env::current_dir().unwrap();
         let source = minimal(&current).replace(
             "listen = \"127.0.0.1:8080\"",
-            "listen = \"127.0.0.1:8080\"\nmax_connections = 77\nheader_read_timeout = 12\nhttp1_max_buffer_size = 32768",
+            "listen = \"127.0.0.1:8080\"\nmax_connections = 77\nheader_read_timeout = 12\nbody_read_timeout = 14\nmax_body_memory = 4194304\nhttp1_max_buffer_size = 32768",
         );
         let runtime = compile_str(&source, Path::new("unused")).unwrap();
         let limits = runtime.http_limits();
         assert_eq!(limits.max_connections(), 77);
         assert_eq!(limits.header_read_timeout(), Duration::from_secs(12));
+        assert_eq!(limits.body_read_timeout(), Duration::from_secs(14));
+        assert_eq!(limits.max_body_memory(), 4 * 1_024 * 1_024);
         assert_eq!(limits.http1_max_buffer_size(), 32_768);
+    }
+
+    #[test]
+    fn accepts_a_disabled_body_budget() {
+        let current = env::current_dir().unwrap();
+        let source = minimal(&current).replace(
+            "listen = \"127.0.0.1:8080\"",
+            "listen = \"127.0.0.1:8080\"
+max_body_memory = 0",
+        );
+        let runtime = compile_str(&source, Path::new("unused")).unwrap();
+        assert_eq!(
+            runtime.http_limits().max_body_memory(),
+            0,
+            "zero must stay an explicit opt out, not fall back to the default"
+        );
     }
 
     #[test]
@@ -921,6 +999,12 @@ mod tests {
             ("max_connections", "65537"),
             ("header_read_timeout", "0"),
             ("header_read_timeout", "3601"),
+            ("body_read_timeout", "0"),
+            ("body_read_timeout", "3601"),
+            // One byte under a single maximum body would make some legal
+            // requests impossible even on a completely idle server.
+            ("max_body_memory", "1048575"),
+            ("max_body_memory", "68719476737"),
             ("http1_max_buffer_size", "8191"),
             ("http1_max_buffer_size", "1048577"),
         ] {

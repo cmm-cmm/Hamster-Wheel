@@ -1,5 +1,6 @@
 #[cfg(feature = "profiling")]
 pub mod blocking_profile;
+pub mod body_budget;
 pub mod config;
 #[cfg(feature = "profiling")]
 pub mod config_profile;

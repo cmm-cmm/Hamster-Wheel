@@ -67,8 +67,23 @@ make the respawn rate proportional to throughput.
 Idle worker death is detected passively on its next assignment, but a request
 that finds a dead worker is now queued again rather than failed, because a
 process reaped before the frame write proves PHP never received it. There is no
-proactive stdout probe, adaptive sizing, memory-threshold recycle, or
-byte-based admission. Permanent slot retirement no longer exists: prolonged
+proactive stdout probe, adaptive sizing or memory-threshold recycle.
+Byte-based admission now exists in the working tree: the
+`server.max_body_memory` budget bounds request-body bytes buffered process-wide
+and refuses over-budget requests with 503 before pool admission, with no
+waiting. It defaults to 64 MiB, reports its configured value at startup and its
+refusals on standard error at most once per minute, and `0` is an explicit
+unlimited opt-out. It is uncommitted. Response bodies, the worker's protocol
+frame and Hyper connection buffers remain outside the counter, and response
+bodies are the largest unbounded resource in the server: measured at 256.6 MiB
+per in-flight request for a 256 MiB static file, bounded by `max_connections`
+times the largest response and released at `header_read_timeout`, not by any
+size limit. Charging a declared `Content-Length` before reading also lets a slow
+client hold budget it never fills; four such clients made every other POST 503
+for `body_read_timeout` while GET kept serving. Both are documented in
+`doc/CONFIGURATION.md` and `doc/HTTP_TRANSPORT_0_5.md` and measured in
+`benchmarks/results/review_0_5_20260916.md`. Permanent slot
+retirement no longer exists: prolonged
 failure settles into a 300-second cooldown ceiling instead. HTTP bodies
 still buffer before pool admission. `max_requests` and `max_worker_age` default
 OFF; recycling is stop-then-spawn and permits one voluntary recycle at a time.
@@ -274,8 +289,43 @@ committed or released.
 
 ## Next Action
 
-Owner review of the first 0.5.x transport-identity slice. Remaining 0.4
-decisions and out-of-scope qualifications:
+Owner closure on the uncommitted 0.5.x aggregate body-memory budget, described
+with its rejected alternatives in `doc/HTTP_TRANSPORT_0_5.md` and measured in
+`benchmarks/results/body_budget_0_5_20260916.md`.
+
+The owner has accepted the mechanism, a 64 MiB default, `0` as an explicit
+unlimited opt-out, and required the mechanism to carry its own minimum
+observability before the default is on. That observability is implemented: a
+startup line with the configured value, a rate-limited stderr notice on actual
+refusal that names the knob and the cumulative count, and a distinguishing 503
+body asserted by tests. `peak()` is deliberately left test-only, because
+reporting a gauge usefully needs periodic sampling and that is a metrics
+subsystem rather than part of this limit.
+
+An independent review of all four 0.5 slices as a milestone candidate found no
+correctness defect, no resource leak, no path weakening at-most-once and no
+measurable performance regression. It raised two documentation blockers, both now
+closed: response-body memory is unbounded and is now stated with its measurement,
+and the declared-`Content-Length` reservation's denial cost is now stated with
+its measurement, its configuration levers, and how it differs from a 413.
+
+Recorded debt from that review, in the order it was ranked:
+
+- streaming responses, which is the actual fix for unbounded response memory;
+- an alternative body-charging policy counting allocated capacity rather than the
+  declared length, which would remove the POST-denial window at the cost of
+  refusing late;
+- a regression test pinning the observed reclaim of a stalled response write at
+  `header_read_timeout`, which is load bearing and rests on Hyper internals that
+  no test currently checks.
+
+What remains is milestone closure, which is an owner decision. Nothing is
+committed, tagged, pushed, merged or released.
+
+Gate 3 was not opened and no following slice was started.
+
+Also pending: owner review of the first 0.5.x transport-identity slice.
+Remaining 0.4 decisions and out-of-scope qualifications:
 
 - Decide how the external PMS adopts Octane and resolves its PhpSpreadsheet
   PHP 8.5 constraint. The disposable scratch proves lifecycle compatibility,

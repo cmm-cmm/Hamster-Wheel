@@ -1,9 +1,18 @@
 # HTTP and Transport Foundation 0.5
 
-Status: immediate transport identity is present in source. The second 0.5.x
-slice, bounded HTTP/1 admission, is implemented in the working tree and awaits
-owner review. It has not been committed, tagged or released. The package
-version remains unchanged until that review.
+Status: four slices are implemented — immediate transport identity, bounded
+HTTP/1 admission, bounded PHP request-body reconstruction, and a bounded
+aggregate request-body memory budget. The last two are in the working tree and
+are not committed, tagged or released; the package version is unchanged.
+
+An independent review of all four as a milestone candidate found no correctness
+defect, no resource leak, no path that weakens at-most-once and no measurable
+performance regression. It found two claims the documentation had to state
+honestly before closure: response-body memory is not bounded by anything this
+milestone adds, and the declared-`Content-Length` reservation lets a slow client
+hold budget it never uses. Both are recorded below with their measurements.
+Streaming responses and an alternative charging policy are documented debt and
+are deliberately not implemented here. Milestone closure is an owner decision.
 
 ## First slice: immediate transport identity
 
@@ -193,32 +202,437 @@ slow-head and shutdown failure. A custom timer wheel or I/O wrapper would add
 synchronization and lifecycle code without current evidence that it is the
 safer trade.
 
+## Third slice: bounded PHP request-body reconstruction
+
+Hyper owns the `Incoming` body stream for a connection, but only the selected
+handler can decide whether the body is needed. Static and simple responses drop
+an unread body and let Hyper close the incomplete exchange. The PHP adapter is
+different: it must reconstruct the body before writing a worker-protocol frame,
+so a client that sends one byte and then pauses can otherwise hold a connection
+slot indefinitely.
+
+The body policy is deliberately local to that consumer:
+
+```text
+HTTP head accepted
+    -> PHP adapter checks header count and declared lower bound
+    -> total body-read deadline around Incoming::frame()
+    -> <= 1 MiB reconstruction
+    -> only then PHP pool admission / application execution
+```
+
+`server.body_read_timeout` is compiled once and passed as an ordinary argument
+through the server and router to the PHP handler. It is not a request extension,
+global timer, or service-wide timeout. The deadline covers the complete body
+reconstruction, so receiving a byte does not reset it. A declared body larger
+than the existing 1 MiB protocol limit is rejected before reading; chunked and
+other unknown-length bodies are bounded while frames arrive. Empty bodies use a
+no-read fast path.
+
+FACT: a real Hyper/TCP test with one connection slot sends body bytes every 75 ms
+while the configured deadline is 300 ms. The request receives HTTP 408 before the
+writer finishes, the queued connection is admitted, and a second request on that
+connection succeeds. The test passes 20 consecutive repetitions. An ignored PHP
+integration test proves the same boundary against the actual worker: the partial
+body receives 408, `/state` reports exactly one backend request, and the worker is
+not given the incomplete request.
+
+FACT: the timeout is before `PhpWorkerPool::execute`, so dropping the incomplete
+`Incoming` cannot replay or cancel a PHP transaction. Hyper closes the incomplete
+HTTP exchange after the 408; this is intentional, since the body is not reusable
+for keep-alive parsing. A subsequent connection or an already queued connection
+recovers normally.
+
+INFERENCE: this is a consumer deadline, not a universal HTTP body policy. A future
+proxy or streaming backend must own a compatible policy because it may consume
+frames incrementally rather than reconstructing them. A total process byte budget
+is still not present. Bodies still being reconstructed are bounded by
+`max_connections * 1 MiB`; once reconstruction completes, queue capacity
+controls how many of those same connection-owned bodies can remain admitted,
+but it does not add a second independent population. Parser, frame-encoding and
+allocator overhead remain on top, and the `BytesMut`/`Vec`/protocol-frame
+transition can create a short-lived peak above the retained body bytes.
+
+The timer uses Tokio's cancellation-safe `timeout` around body reads only. It does
+not wrap the handler future, worker queue wait, PHP IPC, or response generation;
+the established cancellation/at-most-once boundary therefore remains unchanged.
+
+### Adversarial evidence
+
+The checked-in body test proves all of the following on real TCP sockets:
+
+- a one-byte body holds the only connection slot until the configured deadline;
+- trickling bytes faster than the deadline does not extend the total budget;
+- the timed-out exchange returns 408 and releases the slot;
+- a queued complete body is served after release;
+- a second request on that recovered keep-alive connection still succeeds;
+- the server shuts down cleanly after the timeout.
+
+The PHP regression test is dependency-gated because it needs the local PHP 8.5
+distribution, but it exercises the production PHP request path and checks that no
+backend request count is incremented by the partial body.
+
+## Aggregate body-memory investigation
+
+The working-tree Windows probe in `benchmarks/body_memory_probe.ps1` measures
+process-private memory while delayed 1 MiB requests are held. With one worker and
+`queue_capacity=128`, Hamster grew by 6.52, 10.93, 21.32, 37.52 and 73.71 MiB
+at 4, 8, 16, 32 and 64 accepted connections. With 32 connections, changing the
+queue from 1 to 8 to 128 changed the growth from 6.17 to 14.78 to 37.62 MiB.
+An incomplete-body run with 32 connections and `queue_capacity=1` still grew
+37.58 MiB after each client sent only half of a declared body; PHP memory did not
+grow because no request reached the worker.
+
+FACT: queue capacity cannot bound body bytes still owned by HTTP consumers.
+INFERENCE: the aggregate body population is primarily bounded by
+`max_connections * MAX_REQUEST_BODY`; queue capacity controls retention after
+body reconstruction but does not add an independent population. Allocator,
+parser and worker-frame copies remain overhead.
+
+No global byte semaphore was added in that pass. The following slice answers the
+question it left open, with measurements rather than a hypothesis.
+
+## Fourth slice: bounded aggregate request-body memory
+
+Status: working tree only, not committed. The owner accepted the mechanism, a
+64 MiB default, and `0` as an explicit unlimited opt-out, on the condition that
+the mechanism carry its own minimum observability before the default is on.
+That observability is implemented and described below.
+
+### The problem the investigation left
+
+The per-request body limit bounds one body. Nothing bounded how many bodies
+existed at once, and `queue_capacity` cannot help because it only sees a body
+after reconstruction finishes. The only aggregate bound was
+`max_connections * MAX_REQUEST_BODY`, roughly 1 GiB at the shipped defaults.
+
+Lowering `max_connections` does bound it, and that option was taken seriously
+before anything was written. It was rejected as the whole answer because it
+prices every request the same: to hold body memory to 64 MiB an operator would
+have to refuse the 65th concurrent static GET, which costs no body memory at
+all. Connection admission and body memory are different resources and the
+measurement shows they can be bounded separately.
+
+### Designs considered
+
+- **Lower `max_connections` only.** Zero code, zero hot-path cost, and it does
+  bound the risk. Rejected as insufficient, not as wrong: it couples an HTTP
+  concurrency decision to a memory decision, and the owner can still choose it
+  by setting `max_body_memory = 0`.
+- **A coarse permit: N concurrent body reconstructions.** A ceiling of
+  `N * MAX_REQUEST_BODY` that is easy to reason about, but it charges a 20-byte
+  form post the same as a megabyte upload, so it throttles ordinary traffic for
+  no memory benefit. Rejected.
+- **A byte semaphore with waiting.** More accurate, but a waiting request holds
+  a connection slot and a parser buffer while it waits, so it converts a memory
+  problem into a queueing and fairness problem and introduces a new way for one
+  client to delay another. Rejected against the requirement that no new
+  unbounded waiting appear.
+- **Watching process RSS and refusing above a threshold.** Platform specific,
+  lagging, and untestable, because a test cannot make RSS a known value.
+  Rejected.
+- **Spilling bodies to disk.** Solves memory by adding I/O latency, a cleanup
+  obligation and a new failure mode, for a 1 MiB per-request limit. Grossly
+  disproportionate. Rejected.
+- **Chosen: a byte-counted reservation, taken before allocation, refused
+  immediately when it does not fit, released by ownership.**
+
+### Why the chosen shape follows from the measured lifetime
+
+The investigation established that body bytes have exactly one owner at a time
+and that the chain is short:
+
+```text
+Incoming frames -> reader's Vec -> WorkerRequest -> PhpJob in queue or worker
+```
+
+That is an ownership chain, so the mechanism is an owned value that travels
+along it. `BodyReservation` is created before the reader allocates, moves into
+`AdmittedRequest`, moves into `PhpJob`, and is dropped when the job is dropped.
+There is no explicit release call anywhere, which is what makes "released on
+every success, error, timeout, rejection and cancellation path" a property of
+the type rather than a claim about the code.
+
+Placing it in the job, rather than holding it in the HTTP handler, is
+load-bearing. A client that disconnects while its job is queued drops the
+handler future but not the job. A handler-scoped guard would have released the
+reservation while the bytes were still held, and the counter would have been
+behind reality exactly when the server was under the most pressure.
+
+Reserving before allocating is the other load-bearing choice. The reader asks
+the budget for the capacity it is about to take, and only then calls
+`reserve_exact`. A declared `Content-Length` is charged in full before the first
+body byte is read, so trickling a declared megabyte is not a cheaper way past
+the ceiling than sending it.
+
+### Failure behavior
+
+Over budget is `503`, the same class as a full worker queue: a well-formed
+request that the server is out of a bounded resource for right now. It is
+deliberately not `413`, which would tell the client its body was too large when
+the body was within its own limit. Nothing waits, so refusal is immediate and
+adds no queue.
+
+The check sits beside the existing header-count, body-size and body-deadline
+checks, before `PhpWorkerPool::execute`. It therefore cannot cancel or replay a
+possibly-started PHP transaction, and the at-most-once boundary is untouched.
+
+This `503` is an aggregate condition and depends on other traffic, so unlike a
+`413` the same request may succeed a moment later and a client should retry it.
+What a slow client can do with a reservation it never fills is measured in
+*The cost of charging a declared Content-Length* below.
+
+### Evidence
+
+Unit tests cover release on drop, refusal without disturbing the counter, growth
+acquiring only the difference, a refused growth leaving the original intact,
+overflow refusal, and sixteen threads contending without the counter crossing
+the limit.
+
+Real-TCP tests in `server.rs` prove that a saturated budget refuses an
+individually legal body with `503` while admitted bodies are still served whole,
+that the counter returns to zero after served, timed-out, disconnected, refused
+and chunked-overgrown bodies, that a chunked body with no declared length is
+charged as it grows, and that the server serves normally after each.
+
+An ignored PHP integration test proves the refusal happens before the worker:
+with the budget set to exactly one maximum body, a saturating in-flight 1 MiB
+POST causes a concurrent small POST to be refused, and the worker's own executed
+request counter never includes it.
+
+### Operator visibility
+
+The budget is on by default, so a refusal has to be explainable without the
+operator already suspecting it. Three signals cover that, and nothing else was
+added.
+
+**The configured ceiling, once at startup.** `server::run` prints
+`Request body memory budget 67108864 bytes`, or
+`Request body memory budget disabled (server.max_body_memory = 0)`, beside the
+existing worker-ready and listening lines. A running server should not have to
+be asked what its own limit is.
+
+**The refusal itself, rate limited, on standard error.**
+
+```text
+body memory budget exhausted: 3 request(s) refused with 503 since start
+(server.max_body_memory = 67108864 bytes); reported at most once per 60 s
+```
+
+The first refusal of a run reports immediately, so the condition is visible when
+it starts rather than a window later. After that one line per minute, whatever
+the arrival rate. That bound is the point: a refusal is peer-controlled, and
+logging each one would turn refused traffic into a synchronous stderr workload —
+the same failure `should_report_connection_error` exists to avoid on the
+connection path. The clock read and the compare-exchange that enforce the window
+are inside the refusal path, which by definition only runs when the server is
+already at its ceiling; the served path is untouched.
+
+The count is cumulative and is never rate limited. An operator reading it must
+not see a number that was quietly reduced to keep standard error quiet.
+
+**Which 503 it was, in the response body.** A PHP location can answer 503 for a
+full worker queue, an unavailable pool, or this budget. Hyper writes the
+canonical reason phrase for the status, so the status line cannot carry the
+distinction; the body does, and it reads `Request Body Memory Budget`. Both the
+checked-in TCP test and the PHP integration test assert that exact string, so it
+cannot change silently and leave the operator's other signal broken.
+
+### Why `peak` is not reported
+
+`BodyBudget::peak()` exists and is what makes the ceiling checkable in a test
+rather than only arguable, but it is deliberately not surfaced at runtime.
+
+Its only operational use is proactive sizing — "you are running at 60 of 64 MiB,
+consider raising it" — and that answer is only useful if it is sampled
+periodically. Periodic sampling of a gauge is a metrics subsystem, which is
+explicitly out of scope here and is properly the job of the later observability
+work. At the moment a refusal happens, `peak` is also nearly uninformative,
+because it is pinned at or just under the limit by definition.
+
+The refusal count answers the question this slice owes an operator, which is
+"did this mechanism refuse my request, and what do I change". `peak` answers a
+different question that no existing surface can carry.
+
+### Cost of the visibility
+
+None on the served path. Nothing was added to `acquire`'s success path, to
+`grow_to`, to `release`, or to the no-body fast path. The startup line runs once
+per process. The counter increment already existed; the clock read and the
+window compare-exchange run only when a request is being refused.
+
+FACT: the hot-path A/B was re-run after this change and still measures no
+difference outside noise. Conditions are appended to
+`benchmarks/results/body_budget_0_5_20260916.md`.
+
+### Measured ceiling and cost
+
+Full conditions are in
+[`benchmarks/results/body_budget_0_5_20260916.md`](../benchmarks/results/body_budget_0_5_20260916.md).
+
+FACT: with the budget off, private memory under a slow-upload flood grew
+linearly at 1.09 MiB per accepted connection: 36.52, 72.41, 140.59 and
+278.50 MiB at 32, 64, 128 and 256 connections. With a 16 MiB budget the same
+sweep measured 18.23, 18.93, 18.87 and 18.79 MiB.
+
+FACT: at a fixed 128 connections the delta tracked the configured budget at
+1.09-1.15 times it: 4.48 MiB at 4 MiB, 18.36 MiB at 16 MiB, 70.07 MiB at 64 MiB,
+against 140.59 MiB disabled.
+
+FACT: release A/B on the PHP path measured no difference outside noise. GET with
+no body: 7086 versus 7097 rps. 12-byte POST across three passes: 6728/6514,
+6524/6803, 6694/6745 rps, with the sign of the difference flipping. 64 KiB POST
+across two interleaved passes: medians 3712 versus 3710 rps.
+
+HONEST LIMIT: within-arm spread reached 16% on the 12-byte POST, so this harness
+can fail to detect a regression below roughly 5%. It shows no visible cost; it
+does not prove there is none.
+
+INFERENCE: part of why no cost is visible is that the same change removed a full
+`Vec` copy of every reconstructed body. `build_worker_request` used to copy a
+`BytesMut` into the `WorkerRequest`; the reader now builds the `Vec` directly.
+The budget's atomics and that removed copy are plausibly of similar magnitude on
+this workload.
+
+### What the ceiling does not cover
+
+Response bodies, the protocol frame a worker builds for an in-flight job, Hyper
+per-connection parser and write buffers, and allocator fragmentation. The
+measured 1.09-1.15 factor on the request-body probes is where the last three
+appear. The first is not a factor on top of the budget at all; it is an
+independent and larger term, and it has its own section below.
+
+An operator should size roughly 1.2 times `max_body_memory` for the request-body
+component of RSS, bound the connection component separately, and read
+*What 0.5 does not bound* before sizing the machine.
+
+### The cost of charging a declared Content-Length
+
+Charging the declared `Content-Length` before the first body byte is read is what
+makes the aggregate bound hold: without it, sending slowly would be the cheap way
+past the ceiling. The choice has a price, and the review measured it rather than
+leaving it as a footnote.
+
+FACT: with `max_body_memory = 4194304` and `body_read_timeout = 20`, four clients
+that declared 1 MiB each and then sent one byte held the entire budget. Every
+other POST received `503` for the duration; GET requests were still answered
+`200`. At the 64 MiB default the same denial costs an attacker 64 connections.
+
+INFERENCE: the budget therefore traded a memory-exhaustion risk for a
+POST-availability risk. That trade is still favourable — the process survives,
+static and GET traffic keep serving, the hold is bounded by `body_read_timeout`,
+and the condition names itself on standard error — but it is a real property that
+0.5 introduced and did not previously exist.
+
+The alternative charging policy is to count only the capacity actually
+allocated, which is already what an undeclared chunked body does. It would hold
+the same memory bound, because a reservation still cannot be smaller than the
+buffer it covers, and it would remove this denial entirely, because a stalled
+client would hold almost nothing. Its cost is refusing late: a client could
+upload most of a megabyte before being told there is no room, instead of being
+turned away at the door. That is a genuine trade rather than an obvious
+improvement, so it is recorded as debt and left to the owner rather than changed
+here.
+
+Configuration levers, and how this differs from `413`, are in
+`doc/CONFIGURATION.md` under *What a declared Content-Length reserves, and what
+that costs*.
+
+### What 0.5 does not bound
+
+0.5 adds four limits and one budget. It does not add a process-memory ceiling,
+and no combination of its settings produces one. The largest unbounded term is
+the response body.
+
+FACT (source): a `static` location reads the entire file into memory before
+sending it, and a PHP response arrives as one protocol frame. Every in-flight
+request holds a complete copy of what it is about to write. Nothing limits the
+size of a static file and nothing limits the total across connections.
+
+FACT (measured, Windows MSVC release): four clients that requested a 256 MiB
+static file and then stopped reading held 1026.4 MiB of process-private memory —
+256.6 MiB per in-flight request. That is sixteen times the entire default
+`max_body_memory`, reached by four ordinary requests rather than by an attack.
+
+FACT (measured): the hold is bounded in time but not in size. A connection whose
+response write is stalled is closed at `header_read_timeout` and its memory
+released; a second client was served 3.1 s after a 5-second setting and 7.0 s
+after a 10-second setting, in both cases while a large response to a
+non-reading peer was outstanding.
+
+INFERENCE: Hyper's header deadline covers more of the connection than this
+document's second slice describes. That section says the deadline is cleared once
+a head is parsed and re-armed for the next one, and says nothing about the write
+phase; the observed behavior is that a stalled write is also reclaimed at that
+deadline. The favourable behavior is therefore load bearing and comes from a
+dependency's internals, and no test pins it. A Hyper upgrade could remove it
+without anything in this repository failing.
+
+HYPOTHESIS: the same unbounded shape applies to PHP responses up to the 8 MiB
+frame limit, which is smaller by construction and was not separately measured.
+
+Streaming responses are the actual fix and are documented debt, not part of this
+milestone. Until then the operational levers are to keep large files out of
+`static` roots and to lower `max_connections`, which scales this term
+proportionally. `max_body_memory` does not affect it.
+
+### Technical judgment
+
+The protection is real and the ceiling is now a configured number rather than a
+product of two unrelated limits. The cost is one small module, one owned value
+threaded along an ownership chain that already existed, and no measurable
+throughput change.
+
+The default is 64 MiB and that is a behavior change: a configuration that today
+survives a burst of more than 64 concurrent megabyte uploads will begin
+returning `503`. It is accepted because for ordinary traffic it is unreachable —
+64 MiB of 8 KiB form posts is 8192 concurrent bodies against a
+`max_connections` default of 1024 — so it binds only when bodies are both large
+and concurrent, and because the refusal is recoverable and now explains itself.
+An operator whose clients upload near the 1 MiB limit over slow links should
+size it with `expected concurrent uploads * typical body size * 1.2`; `0`
+restores the previous behavior exactly.
+
 ## Deliberate non-scope
 
-These slices do not change protocol v1, `REMOTE_ADDR`, request-body timeout or
-buffering, static-file implementation, proxy trust, TLS, HTTP/2, observability
-export or framework lifecycle. Those are not implied by transport identity or
-connection admission.
+These slices do not change protocol v1, `REMOTE_ADDR`, total byte budgeting,
+streaming request/response transport, static-file implementation, proxy trust,
+TLS, HTTP/2, observability export or framework lifecycle. These are not implied
+by transport identity, connection admission or the PHP body deadline.
 
 FACT: the transport value itself represents IPv4 and IPv6, but the existing
 Host router does not accept bracketed IPv6 literal authorities. That is a
 separate HTTP authority/configuration correctness gap; this slice does not
 claim IPv6 virtual-host support.
 
-FACT: request-body reads remain outside the header deadline. A slow PHP body can
-hold one of the bounded connection slots and retain up to the existing 1 MiB
-body limit. Connection memory/task growth is bounded, but admission starvation
-and a total buffered-byte budget are not solved by this slice.
+FACT: request-body reads for the PHP adapter are now outside the header deadline
+but inside their own total body deadline. A slow PHP body can retain up to the
+existing 1 MiB body limit only until that deadline. Connection memory/task growth
+and time-based admission starvation are bounded, and aggregate request-body bytes
+are now bounded by `max_body_memory`, but streaming bodies are not solved here.
+
+FACT: response-body memory is not bounded by anything this milestone adds, and
+was measured at 256.6 MiB per in-flight request for a 256 MiB static file. See
+*What 0.5 does not bound*. Streaming responses and an alternative body-charging
+policy are both recorded debt; neither is implemented here.
 
 ## Next dependency
 
-INFERENCE: a later owner-selected slice must decide body-read time semantics and
-a total buffered-byte budget before a streaming backend is added. A blanket
-timeout around the service future would violate the established distinction
-between HTTP cancellation and application transaction cancellation, so this
-cannot safely be treated as another Hyper connection timer.
+The total buffered-byte question this section used to pose is answered: the
+fourth slice added `max_body_memory` for request bodies, and a blanket timeout
+around the service future was not used, because it would violate the established
+distinction between HTTP cancellation and application transaction cancellation.
 
-HYPOTHESIS: after connection/request bounds exist, a concrete large static-file
-body is the right consumer from which to derive a streaming response type.
-That remains unproved until the static containment and Windows/Linux I/O
-designs are tested together.
+What the milestone hands forward, in the order the review ranked it:
+
+- INFERENCE: response streaming is now the largest unbounded resource in the
+  server, at a measured 256.6 MiB per in-flight request for a 256 MiB static
+  file. A concrete large static file is the right consumer from which to derive a
+  streaming response type, which is what this section previously guessed at; the
+  measurement now supports it. Static containment and Windows/Linux I/O still
+  have to be designed together, so the shape remains unproved.
+- The alternative body-charging policy, counting allocated capacity instead of
+  the declared length, with the late-refusal cost that comes with it.
+- A regression test pinning the observed reclaim of a stalled response write at
+  `header_read_timeout`, which is load bearing and currently rests on a
+  dependency's internals.

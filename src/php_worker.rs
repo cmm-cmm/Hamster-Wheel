@@ -12,11 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode,
-    body::Incoming,
+    body::{Body, Incoming},
     header::{HeaderName, HeaderValue, SERVER},
 };
 use tokio::{
@@ -28,6 +28,7 @@ use tokio::{
 };
 
 use crate::{
+    body_budget::{BodyBudget, BodyReservation},
     config::SERVER_NAME,
     handler::{HandlerResponse, simple_response},
     php_protocol::{
@@ -118,6 +119,10 @@ pub struct PhpWorkerPoolConfig {
     pub queue_capacity: usize,
     pub max_requests: Option<u64>,
     pub max_worker_age: Option<Duration>,
+    /// The process-wide request-body ceiling. Every PHP pool compiled from one
+    /// configuration shares one budget, because the resource being bounded is
+    /// process memory, not a pool.
+    pub body_budget: Arc<BodyBudget>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,6 +675,13 @@ struct PoolRuntime {
 
 struct PhpJob {
     request: WorkerRequest,
+    /// The body budget this job's bytes are charged against.
+    ///
+    /// It lives here, not in the HTTP handler, because the bytes do. A client
+    /// that disconnects while its job is still queued drops the handler future
+    /// but not the job, and releasing the reservation at that moment would let
+    /// the counter fall behind the memory that is still held.
+    _body: BodyReservation,
     response_tx: oneshot::Sender<Result<WorkerResponse, PoolJobError>>,
     /// How many times this job has already been queued again after a worker
     /// proved it never received the request. Bounds the retry so a pool that
@@ -778,6 +790,7 @@ impl PhpWorkerPool {
             queue_capacity,
             max_requests: None,
             max_worker_age: None,
+            body_budget: BodyBudget::disabled(),
         };
         let slots = (0..workers)
             .map(|slot| RwLock::new(initial_worker_snapshot(slot)))
@@ -1005,25 +1018,18 @@ impl PhpWorkerPool {
         }
     }
 
-    pub(crate) async fn serve_http(&self, request: Request<Incoming>) -> HandlerResponse {
-        let request = match http_request(request).await {
-            Ok(request) => request,
-            Err(HttpRequestError::TooLarge) => {
-                return simple_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
-            }
-            Err(HttpRequestError::TooManyHeaders) => {
-                return simple_response(
-                    StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-                    "Too Many Headers",
-                );
-            }
-            Err(HttpRequestError::Body(error)) => {
-                eprintln!("failed to read request body for PHP worker: {error}");
-                return simple_response(StatusCode::BAD_REQUEST, "Invalid Request Body");
-            }
-        };
+    pub(crate) async fn serve_http(
+        &self,
+        request: Request<Incoming>,
+        body_read_timeout: Duration,
+    ) -> HandlerResponse {
+        let admitted =
+            match http_request(request, body_read_timeout, &self.shared.config.body_budget).await {
+                Ok(admitted) => admitted,
+                Err(error) => return body_admission_response(error),
+            };
 
-        match self.execute(request).await {
+        match self.execute(admitted).await {
             Ok(response) => match http_response(response) {
                 Ok(response) => response,
                 Err(error) => {
@@ -1045,7 +1051,32 @@ impl PhpWorkerPool {
         }
     }
 
-    async fn execute(&self, request: WorkerRequest) -> Result<WorkerResponse, PoolExecuteError> {
+    /// Reconstructs a body exactly as the PHP path does, then echoes it.
+    ///
+    /// `hold` lets a test keep the reservation alive after the response is
+    /// written, which is how the aggregate ceiling is observed over real TCP
+    /// without a PHP distribution.
+    #[cfg(test)]
+    pub(crate) async fn test_body_echo(
+        request: Request<Incoming>,
+        body_read_timeout: Duration,
+        budget: &Arc<BodyBudget>,
+        hold: Option<Duration>,
+    ) -> HandlerResponse {
+        match http_request(request, body_read_timeout, budget).await {
+            Ok(admitted) => {
+                let response = Response::new(Full::new(Bytes::from(admitted.request.body)));
+                if let Some(hold) = hold {
+                    tokio::time::sleep(hold).await;
+                }
+                drop(admitted.body);
+                response
+            }
+            Err(error) => body_admission_response(error),
+        }
+    }
+
+    async fn execute(&self, admitted: AdmittedRequest) -> Result<WorkerResponse, PoolExecuteError> {
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(PoolExecuteError::Unavailable);
         }
@@ -1059,7 +1090,8 @@ impl PhpWorkerPool {
             .ok_or(PoolExecuteError::Unavailable)?;
         let (response_tx, response_rx) = oneshot::channel();
         let job = PhpJob {
-            request,
+            request: admitted.request,
+            _body: admitted.body,
             response_tx,
             redispatches: 0,
         };
@@ -2169,25 +2201,141 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> JoinHandle<()>
 enum HttpRequestError {
     TooLarge,
     TooManyHeaders,
-    Body(hyper::Error),
+    Timeout,
+    Body,
+    BudgetExhausted,
 }
 
-async fn http_request(request: Request<Incoming>) -> Result<WorkerRequest, HttpRequestError> {
+fn body_admission_response(error: HttpRequestError) -> HandlerResponse {
+    match error {
+        HttpRequestError::TooLarge => {
+            simple_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
+        }
+        HttpRequestError::TooManyHeaders => simple_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Too Many Headers",
+        ),
+        HttpRequestError::Timeout => {
+            simple_response(StatusCode::REQUEST_TIMEOUT, "Request Body Timeout")
+        }
+        HttpRequestError::Body => simple_response(StatusCode::BAD_REQUEST, "Invalid Request Body"),
+        // The same class as a full worker queue: the request is well formed,
+        // the server is out of a bounded resource right now. It is deliberately
+        // not 413, because the body is within its own per-request limit.
+        HttpRequestError::BudgetExhausted => simple_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Request Body Memory Budget",
+        ),
+    }
+}
+
+/// A reconstructed request and the budget reservation covering its bytes.
+///
+/// The two travel together from here until the job is dropped, which is what
+/// makes "reserved bytes are never less than buffered bytes" hold on every
+/// path rather than only on the success path.
+pub(crate) struct AdmittedRequest {
+    request: WorkerRequest,
+    body: BodyReservation,
+}
+
+/// How much a growing body over-reserves before it has to ask again.
+///
+/// The reader mirrors `Vec`'s own doubling instead of stepping by a fixed
+/// block: linear steps would make a 1 MiB body realloc and copy dozens of
+/// times, which costs far more than the atomic it would save.
+const BODY_GROWTH_FLOOR: usize = 8 * 1_024;
+
+async fn http_request(
+    request: Request<Incoming>,
+    body_read_timeout: Duration,
+    budget: &Arc<BodyBudget>,
+) -> Result<AdmittedRequest, HttpRequestError> {
     let (parts, mut body) = request.into_parts();
     if parts.headers.len() > MAX_HEADERS {
         return Err(HttpRequestError::TooManyHeaders);
     }
-    let mut bytes = BytesMut::new();
+    let declared = body.size_hint().lower();
+    if declared > MAX_REQUEST_BODY as u64 {
+        return Err(HttpRequestError::TooLarge);
+    }
+    // A request with no body touches neither the allocator nor the budget.
+    // This is the whole static/GET path, and it must stay free.
+    if body.is_end_stream() {
+        return Ok(AdmittedRequest {
+            request: build_worker_request(parts, Vec::new()),
+            body: BodyReservation::none(),
+        });
+    }
+
+    // Charge the declared length before reading a byte. A client that declares
+    // a megabyte and then trickles it must pay for the megabyte up front,
+    // otherwise sending slowly would be the cheapest way past the ceiling.
+    let declared = declared as usize;
+    let Some(mut reservation) = budget.reserve(declared) else {
+        return Err(HttpRequestError::BudgetExhausted);
+    };
+
+    let bytes = match timeout(
+        body_read_timeout,
+        read_http_body(&mut body, declared, &mut reservation),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(HttpRequestError::Timeout),
+    };
+    debug_assert!(
+        !budget.is_enabled() || bytes.capacity() <= reservation.held(),
+        "buffered {} bytes against a {} byte reservation",
+        bytes.capacity(),
+        reservation.held()
+    );
+    Ok(AdmittedRequest {
+        request: build_worker_request(parts, bytes),
+        body: reservation,
+    })
+}
+
+async fn read_http_body(
+    body: &mut Incoming,
+    declared: usize,
+    reservation: &mut BodyReservation,
+) -> Result<Vec<u8>, HttpRequestError> {
+    // Bounded by the declared length, so a false declaration cannot make the
+    // server allocate ahead of what it has actually been charged for.
+    let mut bytes = Vec::with_capacity(declared.min(BODY_GROWTH_FLOOR));
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(HttpRequestError::Body)?;
+        let frame = frame.map_err(|_| HttpRequestError::Body)?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        if bytes.len().saturating_add(data.len()) > MAX_REQUEST_BODY {
+        let needed = bytes.len().saturating_add(data.len());
+        if needed > MAX_REQUEST_BODY {
             return Err(HttpRequestError::TooLarge);
+        }
+        if needed > bytes.capacity() {
+            // Mirror Vec's own doubling, floored so a trickle of tiny frames
+            // does not consult the budget on every frame, and capped at the
+            // per-request limit. `needed` is already inside that cap.
+            let mut target = bytes.capacity().saturating_mul(2).max(BODY_GROWTH_FLOOR);
+            if target > MAX_REQUEST_BODY {
+                target = MAX_REQUEST_BODY;
+            }
+            let target = target.max(needed);
+            // Reserve, then allocate. The other order would let the process
+            // hold memory the counter has not admitted yet.
+            if !reservation.grow_to(target) {
+                return Err(HttpRequestError::BudgetExhausted);
+            }
+            bytes.reserve_exact(target - bytes.len());
         }
         bytes.extend_from_slice(&data);
     }
+    Ok(bytes)
+}
+
+fn build_worker_request(parts: hyper::http::request::Parts, bytes: Vec<u8>) -> WorkerRequest {
     let uri = parts.uri.to_string();
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or_default();
@@ -2196,14 +2344,14 @@ async fn http_request(request: Request<Incoming>) -> Result<WorkerRequest, HttpR
         .iter()
         .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
         .collect();
-    Ok(WorkerRequest {
+    WorkerRequest {
         method: parts.method.as_str().as_bytes().to_vec(),
         uri: uri.into_bytes(),
         path: path.as_bytes().to_vec(),
         query: query.as_bytes().to_vec(),
         headers,
-        body: bytes.to_vec(),
-    })
+        body: bytes,
+    }
 }
 
 fn http_response(worker: WorkerResponse) -> Result<HandlerResponse, String> {
@@ -2271,7 +2419,15 @@ mod tests {
             queue_capacity,
             max_requests: None,
             max_worker_age: None,
+            body_budget: BodyBudget::disabled(),
         }))
+    }
+
+    fn admitted(request: WorkerRequest) -> AdmittedRequest {
+        AdmittedRequest {
+            request,
+            body: BodyReservation::none(),
+        }
     }
 
     fn request(method: &str, path: &str, query: &str, body: Vec<u8>) -> WorkerRequest {
@@ -2304,6 +2460,7 @@ mod tests {
             (
                 PhpJob {
                     request: request("GET", "/hello", "", Vec::new()),
+                    _body: BodyReservation::none(),
                     response_tx,
                     redispatches,
                 },
@@ -2355,6 +2512,7 @@ mod tests {
         jobs_tx
             .send(PhpJob {
                 request: request("GET", "/hello", "", Vec::new()),
+                _body: BodyReservation::none(),
                 response_tx,
                 redispatches: 0,
             })
@@ -2383,7 +2541,8 @@ mod tests {
         assert!(result.is_err());
         assert!(!pool.shared.accepting.load(Ordering::Acquire));
         assert!(matches!(
-            pool.execute(request("GET", "/hello", "", Vec::new())).await,
+            pool.execute(admitted(request("GET", "/hello", "", Vec::new())))
+                .await,
             Err(PoolExecuteError::Unavailable)
         ));
     }
@@ -2422,6 +2581,7 @@ mod tests {
             queue_capacity: 8,
             max_requests: None,
             max_worker_age: None,
+            body_budget: BodyBudget::disabled(),
         }));
         let (jobs_tx, jobs_rx) = mpsc::channel(1);
         let (idle_tx, idle_rx) = mpsc::channel(2);
@@ -2441,6 +2601,7 @@ mod tests {
         jobs_tx
             .send(PhpJob {
                 request: request("GET", "/hello", "", Vec::new()),
+                _body: BodyReservation::none(),
                 response_tx,
                 redispatches: 0,
             })
@@ -2467,6 +2628,7 @@ mod tests {
             queue_capacity: 8,
             max_requests: None,
             max_worker_age: None,
+            body_budget: BodyBudget::disabled(),
         }));
         let (jobs_tx, jobs_rx) = mpsc::channel(8);
         // The production capacity for a single-slot pool.
@@ -2511,6 +2673,7 @@ mod tests {
         jobs_tx
             .send(PhpJob {
                 request: request("GET", "/hello", "", Vec::new()),
+                _body: BodyReservation::none(),
                 response_tx,
                 redispatches: 0,
             })
@@ -2598,6 +2761,7 @@ mod tests {
         taken
             .mailbox
             .try_send(WorkerCommand::Job(PhpJob {
+                _body: BodyReservation::none(),
                 request: request("GET", "/", "", Vec::new()),
                 response_tx,
                 redispatches: 0,
@@ -2781,7 +2945,8 @@ mod tests {
         for _ in 0..16 {
             let pool = Arc::clone(&pool);
             tasks.push(tokio::spawn(async move {
-                pool.execute(request("GET", "/hello", "", Vec::new())).await
+                pool.execute(admitted(request("GET", "/hello", "", Vec::new())))
+                    .await
             }));
         }
         for task in tasks {
@@ -2789,7 +2954,7 @@ mod tests {
             assert_eq!(response.body, b"Hello from PHP");
         }
         let state = pool
-            .execute(request("GET", "/state", "", Vec::new()))
+            .execute(admitted(request("GET", "/state", "", Vec::new())))
             .await
             .unwrap();
         assert!(
@@ -2955,7 +3120,7 @@ mod tests {
         let request_pool = Arc::clone(&pool);
         let request_task = tokio::spawn(async move {
             request_pool
-                .execute(request("GET", "/delay", "ms=200", Vec::new()))
+                .execute(admitted(request("GET", "/delay", "ms=200", Vec::new())))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2984,9 +3149,14 @@ mod tests {
         for _ in 0..4 {
             let pool = Arc::clone(&pool);
             initial.spawn(async move {
-                pool.execute(request("GET", "/state-delay", "ms=25", Vec::new()))
-                    .await
-                    .unwrap()
+                pool.execute(admitted(request(
+                    "GET",
+                    "/state-delay",
+                    "ms=25",
+                    Vec::new(),
+                )))
+                .await
+                .unwrap()
             });
         }
         let mut initial_pids = std::collections::HashSet::new();
@@ -3005,7 +3175,7 @@ mod tests {
             clients.spawn(async move {
                 for _ in 0..count {
                     let response = pool
-                        .execute(request("GET", "/hello", "", Vec::new()))
+                        .execute(admitted(request("GET", "/hello", "", Vec::new())))
                         .await
                         .unwrap();
                     assert_eq!(response.body, b"Hello from PHP");
@@ -3020,9 +3190,14 @@ mod tests {
         for _ in 0..4 {
             let pool = Arc::clone(&pool);
             final_states.spawn(async move {
-                pool.execute(request("GET", "/state-delay", "ms=25", Vec::new()))
-                    .await
-                    .unwrap()
+                pool.execute(admitted(request(
+                    "GET",
+                    "/state-delay",
+                    "ms=25",
+                    Vec::new(),
+                )))
+                .await
+                .unwrap()
             });
         }
         let mut final_pids = std::collections::HashSet::new();

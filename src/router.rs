@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, fmt, path::PathBuf, sync::Arc};
+use std::{cmp::Reverse, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use hyper::{
     HeaderMap, Request, StatusCode,
@@ -179,12 +179,13 @@ impl HostRouter {
         &self,
         request: Request<Incoming>,
         transport: TransportInfo,
+        body_read_timeout: Duration,
     ) -> Result<HandlerResponse, std::convert::Infallible> {
         let handler = match self.route(request.headers(), request.uri().path()) {
             Ok(handler) => handler,
             Err(error) => return Ok(simple_response(error.status(), error.message())),
         };
-        handler.serve(request, transport).await
+        handler.serve(request, transport, body_read_timeout).await
     }
 
     #[cfg(feature = "profiling")]

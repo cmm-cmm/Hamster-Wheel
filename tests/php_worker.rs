@@ -154,6 +154,27 @@ fn php_runtime_with_script(
         .expect("PHP runtime config should compile")
 }
 
+fn php_runtime_with_body_policy(
+    workers: usize,
+    queue_capacity: usize,
+    max_connections: usize,
+    body_read_timeout: u64,
+    script: &Path,
+) -> config::RuntimeConfig {
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let source = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\nmax_connections = {max_connections}\nbody_read_timeout = {body_read_timeout}\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
+        toml_literal(&executable),
+        toml_literal(script)
+    );
+    config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("PHP body policy config should compile")
+}
+
 fn php_runtime_with_env(
     workers: usize,
     script: &Path,
@@ -282,6 +303,22 @@ fn split_response(response: &[u8]) -> (&[u8], &[u8]) {
         .position(|window| window == b"\r\n\r\n")
         .expect("HTTP response should have a header boundary");
     (&response[..boundary + 4], &response[boundary + 4..])
+}
+
+async fn read_response_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    loop {
+        if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            return response[..index + 4].to_vec();
+        }
+        let mut chunk = [0_u8; 512];
+        let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("response header timeout")
+            .expect("read response header");
+        assert_ne!(count, 0, "connection closed before response headers");
+        response.extend_from_slice(&chunk[..count]);
+    }
 }
 
 fn response_cookie_header(headers: &[u8]) -> String {
@@ -869,6 +906,157 @@ async fn http_mapping_preserves_query_headers_body_and_custom_response() {
             .any(|window| window.eq_ignore_ascii_case(b"x-php-worker: persistent"))
     );
     assert_eq!(body, binary);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn incomplete_php_body_times_out_before_backend_dispatch() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+    let runtime = Arc::new(php_runtime_with_body_policy(1, 8, 1, 1, &script));
+    let server = TestServer::start_runtime(runtime).await;
+    let mut slow = TcpStream::connect(server.address).await.unwrap();
+    slow.write_all(
+        b"POST /inspect HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n",
+    )
+        .await
+        .unwrap();
+    assert!(
+        read_response_head(&mut slow)
+            .await
+            .starts_with(b"HTTP/1.1 100 Continue\r\n")
+    );
+    slow.write_all(b"x").await.unwrap();
+
+    let address = server.address;
+    let state_task =
+        tokio::spawn(async move { request_at(address, &close_request("/state")).await });
+    let mut slow_response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), slow.read_to_end(&mut slow_response))
+        .await
+        .expect("incomplete body should be bounded")
+        .expect("read timed-out body response");
+    assert!(
+        slow_response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"),
+        "incomplete body should receive 408, got {:?}",
+        String::from_utf8_lossy(&slow_response)
+    );
+
+    let state = state_task.await.expect("state request task");
+    let (_, body) = split_response(&state);
+    assert_eq!(json_number(body, "request"), 1);
+    drop(slow);
+    server.stop().await;
+}
+
+fn php_runtime_with_body_budget(
+    workers: usize,
+    queue_capacity: usize,
+    max_connections: usize,
+    max_body_memory: usize,
+    script: &Path,
+) -> config::RuntimeConfig {
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let source = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\nmax_connections = {max_connections}\nbody_read_timeout = 10\nmax_body_memory = {max_body_memory}\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
+        toml_literal(&executable),
+        toml_literal(script)
+    );
+    config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("PHP body budget config should compile")
+}
+
+fn post_request(path: &str, body: &[u8]) -> Vec<u8> {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
+}
+
+/// The aggregate ceiling must refuse work before PHP, never during it.
+///
+/// A budget rejection is only sound if it happens on the admission side of the
+/// worker transaction. This asserts the consequence directly: the number of
+/// requests the worker reports having executed equals the number of requests
+/// that were answered 2xx, so nothing refused for memory was also started.
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn an_over_budget_body_is_refused_before_the_worker_sees_it() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+    // One maximum body is the whole budget, so a single in-flight 1 MiB body
+    // saturates it and anything concurrent must be refused.
+    let runtime = Arc::new(php_runtime_with_body_budget(
+        1,
+        8,
+        8,
+        hamster_wheel::php_worker::MAX_REQUEST_BODY,
+        &script,
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    let address = server.address;
+
+    // Baseline, before any load: /state itself is a request, so record it.
+    let baseline = {
+        let state = request_at(address, &close_request("/state")).await;
+        let (_, body) = split_response(&state);
+        json_number(body, "request")
+    };
+
+    // Hold the whole budget inside a worker that is deliberately slow.
+    let large = vec![b'x'; hamster_wheel::php_worker::MAX_REQUEST_BODY];
+    let holder =
+        tokio::spawn(
+            async move { request_at(address, &post_request("/delay?ms=1200", &large)).await },
+        );
+    // Let the holder's body be read and charged before competing for it.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let refused = request_at(address, &post_request("/echo", b"small")).await;
+    assert!(
+        refused.starts_with(b"HTTP/1.1 503 "),
+        "a body that does not fit the aggregate ceiling should be refused with 503, got {:?}",
+        String::from_utf8_lossy(&refused[..refused.len().min(64)])
+    );
+    // Both 503s a PHP location can produce look identical in the status line.
+    // The body is what tells an operator which limit they hit.
+    let (_, refused_body) = split_response(&refused);
+    assert_eq!(
+        refused_body, b"Request Body Memory Budget",
+        "a budget refusal must be distinguishable from a full worker queue"
+    );
+
+    let held = holder.await.expect("holder task");
+    assert!(
+        held.starts_with(b"HTTP/1.1 200 "),
+        "the admitted body should still be served, got {:?}",
+        String::from_utf8_lossy(&held[..held.len().min(64)])
+    );
+
+    // The budget is returned, so the same small body now succeeds.
+    let accepted = request_at(address, &post_request("/echo", b"small")).await;
+    assert!(
+        accepted.starts_with(b"HTTP/1.1 201 "),
+        "the ceiling must release, got {:?}",
+        String::from_utf8_lossy(&accepted[..accepted.len().min(64)])
+    );
+
+    let state = request_at(address, &close_request("/state")).await;
+    let (_, body) = split_response(&state);
+    // Since the baseline /state: the delayed POST, the accepted POST and this
+    // /state itself. The refused POST must not appear.
+    assert_eq!(
+        json_number(body, "request") - baseline,
+        3,
+        "the worker must not have executed the refused request"
+    );
+
     server.stop().await;
 }
 
