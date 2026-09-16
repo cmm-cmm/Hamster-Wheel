@@ -13,7 +13,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::{
     Request, Response, StatusCode,
     body::{Body, Incoming},
@@ -36,6 +36,7 @@ use crate::{
         decode_shutdown_ack, encode_request, encode_shutdown, read_frame, write_frame,
         write_frame_tracked,
     },
+    response_body::ResponseBody,
 };
 
 pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
@@ -1065,7 +1066,8 @@ impl PhpWorkerPool {
     ) -> HandlerResponse {
         match http_request(request, body_read_timeout, budget).await {
             Ok(admitted) => {
-                let response = Response::new(Full::new(Bytes::from(admitted.request.body)));
+                let response =
+                    Response::new(ResponseBody::buffered(Bytes::from(admitted.request.body)));
                 if let Some(hold) = hold {
                     tokio::time::sleep(hold).await;
                 }
@@ -2359,7 +2361,7 @@ fn http_response(worker: WorkerResponse) -> Result<HandlerResponse, String> {
         return Err(format!("invalid final status {}", worker.status));
     }
     let status = StatusCode::from_u16(worker.status).map_err(|error| error.to_string())?;
-    let mut response = Response::new(Full::new(Bytes::from(worker.body)));
+    let mut response = Response::new(ResponseBody::buffered(Bytes::from(worker.body)));
     *response.status_mut() = status;
     for (raw_name, raw_value) in worker.headers {
         let name = HeaderName::from_bytes(&raw_name).map_err(|error| error.to_string())?;

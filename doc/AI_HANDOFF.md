@@ -2,6 +2,15 @@
 
 ## Current Milestone
 
+0.6.2 — Response Liveness is implemented in the working tree for owner review,
+on top of the uncommitted 0.6.1 streaming response. A lazy per-connection timer
+now covers only a backpressured socket write with zero byte progress; it does
+not time request reads, keep-alive idle, application execution or total response
+duration. The two-second release probe returned the sole admission slot in
+2008.3 ms, while a progressing 36 KiB/s client survived three timeout
+intervals. See `doc/RESPONSE_LIVENESS_0_6_2.md` and
+`benchmarks/results/response_liveness_0_6_2_20260916.md`.
+
 0.4.0 — Laravel Persistent Worker. The investigation and Octane adapter are
 committed on `dev` at `6e961d5`. They are not tagged or released, and milestone
 closure remains an owner decision. Findings, measurements and rejected
@@ -68,17 +77,20 @@ Idle worker death is detected passively on its next assignment, but a request
 that finds a dead worker is now queued again rather than failed, because a
 process reaped before the frame write proves PHP never received it. There is no
 proactive stdout probe, adaptive sizing or memory-threshold recycle.
-Byte-based admission now exists in the working tree: the
+Byte-based admission now exists: the
 `server.max_body_memory` budget bounds request-body bytes buffered process-wide
 and refuses over-budget requests with 503 before pool admission, with no
 waiting. It defaults to 64 MiB, reports its configured value at startup and its
 refusals on standard error at most once per minute, and `0` is an explicit
-unlimited opt-out. It is uncommitted. Response bodies, the worker's protocol
-frame and Hyper connection buffers remain outside the counter, and response
-bodies are the largest unbounded resource in the server: measured at 256.6 MiB
-per in-flight request for a 256 MiB static file, bounded by `max_connections`
-times the largest response and released at `header_read_timeout`, not by any
-size limit. Charging a declared `Content-Length` before reading also lets a slow
+unlimited opt-out. Static response bodies now stream in bounded 128 KiB frames;
+32 slow clients serving 256 MiB files used 9.39 MiB additional private memory.
+PHP responses remain buffered protocol-v1 frames. `header_read_timeout` still
+does not cover response writes; `write_progress_timeout` now releases an active
+response after its socket write makes zero progress for a configured interval.
+This is deliberately not a total-duration or minimum-rate policy, so a peer
+that makes deliberate trickle progress can still hold a slot indefinitely.
+Graceful shutdown retains its separate finite drain deadline. Charging a
+declared `Content-Length` before reading also lets a slow
 client hold budget it never fills; four such clients made every other POST 503
 for `body_read_timeout` while GET kept serving. Both are documented in
 `doc/CONFIGURATION.md` and `doc/HTTP_TRANSPORT_0_5.md` and measured in
@@ -289,42 +301,16 @@ committed or released.
 
 ## Next Action
 
-Owner closure on the uncommitted 0.5.x aggregate body-memory budget, described
-with its rejected alternatives in `doc/HTTP_TRANSPORT_0_5.md` and measured in
-`benchmarks/results/body_budget_0_5_20260916.md`.
+Owner review of 0.6.1 Concrete Streaming Response. The measured response-memory
+failure is closed and no static or PHP performance regression was detected.
+The pass also falsified the 0.5 inference that `header_read_timeout` reclaims an
+active response write: a streaming slow reader remains active past it. Graceful
+shutdown has its own bounded drain using that configured interval, but the
+normal-operation response-write timeout policy remains a documented gap and is
+not silently folded into 0.6.1.
 
-The owner has accepted the mechanism, a 64 MiB default, `0` as an explicit
-unlimited opt-out, and required the mechanism to carry its own minimum
-observability before the default is on. That observability is implemented: a
-startup line with the configured value, a rate-limited stderr notice on actual
-refusal that names the knob and the cumulative count, and a distinguishing 503
-body asserted by tests. `peak()` is deliberately left test-only, because
-reporting a gauge usefully needs periodic sampling and that is a metrics
-subsystem rather than part of this limit.
-
-An independent review of all four 0.5 slices as a milestone candidate found no
-correctness defect, no resource leak, no path weakening at-most-once and no
-measurable performance regression. It raised two documentation blockers, both now
-closed: response-body memory is unbounded and is now stated with its measurement,
-and the declared-`Content-Length` reservation's denial cost is now stated with
-its measurement, its configuration levers, and how it differs from a 413.
-
-Recorded debt from that review, in the order it was ranked:
-
-- streaming responses, which is the actual fix for unbounded response memory;
-- an alternative body-charging policy counting allocated capacity rather than the
-  declared length, which would remove the POST-denial window at the cost of
-  refusing late;
-- a regression test pinning the observed reclaim of a stalled response write at
-  `header_read_timeout`, which is load bearing and rests on Hyper internals that
-  no test currently checks.
-
-What remains is milestone closure, which is an owner decision. Nothing is
-committed, tagged, pushed, merged or released.
-
-Gate 3 was not opened and no following slice was started.
-
-Also pending: owner review of the first 0.5.x transport-identity slice.
+Nothing in 0.6.1 is committed, tagged, pushed, merged or released. Do not start
+the next 0.6.x slice until the owner decides closure.
 Remaining 0.4 decisions and out-of-scope qualifications:
 
 - Decide how the external PMS adopts Octane and resolves its PhpSpreadsheet

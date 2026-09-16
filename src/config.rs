@@ -31,6 +31,8 @@ const DEFAULT_HEADER_READ_TIMEOUT_SECONDS: u64 = 30;
 const MAX_HEADER_READ_TIMEOUT_SECONDS: u64 = 3_600;
 const DEFAULT_BODY_READ_TIMEOUT_SECONDS: u64 = 30;
 const MAX_BODY_READ_TIMEOUT_SECONDS: u64 = 3_600;
+const DEFAULT_WRITE_PROGRESS_TIMEOUT_SECONDS: u64 = 30;
+const MAX_WRITE_PROGRESS_TIMEOUT_SECONDS: u64 = 3_600;
 /// Request-body bytes Hamster may have buffered process-wide at one time.
 ///
 /// Zero disables the budget and restores the pre-budget path exactly, where
@@ -66,6 +68,8 @@ struct RawServer {
     header_read_timeout: u64,
     #[serde(default = "default_body_read_timeout")]
     body_read_timeout: u64,
+    #[serde(default = "default_write_progress_timeout")]
+    write_progress_timeout: u64,
     #[serde(default = "default_max_body_memory")]
     max_body_memory: u64,
     #[serde(default = "default_http1_max_buffer_size")]
@@ -82,6 +86,10 @@ const fn default_header_read_timeout() -> u64 {
 
 const fn default_body_read_timeout() -> u64 {
     DEFAULT_BODY_READ_TIMEOUT_SECONDS
+}
+
+const fn default_write_progress_timeout() -> u64 {
+    DEFAULT_WRITE_PROGRESS_TIMEOUT_SECONDS
 }
 
 const fn default_max_body_memory() -> u64 {
@@ -143,6 +151,7 @@ pub struct HttpLimits {
     max_connections: usize,
     header_read_timeout: Duration,
     body_read_timeout: Duration,
+    write_progress_timeout: Duration,
     max_body_memory: usize,
     http1_max_buffer_size: usize,
 }
@@ -153,6 +162,7 @@ impl Default for HttpLimits {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             header_read_timeout: Duration::from_secs(DEFAULT_HEADER_READ_TIMEOUT_SECONDS),
             body_read_timeout: Duration::from_secs(DEFAULT_BODY_READ_TIMEOUT_SECONDS),
+            write_progress_timeout: Duration::from_secs(DEFAULT_WRITE_PROGRESS_TIMEOUT_SECONDS),
             max_body_memory: DEFAULT_MAX_BODY_MEMORY as usize,
             http1_max_buffer_size: DEFAULT_HTTP1_MAX_BUFFER_SIZE,
         }
@@ -170,6 +180,10 @@ impl HttpLimits {
 
     pub const fn body_read_timeout(self) -> Duration {
         self.body_read_timeout
+    }
+
+    pub const fn write_progress_timeout(self) -> Duration {
+        self.write_progress_timeout
     }
 
     /// Zero means the budget is disabled.
@@ -192,9 +206,16 @@ impl HttpLimits {
             max_connections,
             header_read_timeout,
             body_read_timeout,
+            write_progress_timeout: Duration::from_secs(DEFAULT_WRITE_PROGRESS_TIMEOUT_SECONDS),
             max_body_memory: DEFAULT_MAX_BODY_MEMORY as usize,
             http1_max_buffer_size,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_write_progress_timeout(mut self, timeout: Duration) -> Self {
+        self.write_progress_timeout = timeout;
+        self
     }
 }
 
@@ -357,6 +378,7 @@ fn builtin_raw_config() -> RawConfig {
             max_connections: default_max_connections(),
             header_read_timeout: default_header_read_timeout(),
             body_read_timeout: default_body_read_timeout(),
+            write_progress_timeout: default_write_progress_timeout(),
             max_body_memory: default_max_body_memory(),
             http1_max_buffer_size: default_http1_max_buffer_size(),
         },
@@ -469,6 +491,11 @@ pub(crate) fn validate_raw(
             "server.body_read_timeout must be between 1 and {MAX_BODY_READ_TIMEOUT_SECONDS} seconds"
         )));
     }
+    if !(1..=MAX_WRITE_PROGRESS_TIMEOUT_SECONDS).contains(&raw.server.write_progress_timeout) {
+        return Err(ConfigError::Validation(format!(
+            "server.write_progress_timeout must be between 1 and {MAX_WRITE_PROGRESS_TIMEOUT_SECONDS} seconds"
+        )));
+    }
     if raw.server.max_body_memory != 0
         && !(MIN_MAX_BODY_MEMORY..=MAX_MAX_BODY_MEMORY).contains(&raw.server.max_body_memory)
     {
@@ -487,6 +514,7 @@ pub(crate) fn validate_raw(
         max_connections: raw.server.max_connections,
         header_read_timeout: Duration::from_secs(raw.server.header_read_timeout),
         body_read_timeout: Duration::from_secs(raw.server.body_read_timeout),
+        write_progress_timeout: Duration::from_secs(raw.server.write_progress_timeout),
         max_body_memory: raw.server.max_body_memory as usize,
         http1_max_buffer_size: raw.server.http1_max_buffer_size,
     };
@@ -964,13 +992,14 @@ mod tests {
         let current = env::current_dir().unwrap();
         let source = minimal(&current).replace(
             "listen = \"127.0.0.1:8080\"",
-            "listen = \"127.0.0.1:8080\"\nmax_connections = 77\nheader_read_timeout = 12\nbody_read_timeout = 14\nmax_body_memory = 4194304\nhttp1_max_buffer_size = 32768",
+            "listen = \"127.0.0.1:8080\"\nmax_connections = 77\nheader_read_timeout = 12\nbody_read_timeout = 14\nwrite_progress_timeout = 16\nmax_body_memory = 4194304\nhttp1_max_buffer_size = 32768",
         );
         let runtime = compile_str(&source, Path::new("unused")).unwrap();
         let limits = runtime.http_limits();
         assert_eq!(limits.max_connections(), 77);
         assert_eq!(limits.header_read_timeout(), Duration::from_secs(12));
         assert_eq!(limits.body_read_timeout(), Duration::from_secs(14));
+        assert_eq!(limits.write_progress_timeout(), Duration::from_secs(16));
         assert_eq!(limits.max_body_memory(), 4 * 1_024 * 1_024);
         assert_eq!(limits.http1_max_buffer_size(), 32_768);
     }
@@ -1001,6 +1030,8 @@ max_body_memory = 0",
             ("header_read_timeout", "3601"),
             ("body_read_timeout", "0"),
             ("body_read_timeout", "3601"),
+            ("write_progress_timeout", "0"),
+            ("write_progress_timeout", "3601"),
             // One byte under a single maximum body would make some legal
             // requests impossible even on a completely idle server.
             ("max_body_memory", "1048575"),

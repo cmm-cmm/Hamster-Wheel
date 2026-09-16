@@ -2,7 +2,7 @@ use std::{hint::black_box, io, path::PathBuf, time::Instant};
 
 use bytes::Bytes;
 
-use crate::static_files;
+use crate::{response_body::ResponseBody, static_files};
 
 const CPU_ITERATIONS: u64 = 500_000;
 const FILESYSTEM_ITERATIONS: u64 = 10_000;
@@ -122,7 +122,7 @@ pub async fn profile_static_pipeline(document_root: PathBuf) -> io::Result<Vec<S
             let metadata = tokio::fs::metadata(&canonical).await?;
             black_box(static_files::file_response(
                 &canonical,
-                Bytes::new(),
+                ResponseBody::buffered(Bytes::new()),
                 metadata.len(),
             ));
         }
@@ -139,12 +139,11 @@ pub async fn profile_static_pipeline(document_root: PathBuf) -> io::Result<Vec<S
             black_box(tokio::fs::metadata(&candidate).await?);
             let canonical = tokio::fs::canonicalize(candidate).await?;
             black_box(canonical.starts_with(&canonical_root));
-            black_box(tokio::fs::metadata(&canonical).await?);
-            let contents = tokio::fs::read(&canonical).await?;
-            let content_length = contents.len() as u64;
+            let file = tokio::fs::File::open(&canonical).await?;
+            let content_length = file.metadata().await?.len();
             black_box(static_files::file_response(
                 &canonical,
-                Bytes::from(contents),
+                ResponseBody::file(file, content_length),
                 content_length,
             ));
         }

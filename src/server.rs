@@ -2,6 +2,7 @@ use std::{fmt, future::Future, io, sync::Arc};
 
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::time::timeout;
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
     php_worker::PhpWorkerError,
     router::HostRouter,
     transport::TransportInfo,
+    write_progress::WriteProgressTimeout,
 };
 
 #[derive(Debug)]
@@ -163,6 +165,7 @@ async fn serve_connection(
         .timer(TokioTimer::new())
         .header_read_timeout(http_limits.header_read_timeout())
         .max_buf_size(http_limits.http1_max_buffer_size());
+    let stream = WriteProgressTimeout::new(stream, http_limits.write_progress_timeout());
     let connection = builder.serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
 
@@ -179,7 +182,22 @@ async fn serve_connection(
         changed = shutdown.changed() => {
             if changed.is_ok() && *shutdown.borrow() {
                 connection.as_mut().graceful_shutdown();
-                if let Err(error) = connection.await && should_report_connection_error(&error) {
+                // Graceful shutdown stops accepting another request but a peer
+                // that no longer reads a streaming response can otherwise hold
+                // this connection task, its file handle, and process shutdown
+                // forever. The ordinary header deadline is the connection's
+                // existing maximum idle lifetime; use the same finite interval
+                // to drain, then drop the connection and response body. Dropping
+                // an HTTP future still cannot cancel or replay an owned worker
+                // transaction; the pool's cancellation contract remains the
+                // authority for application work.
+                if let Ok(Err(error)) = timeout(
+                    http_limits.header_read_timeout(),
+                    connection.as_mut(),
+                )
+                .await
+                    && should_report_connection_error(&error)
+                {
                     eprintln!(
                         "failed to gracefully close connection from {} to {}: {error}",
                         transport.peer_addr(),
@@ -197,9 +215,24 @@ fn should_report_connection_error(error: &hyper::Error) -> bool {
     // into a stderr backpressure path.
     !(error.is_parse()
         || error.is_timeout()
+        || error_chain_has_io_kind(error, io::ErrorKind::TimedOut)
         || error.is_incomplete_message()
         || error.is_closed()
         || error.is_canceled())
+}
+
+fn error_chain_has_io_kind(error: &(dyn std::error::Error + 'static), kind: io::ErrorKind) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == kind)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -245,6 +278,31 @@ mod tests {
     fn body_router(budget: Arc<BodyBudget>, hold: Option<Duration>) -> HostRouter {
         let locations = Arc::new(
             LocationRouter::new(Vec::new(), Handler::body_echo(budget, hold))
+                .expect("valid locations"),
+        );
+        HostRouter::new(vec![
+            VirtualHost::new("127.0.0.1", locations).expect("valid host"),
+        ])
+        .expect("valid router")
+    }
+
+    fn short_file_router(path: Arc<std::path::PathBuf>, declared_length: u64) -> HostRouter {
+        let locations = Arc::new(
+            LocationRouter::new(
+                vec![("/broken", Handler::short_file(path, declared_length))],
+                Handler::transport_echo(),
+            )
+            .expect("valid locations"),
+        );
+        HostRouter::new(vec![
+            VirtualHost::new("127.0.0.1", locations).expect("valid host"),
+        ])
+        .expect("valid router")
+    }
+
+    fn static_router(document_root: Arc<std::path::PathBuf>) -> HostRouter {
+        let locations = Arc::new(
+            LocationRouter::new(Vec::new(), Handler::static_files(document_root))
                 .expect("valid locations"),
         );
         HostRouter::new(vec![
@@ -738,6 +796,206 @@ mod tests {
 
         shutdown_tx.send(()).expect("signal shutdown");
         server.await.expect("join server").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn midstream_response_error_closes_connection_and_server_recovers() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hamster-wheel-short-response-{}",
+            std::process::id()
+        ));
+        std::fs::write(&fixture, b"short").expect("write short response fixture");
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(short_file_router(Arc::new(fixture.clone()), 10)),
+            HttpLimits::default(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut client = connect(listen_addr).await;
+        client
+            .write_all(
+                b"GET /broken HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n\
+                  GET /healthy HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write broken and pipelined requests");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .expect("body error must close the connection")
+            .expect("read partial response");
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response_text.contains("content-length: 10\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nshort"));
+        assert_eq!(
+            response_text.matches("HTTP/1.1 200 OK").count(),
+            1,
+            "the pipelined request must not run after a corrupt response body"
+        );
+
+        let mut recovered = connect(listen_addr).await;
+        recovered
+            .write_all(b"GET /healthy HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write recovery request");
+        assert!(
+            read_response_body(&mut recovered)
+                .await
+                .starts_with("peer=")
+        );
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+        std::fs::remove_file(fixture).expect("remove short response fixture");
+    }
+
+    #[tokio::test]
+    async fn stalled_response_write_releases_connection_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "hamster-wheel-write-progress-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create write-progress root");
+        let large = root.join("large.bin");
+        let fixture = std::fs::File::create(&large).expect("create large response fixture");
+        fixture
+            .set_len(32 * 1_024 * 1_024)
+            .expect("size large response fixture");
+        drop(fixture);
+        std::fs::write(root.join("healthy.txt"), b"healthy").expect("write healthy fixture");
+        let canonical_root = Arc::new(
+            tokio::fs::canonicalize(&root)
+                .await
+                .expect("canonicalize write-progress root"),
+        );
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let limits =
+            HttpLimits::for_test(1, Duration::from_secs(5), Duration::from_secs(1), 8 * 1_024)
+                .with_write_progress_timeout(Duration::from_millis(200));
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(static_router(canonical_root)),
+            limits,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut stalled = connect(listen_addr).await;
+        stalled
+            .write_all(b"GET /large.bin HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("request large static file");
+        let head = read_response_head(&mut stalled).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        // max_connections=1 means this connection cannot be accepted and
+        // served until the stalled writer releases its admission slot.
+        let mut waiting = connect(listen_addr).await;
+        waiting
+            .write_all(b"GET /healthy.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("queue healthy connection in the listen backlog");
+        let body = tokio::time::timeout(Duration::from_secs(3), read_response_body(&mut waiting))
+            .await
+            .expect("write-progress timeout must release connection admission");
+        assert_eq!(body, "healthy");
+
+        let mut partial = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stalled.read_to_end(&mut partial))
+            .await
+            .expect("timed-out partial response must close")
+            .expect("drain partial response");
+        assert!(
+            partial.len() < 32 * 1_024 * 1_024,
+            "a timed-out response must not silently become a complete response"
+        );
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+        std::fs::remove_file(root.join("healthy.txt")).expect("remove healthy fixture");
+        std::fs::remove_file(&large).expect("timed-out stream released its file handle");
+        std::fs::remove_dir(&root).expect("remove write-progress root");
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_a_static_stream_stalled_on_the_client() {
+        let root = std::env::temp_dir().join(format!(
+            "hamster-wheel-streaming-shutdown-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create static stream root");
+        let large = root.join("large.bin");
+        let fixture = std::fs::File::create(&large).expect("create large static fixture");
+        fixture
+            .set_len(32 * 1_024 * 1_024)
+            .expect("size large static fixture");
+        drop(fixture);
+        let canonical_root = Arc::new(
+            tokio::fs::canonicalize(&root)
+                .await
+                .expect("canonicalize static stream root"),
+        );
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let limits = HttpLimits::for_test(
+            1,
+            Duration::from_millis(300),
+            Duration::from_secs(1),
+            8 * 1_024,
+        );
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(static_router(canonical_root)),
+            limits,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut client = connect(listen_addr).await;
+        client
+            .write_all(b"GET /large.bin HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("request large static file");
+        let head = read_response_head(&mut client).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(
+            head.windows(24)
+                .any(|window| window == b"content-length: 33554432")
+        );
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stalled static stream must not hold shutdown forever")
+            .expect("join server")
+            .expect("server result");
+
+        // Completion of the connection task must have dropped the FileBody and
+        // its open handle before the server reports shutdown complete.
+        std::fs::remove_file(&large).expect("stream file handle was released");
+        std::fs::remove_dir(&root).expect("remove static stream root");
+        drop(client);
     }
 
     async fn start_budget_server(

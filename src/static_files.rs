@@ -1,14 +1,13 @@
 use std::{convert::Infallible, io, path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::{
     Method, Request, Response, StatusCode,
     body::Incoming,
     header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, SERVER},
 };
 
-use crate::config::SERVER_NAME;
+use crate::{config::SERVER_NAME, response_body::ResponseBody};
 
 const INDEX_FILE: &str = "index.html";
 
@@ -28,13 +27,14 @@ enum FileError {
 
 struct ResolvedFile {
     path: PathBuf,
+    file: tokio::fs::File,
     length: u64,
 }
 
 pub async fn serve(
     request: Request<Incoming>,
     document_root: Arc<PathBuf>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<ResponseBody>, Infallible> {
     let is_head = request.method() == Method::HEAD;
     if request.method() != Method::GET && !is_head {
         let mut response = text_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
@@ -45,14 +45,16 @@ pub async fn serve(
     }
 
     let response = match resolve_file(&document_root, request.uri().path()).await {
-        Ok(file) if is_head => file_response(&file.path, Bytes::new(), file.length),
-        Ok(file) => match tokio::fs::read(&file.path).await {
-            Ok(contents) => {
-                let content_length = contents.len() as u64;
-                file_response(&file.path, Bytes::from(contents), content_length)
-            }
-            Err(error) => error_response(map_io_error(error)),
-        },
+        Ok(file) if is_head => file_response(
+            &file.path,
+            ResponseBody::buffered(Bytes::new()),
+            file.length,
+        ),
+        Ok(file) => file_response(
+            &file.path,
+            ResponseBody::file(file.file, file.length),
+            file.length,
+        ),
         Err(error) => error_response(error),
     };
 
@@ -80,15 +82,17 @@ async fn resolve_file(document_root: &PathBuf, uri_path: &str) -> Result<Resolve
         return Err(FileError::Forbidden);
     }
 
-    let metadata = tokio::fs::metadata(&canonical)
+    let file = tokio::fs::File::open(&canonical)
         .await
         .map_err(map_io_error)?;
+    let metadata = file.metadata().await.map_err(map_io_error)?;
     if !metadata.is_file() {
         return Err(FileError::NotFound);
     }
 
     Ok(ResolvedFile {
         path: canonical,
+        file,
         length: metadata.len(),
     })
 }
@@ -164,10 +168,10 @@ const fn hex_value(byte: u8) -> Option<u8> {
 
 pub(crate) fn file_response(
     path: &std::path::Path,
-    body: Bytes,
+    body: ResponseBody,
     content_length: u64,
-) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(body));
+) -> Response<ResponseBody> {
+    let mut response = Response::new(body);
     *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()
@@ -181,7 +185,7 @@ pub(crate) fn file_response(
     response
 }
 
-fn error_response(error: FileError) -> Response<Full<Bytes>> {
+fn error_response(error: FileError) -> Response<ResponseBody> {
     match error {
         FileError::BadRequest => text_response(StatusCode::BAD_REQUEST, "Bad Request"),
         FileError::Forbidden => text_response(StatusCode::FORBIDDEN, "Forbidden"),
@@ -201,8 +205,10 @@ fn map_io_error(error: io::Error) -> FileError {
     }
 }
 
-fn text_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from_static(message.as_bytes())));
+fn text_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
+    let mut response = Response::new(ResponseBody::buffered(Bytes::from_static(
+        message.as_bytes(),
+    )));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -212,14 +218,14 @@ fn text_response(status: StatusCode, message: &'static str) -> Response<Full<Byt
     response
 }
 
-fn insert_common_headers(response: &mut Response<Full<Bytes>>) {
+fn insert_common_headers(response: &mut Response<ResponseBody>) {
     response
         .headers_mut()
         .insert(SERVER, HeaderValue::from_static(SERVER_NAME));
 }
 
 #[cfg(feature = "profiling")]
-pub(crate) fn constant_response() -> Response<Full<Bytes>> {
+pub(crate) fn constant_response() -> Response<ResponseBody> {
     text_response(StatusCode::OK, "Hello, Hamster Wheel!")
 }
 

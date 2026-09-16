@@ -1,7 +1,6 @@
 use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::{
     Request, Response, StatusCode,
     body::Incoming,
@@ -11,10 +10,11 @@ use hyper::{
 #[cfg(test)]
 use crate::body_budget::BodyBudget;
 use crate::{
-    config::SERVER_NAME, php_worker::PhpWorkerPool, static_files, transport::TransportInfo,
+    config::SERVER_NAME, php_worker::PhpWorkerPool, response_body::ResponseBody, static_files,
+    transport::TransportInfo,
 };
 
-pub(crate) type HandlerResponse = Response<Full<Bytes>>;
+pub(crate) type HandlerResponse = Response<ResponseBody>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandlerKind {
@@ -25,6 +25,8 @@ pub enum HandlerKind {
     TransportEcho,
     #[cfg(test)]
     BodyEcho,
+    #[cfg(test)]
+    ShortFile,
 }
 
 #[derive(Clone)]
@@ -49,6 +51,14 @@ pub enum Handler {
     BodyEcho {
         budget: Arc<BodyBudget>,
         hold: Option<Duration>,
+    },
+    /// Emits a response whose declared length exceeds the open file. This is a
+    /// transport fault seam: the file body must error mid-stream and Hyper must
+    /// close the connection instead of accepting a subsequent request on it.
+    #[cfg(test)]
+    ShortFile {
+        path: Arc<PathBuf>,
+        declared_length: u64,
     },
 }
 
@@ -79,6 +89,14 @@ impl Handler {
         Self::BodyEcho { budget, hold }
     }
 
+    #[cfg(test)]
+    pub(crate) fn short_file(path: Arc<PathBuf>, declared_length: u64) -> Self {
+        Self::ShortFile {
+            path,
+            declared_length,
+        }
+    }
+
     pub const fn kind(&self) -> HandlerKind {
         match self {
             Self::Static { .. } => HandlerKind::Static,
@@ -88,6 +106,8 @@ impl Handler {
             Self::TransportEcho => HandlerKind::TransportEcho,
             #[cfg(test)]
             Self::BodyEcho { .. } => HandlerKind::BodyEcho,
+            #[cfg(test)]
+            Self::ShortFile { .. } => HandlerKind::ShortFile,
         }
     }
 
@@ -115,6 +135,20 @@ impl Handler {
                 )
                 .await)
             }
+            #[cfg(test)]
+            Self::ShortFile {
+                path,
+                declared_length,
+            } => {
+                let file = tokio::fs::File::open(path.as_ref())
+                    .await
+                    .expect("open short-file test fixture");
+                Ok(static_files::file_response(
+                    path.as_ref(),
+                    ResponseBody::file(file, *declared_length),
+                    *declared_length,
+                ))
+            }
         }
     }
 
@@ -128,6 +162,8 @@ impl Handler {
             Self::TransportEcho => simple_response(StatusCode::OK, "Transport Echo"),
             #[cfg(test)]
             Self::BodyEcho { .. } => simple_response(StatusCode::OK, "Body Echo"),
+            #[cfg(test)]
+            Self::ShortFile { .. } => simple_response(StatusCode::OK, "Short File"),
         }
     }
 }
@@ -139,7 +175,7 @@ fn transport_response(transport: TransportInfo) -> HandlerResponse {
         transport.peer_addr(),
         transport.local_addr()
     ));
-    let mut response = Response::new(Full::new(body));
+    let mut response = Response::new(ResponseBody::buffered(body));
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -151,7 +187,7 @@ fn transport_response(transport: TransportInfo) -> HandlerResponse {
 }
 
 pub(crate) fn simple_response(status: StatusCode, body: &'static str) -> HandlerResponse {
-    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
+    let mut response = Response::new(ResponseBody::buffered(Bytes::from_static(body.as_bytes())));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,

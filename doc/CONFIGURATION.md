@@ -16,6 +16,7 @@ listen = "127.0.0.1:8080"
 max_connections = 1024
 header_read_timeout = 30
 body_read_timeout = 30
+write_progress_timeout = 30
 max_body_memory = 67108864
 http1_max_buffer_size = 65536
 
@@ -74,6 +75,13 @@ returns HTTP 408 and closes the incomplete HTTP/1 exchange; it does not cancel a
 PHP request because PHP has not received one. The existing 1 MiB PHP body limit
 remains independent of this timer.
 
+`write_progress_timeout` is the maximum number of seconds an HTTP response
+socket write may remain backpressured without writing at least one byte. It
+defaults to 30 and must be 1-3600. The timer is lazy: it starts only when the
+underlying TCP write returns `Pending`, is cleared by a positive socket write,
+and does not run during request reads, keep-alive idle time, or application/PHP
+execution. It is an inactivity interval, not a total response deadline.
+
 `max_body_memory` is the total number of request-body bytes Hamster may have
 buffered process-wide at one time. It defaults to 67108864 (64 MiB) and must be
 0 or between 1048576 and 68719476736. Zero disables the budget and restores the
@@ -112,36 +120,43 @@ distinguishing signal is the response body, which reads
 it is only useful for proactive sizing, which needs periodic sampling, and that
 is later observability work rather than part of this limit.
 
-These five limits bound connection tasks, slow/idle request heads, HTTP/1 parser
+These six limits bound connection tasks, slow/idle request heads, HTTP/1 parser
 buffering, PHP body reconstruction time and buffered request-body bytes. They do
 not add up to a process-memory budget, and 0.5 does not create one. Two terms sit
 outside every limit above, and the larger of them is not small. The header and
 body deadlines both stop before PHP pool admission, so neither can cancel a
 possibly-started application transaction.
 
-### Response bodies are not bounded
+### Response-body memory
 
-A response is assembled in memory before it is sent. A `static` location reads
-the whole file into memory, and a PHP response arrives as one protocol frame, so
-every in-flight request holds a complete copy of what it is about to write. No
-setting caps the size of a static file, and no setting caps the total across
-connections. `max_body_memory` has no effect here: it counts request bodies
-only.
+Static GET responses stream from one open file in 128 KiB application frames.
+The same limit is applied to Tokio's internal file buffer, and Hyper only polls
+another frame while the connection can accept it. A 256 MiB file therefore no
+longer creates a 256 MiB application allocation per slow client.
 
-FACT: on a Windows MSVC release build, four clients that requested a 256 MiB
-static file and then stopped reading held 1026.4 MiB of process-private memory,
-256.6 MiB per in-flight request.
+FACT: on a Windows MSVC release build, 32 clients requesting a 256 MiB file and
+then reading nothing held 9.39 MiB of additional process-private memory. The old
+fully buffered path used 1026.36 MiB with only four clients. After disconnect,
+the 32-client process returned to within 1.20 MiB of idle.
 
-The working bound is therefore `max_connections` multiplied by the largest
-response a location can produce, held for as long as the slowest client takes to
-read it. That time is bounded: a connection whose response write is stalled is
-closed at `header_read_timeout` and its memory released, verified at 5-second
-and 10-second settings. It is not bounded by size.
+This is a per-stream bound, not a configured aggregate response budget. The
+observed slope was about 0.29 MiB per slow connection after the emitted frame,
+Tokio, Hyper/socket and allocator overhead were included. `max_connections`
+bounds how many such streams the process owns. `max_body_memory` continues to
+count request bodies only.
 
-Until streaming responses exist, the levers are operational: keep large files
-out of `static` roots or serve them from something else, and lower
-`max_connections`, which scales this term proportionally. Sizing a machine from
-`max_body_memory` alone will under-provision it.
+PHP responses remain buffered protocol-v1 frames and are unchanged. Their frame
+limit, rather than the static file size, bounds one response.
+
+`header_read_timeout` is not a response-write timeout. `write_progress_timeout`
+owns that separate phase: after socket backpressure begins, no accepted bytes
+for the configured interval closes the partial response and releases its
+connection slot. Producing another body frame is deliberately not progress,
+because Hyper may buffer it before the socket accepts it. A client that keeps
+causing positive writes is not cut by this inactivity policy, even when its
+total transfer is slow. Consequently this is not an absolute response-lifetime
+bound; enforcing one would require a declared minimum rate or total deadline.
+Graceful shutdown retains its independent finite drain deadline.
 
 ### What a declared Content-Length reserves, and what that costs
 

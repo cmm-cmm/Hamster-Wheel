@@ -1735,3 +1735,54 @@ default the same denial costs 64 connections.
 An earlier eight-client run against a 64 MiB file measured only a 0.75 MiB delta
 and is recorded as a sampling failure, not a contrary result: loopback drained
 those responses faster than the 250 ms sampling interval.
+
+## 0.6.1 concrete streaming response — working tree
+
+Full methodology and the chunk-size comparison are in
+[`benchmarks/results/streaming_response_0_6_1_20260916.md`](../benchmarks/results/streaming_response_0_6_1_20260916.md).
+Windows 11, Core i5-12400, 32 GiB, MSVC release builds were used throughout.
+
+The slow-reader probe independently reproduced the old result: a 256 MiB file
+cost 256.57 MiB private memory with one client and 1026.36 MiB with four. With
+128 KiB streaming frames the deltas were 0.34, 1.37, 4.96 and 9.39 MiB at 1, 4,
+16 and 32 clients. The 32-client process returned to within 1.20 MiB of idle
+after disconnect.
+
+Three interleaved fresh-server release runs per cell:
+
+| workload | baseline RPS / CPU us | streaming RPS / CPU us |
+|---|---:|---:|
+| 21 B static, C1 | 4,167 / 243.750 | 4,553 / 244.271 |
+| 21 B static, C32 | 7,358 / 426.250 | 8,669 / 438.750 |
+| 1 MiB static, C8 | 2,492 / 1,620.312 | 3,266 / 1,378.125 |
+
+The 1 MiB p50 improved from 2.833 to 2.026 ms and p95 from 4.447 to
+3.513 ms; p99 was 18.024 versus 18.264 ms and is inconclusive. Every candidate
+RPS sample exceeded its paired baseline. These loopback, cache-warmed numbers
+show the cost of Hamster's data path, not physical-disk throughput.
+
+64, 128 and 256 KiB chunks were measured rather than assumed. At 32 slow
+clients their private deltas were 5.34, 9.39 and 17.59 MiB. On the 1 MiB cell,
+64 KiB paid the highest CPU from sixteen body reads, while 256 KiB retained 87%
+more memory than 128 KiB without higher throughput. The implementation retains
+128 KiB.
+
+## 0.6.2 response write liveness — working tree
+
+Full methodology and raw samples are in
+[`benchmarks/results/response_liveness_0_6_2_20260916.md`](../benchmarks/results/response_liveness_0_6_2_20260916.md).
+
+With `max_connections = 1`, a 256 MiB response, a non-reading client and a
+two-second `write_progress_timeout`, the waiting healthy connection completed
+after 2008.3 ms. The expected timeout produced zero stderr bytes. A separate
+client reading about 36 KiB/s stayed connected for six seconds, three complete
+timeout intervals.
+
+Release A/B on the 22-byte loopback static path found no material C32
+regression: median RPS was 9,030 baseline and 9,089 candidate, with 408.125 and
+400.625 CPU us/request. Six C1 samples produced 4,546 versus 4,444 median RPS
+and 245.938 versus 249.062 CPU us/request. The C1 point estimate is a 2.2% RPS
+loss and 1.3% CPU increase, but within-arm RPS spread was about 10% and paired
+signs were unstable after reversing run order. This supports “possible
+low-single-digit C1 cost,” not a zero-cost claim or a demonstrated material
+regression.
