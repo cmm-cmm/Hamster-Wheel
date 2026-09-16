@@ -2,7 +2,10 @@ param(
     [int]$Runs = 3,
     [int]$Requests = 500000,
     [int]$Concurrency = 32,
-    [int]$WarmupRequests = 1000
+    [int]$WarmupRequests = 1000,
+    [string]$RequestPath = '/',
+    [int]$ExpectedStatus = 200,
+    [string]$Executable = '.\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,19 +29,24 @@ public sealed class StaticBenchClient : IDisposable
     private sealed class Counter { public int Value; }
     private readonly SocketsHttpHandler handler;
     private readonly HttpClient client;
+    private readonly string requestPath;
+    private readonly HttpStatusCode expectedStatus;
 
-    public StaticBenchClient(string url, int concurrency)
+    public StaticBenchClient(string url, string requestPath, int expectedStatus, int concurrency)
     {
         handler = new SocketsHttpHandler { MaxConnectionsPerServer = concurrency };
         client = new HttpClient(handler) { BaseAddress = new Uri(url) };
+        this.requestPath = requestPath;
+        this.expectedStatus = (HttpStatusCode)expectedStatus;
     }
 
     public async Task Warmup(int requests)
     {
         for (int i = 0; i < requests; i++)
         {
-            using (HttpResponseMessage response = await client.GetAsync("/"))
-                response.EnsureSuccessStatusCode();
+            using (HttpResponseMessage response = await client.GetAsync(requestPath))
+                if (response.StatusCode != expectedStatus)
+                    throw new InvalidOperationException("Unexpected HTTP status: " + response.StatusCode);
         }
     }
 
@@ -49,9 +57,9 @@ public sealed class StaticBenchClient : IDisposable
             int index = Interlocked.Increment(ref counter.Value) - 1;
             if (index >= count) return;
             long started = Stopwatch.GetTimestamp();
-            using (HttpResponseMessage response = await client.GetAsync("/", HttpCompletionOption.ResponseContentRead))
+            using (HttpResponseMessage response = await client.GetAsync(requestPath, HttpCompletionOption.ResponseContentRead))
             {
-                if (response.StatusCode != HttpStatusCode.OK)
+                if (response.StatusCode != expectedStatus)
                     throw new InvalidOperationException("Unexpected HTTP status: " + response.StatusCode);
             }
             milliseconds[index] = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -90,7 +98,7 @@ function Get-Median($Values) {
     return $sorted[[Math]::Floor($sorted.Count / 2)]
 }
 
-$executable = (Resolve-Path -LiteralPath '.\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe').Path
+$executable = (Resolve-Path -LiteralPath $Executable).Path
 $logicalProcessors = [Environment]::ProcessorCount
 $results = @()
 
@@ -112,7 +120,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         }
         if (-not $ready) { throw 'Server did not become ready' }
 
-        $client = [StaticBenchClient]::new('http://127.0.0.1:8080', $Concurrency)
+        $client = [StaticBenchClient]::new('http://127.0.0.1:8080', $RequestPath, $ExpectedStatus, $Concurrency)
         try {
             $null = $client.Warmup($WarmupRequests).GetAwaiter().GetResult()
             $serverProcess.Refresh()
@@ -161,8 +169,8 @@ $medianP99 = Get-Median $results.P99Ms
 $rpsRangePercent = (($results.Rps | Measure-Object -Maximum).Maximum - ($results.Rps | Measure-Object -Minimum).Minimum) / $medianRps * 100
 $p99RangePercent = (($results.P99Ms | Measure-Object -Maximum).Maximum - ($results.P99Ms | Measure-Object -Minimum).Minimum) / $medianP99 * 100
 
-Write-Output ("MEDIAN CONCURRENCY={0} REQUESTS={1} WALL_S={2:F3} RPS={3:F0} P50_MS={4:F3} P95_MS={5:F3} P99_MS={6:F3} CPU_S={7:F3} EFFECTIVE_CORES={8:F3} CPU_NORMALIZED_PERCENT={9:F1} CPU_US_PER_REQUEST={10:F3} WORKING_MIB={11:F1} PEAK_MIB={12:F1} RPS_RANGE_PERCENT={13:F1} P99_RANGE_PERCENT={14:F1}" -f
-    $Concurrency, $Requests, (Get-Median $results.WallSeconds), $medianRps,
+Write-Output ("MEDIAN PATH={0} EXPECTED_STATUS={1} CONCURRENCY={2} REQUESTS={3} WALL_S={4:F3} RPS={5:F0} P50_MS={6:F3} P95_MS={7:F3} P99_MS={8:F3} CPU_S={9:F3} EFFECTIVE_CORES={10:F3} CPU_NORMALIZED_PERCENT={11:F1} CPU_US_PER_REQUEST={12:F3} WORKING_MIB={13:F1} PEAK_MIB={14:F1} RPS_RANGE_PERCENT={15:F1} P99_RANGE_PERCENT={16:F1}" -f
+    $RequestPath, $ExpectedStatus, $Concurrency, $Requests, (Get-Median $results.WallSeconds), $medianRps,
     (Get-Median $results.P50Ms), (Get-Median $results.P95Ms),
     $medianP99, (Get-Median $results.CpuSeconds),
     (Get-Median $results.EffectiveCores), (Get-Median $results.NormalizedCpuPercent),

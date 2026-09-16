@@ -13,6 +13,9 @@ paths, or rebuilds routing data.
 ```toml
 [server]
 listen = "127.0.0.1:8080"
+max_connections = 1024
+header_read_timeout = 30
+http1_max_buffer_size = 65536
 
 [[hosts]]
 name = "localhost"
@@ -50,7 +53,24 @@ max_worker_age = 3600
 HAMSTER_LARAVEL_PATH = "www/pms"
 ```
 
-`server.listen` must be a numeric IP socket address. Host names and aliases use
+`server.listen` must be a numeric IP socket address. `max_connections` bounds
+accepted connections owned by the process and defaults to 1024 (valid range
+1-65536). At the bound, Hamster stops accepting until a connection task exits;
+it does not create an application queue or reject an already accepted request.
+`header_read_timeout` is the maximum number of seconds to receive each complete
+HTTP/1 request head, including the wait for a next keep-alive request. It
+defaults to 30 and must be 1-3600. `http1_max_buffer_size` caps Hyper's adaptive
+per-connection HTTP/1 read/write buffer. It defaults to 65536 bytes and must be
+8192-1048576 bytes.
+
+These three limits bound connection tasks, slow/idle request heads and HTTP/1
+parser buffering. They do not constitute a total process-memory budget. PHP
+request bodies are still buffered separately up to the protocol's 1 MiB body
+limit, and a client may hold a body read after its head is complete. The header
+deadline deliberately stops before handler execution, so it cannot cancel a
+possibly-started application transaction.
+
+Host names and aliases use
 the router's restricted DNS-name grammar, do not include a port, and match
 requests exactly and ASCII case-insensitively. Handler names are case-sensitive;
 only `static`, `not_found`, and `php_worker` are supported. A static location
@@ -108,7 +128,7 @@ invalid explicit files never fall back to the built-in configuration.
 
 ## Validation Rules
 
-Configuration fails fast for an invalid listen address; empty or invalid host
+Configuration fails fast for an invalid listen address or HTTP bound; empty or invalid host
 names; case-insensitive primary/alias collisions; absent hosts or locations;
 invalid or duplicate normalized location paths; unknown handlers; missing or
 unexpected handler fields; multiple PHP worker locations; invalid pool bounds;

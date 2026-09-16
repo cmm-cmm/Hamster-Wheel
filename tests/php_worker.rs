@@ -73,9 +73,10 @@ impl TestServer {
             .local_addr()
             .expect("listener should have an address");
         let router = runtime.router_arc();
+        let http_limits = runtime.http_limits();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            server::serve_with_router(listener, router, async {
+            server::serve_with_router(listener, router, http_limits, async {
                 let _ = shutdown_rx.await;
             })
             .await

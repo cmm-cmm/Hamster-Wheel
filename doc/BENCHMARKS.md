@@ -1560,3 +1560,60 @@ Raw records, hashes, run ranges, observer failures and commands are in
 `benchmarks/results/persistent_cost_gate_2_20260916/`. Detailed interpretation
 is in `doc/research/PERSISTENT_WORKER_COST_GATE_2_RESULTS.md`. Gate 3 was not
 opened and no production architecture or protocol was changed.
+
+## 0.5.x Bounded HTTP/1 Admission
+
+Windows 11 Pro build 26200, Core i5-12400 (6 cores / 12 logical), 32 GiB,
+MSVC release builds. Baseline `11fd550` and the working-tree candidate used the
+same .NET client, Balanced power plan, concurrency 32 and 1,000 warm-up
+requests. Three fresh servers each handled 500,000 static `/` requests. Exact
+per-run values and binary hashes are in
+[`benchmarks/results/http_admission_0_5_20260916.md`](../benchmarks/results/http_admission_0_5_20260916.md).
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+./benchmarks/static_http.ps1 -Runs 3 -Requests 500000 -Concurrency 32 -WarmupRequests 1000
+```
+
+| Tree | median RPS | p50 | p95 | p99 | CPU us/request | working set |
+|---|---:|---:|---:|---:|---:|---:|
+| `11fd550` | 6,941 | 4.575 ms | 5.187 ms | 5.688 ms | 436.312 | 9.7 MiB |
+| bounded admission | 7,268 | 4.336 ms | 4.992 ms | 5.437 ms | 422.375 | 9.2 MiB |
+
+Baseline RPS ranged 6,811-7,170 (5.2%); candidate ranged 7,218-7,371
+(2.1%). The candidate's 4.7% higher median is not attributed to the change:
+this fully buffered static path is filesystem-dominated and the A/B runs were
+sequential. This evidence rejects a material static-path regression but cannot
+resolve a small HTTP-core cost.
+
+The same binaries therefore ran the built-in `/api` not-found route, whose
+small in-memory 404 response removes filesystem work. The driver now accepts a
+request path, expected status and executable so this control is reproducible.
+Seven fresh servers per tree each handled 500,000 measured requests after
+20,000 warm-up requests:
+
+```powershell
+./benchmarks/static_http.ps1 -Runs 7 -Requests 500000 -Concurrency 32 `
+  -WarmupRequests 20000 -RequestPath /api -ExpectedStatus 404 `
+  -Executable <release-binary>
+```
+
+| Tree | median RPS | p50 | p95 | p99 | CPU us/request | working set |
+|---|---:|---:|---:|---:|---:|---:|
+| `11fd550` | 140,432 | 0.211 ms | 0.352 ms | 0.680 ms | 28.438 | 7.7 MiB |
+| bounded admission | 137,773 | 0.214 ms | 0.358 ms | 0.685 ms | 29.656 | 7.7 MiB |
+
+Baseline RPS ranged 139,022-141,544 (1.8%); candidate ranged
+134,399-139,626 (3.8%). The candidate used 1.218 additional CPU
+microseconds/request (+4.3%) and served 1.9% fewer requests/second at the
+median. This is a real measurable cost on an intentionally trivial response,
+not a general 4.3% application regression. The locked Hyper 1.11.1 path boxes
+a Tokio sleep future for each request head and discards it after parsing; that
+is the most plausible source, but no allocation profile was taken, so the
+attribution remains an inference.
+
+The cost buys a total deadline for every request head and idle keep-alive
+period. Replacing it with a service-wide timeout would be incorrect because it
+could cancel a possibly-started backend transaction. A custom shared timer or
+I/O wrapper was not introduced without evidence that roughly 1.2 us/request on
+the smallest response justifies new synchronization and lifecycle risk.

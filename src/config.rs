@@ -24,6 +24,13 @@ pub const SERVER_NAME: &str = concat!("HamsterWheel/", env!("CARGO_PKG_VERSION")
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_DOCUMENT_ROOT: &str = "public";
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+const MAX_CONNECTIONS: usize = 65_536;
+const DEFAULT_HEADER_READ_TIMEOUT_SECONDS: u64 = 30;
+const MAX_HEADER_READ_TIMEOUT_SECONDS: u64 = 3_600;
+const MIN_HTTP1_MAX_BUFFER_SIZE: usize = 8 * 1_024;
+const DEFAULT_HTTP1_MAX_BUFFER_SIZE: usize = 64 * 1_024;
+const MAX_HTTP1_MAX_BUFFER_SIZE: usize = 1024 * 1_024;
 
 #[cfg(feature = "profiling")]
 pub fn profiling_document_root() -> PathBuf {
@@ -41,6 +48,24 @@ pub struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawServer {
     listen: String,
+    #[serde(default = "default_max_connections")]
+    max_connections: usize,
+    #[serde(default = "default_header_read_timeout")]
+    header_read_timeout: u64,
+    #[serde(default = "default_http1_max_buffer_size")]
+    http1_max_buffer_size: usize,
+}
+
+const fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
+}
+
+const fn default_header_read_timeout() -> u64 {
+    DEFAULT_HEADER_READ_TIMEOUT_SECONDS
+}
+
+const fn default_http1_max_buffer_size() -> usize {
+    DEFAULT_HTTP1_MAX_BUFFER_SIZE
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,8 +109,53 @@ const fn default_php_workers() -> usize {
 
 pub struct RuntimeConfig {
     listen: SocketAddr,
+    http_limits: HttpLimits,
     router: Arc<HostRouter>,
     php_pools: Vec<Arc<PhpWorkerPool>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpLimits {
+    max_connections: usize,
+    header_read_timeout: Duration,
+    http1_max_buffer_size: usize,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            header_read_timeout: Duration::from_secs(DEFAULT_HEADER_READ_TIMEOUT_SECONDS),
+            http1_max_buffer_size: DEFAULT_HTTP1_MAX_BUFFER_SIZE,
+        }
+    }
+}
+
+impl HttpLimits {
+    pub const fn max_connections(self) -> usize {
+        self.max_connections
+    }
+
+    pub const fn header_read_timeout(self) -> Duration {
+        self.header_read_timeout
+    }
+
+    pub const fn http1_max_buffer_size(self) -> usize {
+        self.http1_max_buffer_size
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        max_connections: usize,
+        header_read_timeout: Duration,
+        http1_max_buffer_size: usize,
+    ) -> Self {
+        Self {
+            max_connections,
+            header_read_timeout,
+            http1_max_buffer_size,
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -99,6 +169,10 @@ impl RuntimeConfig {
 
     pub fn router_arc(&self) -> Arc<HostRouter> {
         Arc::clone(&self.router)
+    }
+
+    pub const fn http_limits(&self) -> HttpLimits {
+        self.http_limits
     }
 
     pub async fn start_workers(&self) -> Result<Vec<WorkerStart>, PhpWorkerError> {
@@ -240,6 +314,9 @@ fn builtin_raw_config() -> RawConfig {
     RawConfig {
         server: RawServer {
             listen: DEFAULT_LISTEN.to_owned(),
+            max_connections: default_max_connections(),
+            header_read_timeout: default_header_read_timeout(),
+            http1_max_buffer_size: default_http1_max_buffer_size(),
         },
         hosts: vec![RawHost {
             name: "localhost".to_owned(),
@@ -288,6 +365,7 @@ pub(crate) fn compile_raw(
 
 pub(crate) struct ValidatedConfig {
     listen: SocketAddr,
+    http_limits: HttpLimits,
     hosts: Vec<ValidatedHost>,
 }
 
@@ -334,6 +412,28 @@ pub(crate) fn validate_raw(
             raw.server.listen
         ))
     })?;
+    if !(1..=MAX_CONNECTIONS).contains(&raw.server.max_connections) {
+        return Err(ConfigError::Validation(format!(
+            "server.max_connections must be between 1 and {MAX_CONNECTIONS}"
+        )));
+    }
+    if !(1..=MAX_HEADER_READ_TIMEOUT_SECONDS).contains(&raw.server.header_read_timeout) {
+        return Err(ConfigError::Validation(format!(
+            "server.header_read_timeout must be between 1 and {MAX_HEADER_READ_TIMEOUT_SECONDS} seconds"
+        )));
+    }
+    if !(MIN_HTTP1_MAX_BUFFER_SIZE..=MAX_HTTP1_MAX_BUFFER_SIZE)
+        .contains(&raw.server.http1_max_buffer_size)
+    {
+        return Err(ConfigError::Validation(format!(
+            "server.http1_max_buffer_size must be between {MIN_HTTP1_MAX_BUFFER_SIZE} and {MAX_HTTP1_MAX_BUFFER_SIZE} bytes"
+        )));
+    }
+    let http_limits = HttpLimits {
+        max_connections: raw.server.max_connections,
+        header_read_timeout: Duration::from_secs(raw.server.header_read_timeout),
+        http1_max_buffer_size: raw.server.http1_max_buffer_size,
+    };
     if raw.hosts.is_empty() {
         return Err(ConfigError::Validation(
             "hosts must contain at least one virtual host".to_owned(),
@@ -521,7 +621,11 @@ pub(crate) fn validate_raw(
             locations,
         });
     }
-    Ok(ValidatedConfig { listen, hosts })
+    Ok(ValidatedConfig {
+        listen,
+        http_limits,
+        hosts,
+    })
 }
 
 fn resolve_path(base_directory: &Path, path: PathBuf) -> PathBuf {
@@ -660,6 +764,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         .map_err(|error| ConfigError::Compile(format!("host router: {error}")))?;
     Ok(RuntimeConfig {
         listen: validated.listen,
+        http_limits: validated.http_limits,
         router: Arc::new(router),
         php_pools,
     })
@@ -791,5 +896,45 @@ mod tests {
         let current = env::current_dir().unwrap();
         let runtime = compile_str(&minimal(&current), Path::new("unused")).unwrap();
         assert_eq!(runtime.listen_address(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(runtime.http_limits(), HttpLimits::default());
+    }
+
+    #[test]
+    fn compiles_explicit_http_limits() {
+        let current = env::current_dir().unwrap();
+        let source = minimal(&current).replace(
+            "listen = \"127.0.0.1:8080\"",
+            "listen = \"127.0.0.1:8080\"\nmax_connections = 77\nheader_read_timeout = 12\nhttp1_max_buffer_size = 32768",
+        );
+        let runtime = compile_str(&source, Path::new("unused")).unwrap();
+        let limits = runtime.http_limits();
+        assert_eq!(limits.max_connections(), 77);
+        assert_eq!(limits.header_read_timeout(), Duration::from_secs(12));
+        assert_eq!(limits.http1_max_buffer_size(), 32_768);
+    }
+
+    #[test]
+    fn rejects_http_limits_that_cannot_bound_the_server() {
+        let current = env::current_dir().unwrap();
+        for (field, value) in [
+            ("max_connections", "0"),
+            ("max_connections", "65537"),
+            ("header_read_timeout", "0"),
+            ("header_read_timeout", "3601"),
+            ("http1_max_buffer_size", "8191"),
+            ("http1_max_buffer_size", "1048577"),
+        ] {
+            let source = minimal(&current).replace(
+                "listen = \"127.0.0.1:8080\"",
+                &format!("listen = \"127.0.0.1:8080\"\n{field} = {value}"),
+            );
+            assert!(
+                matches!(
+                    compile_str(&source, Path::new("unused")),
+                    Err(ConfigError::Validation(_))
+                ),
+                "{field}={value} should be rejected"
+            );
+        }
     }
 }

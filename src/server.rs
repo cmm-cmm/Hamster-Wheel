@@ -1,11 +1,14 @@
 use std::{fmt, future::Future, io, sync::Arc};
 
 use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{
-    config::RuntimeConfig, php_worker::PhpWorkerError, router::HostRouter, transport::TransportInfo,
+    config::{HttpLimits, RuntimeConfig},
+    php_worker::PhpWorkerError,
+    router::HostRouter,
+    transport::TransportInfo,
 };
 
 #[derive(Debug)]
@@ -70,7 +73,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     println!("Hamster Wheel listening on http://{address}");
 
     let router = config.router_arc();
-    let serve_result = serve_with_router(listener, router, shutdown).await;
+    let serve_result = serve_with_router(listener, router, config.http_limits(), shutdown).await;
     let shutdown_result = config.shutdown_workers().await;
     serve_result?;
     shutdown_result?;
@@ -80,6 +83,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
 pub async fn serve_with_router<F>(
     listener: TcpListener,
     router: Arc<HostRouter>,
+    http_limits: HttpLimits,
     shutdown: F,
 ) -> io::Result<()>
 where
@@ -92,7 +96,7 @@ where
 
     loop {
         tokio::select! {
-            accept_result = listener.accept() => {
+            accept_result = listener.accept(), if connections.len() < http_limits.max_connections() => {
                 let (stream, peer_addr) = accept_result?;
                 let local_addr = match stream.local_addr() {
                     Ok(local_addr) => local_addr,
@@ -106,7 +110,7 @@ where
                 let router = Arc::clone(&router);
 
                 connections.spawn(async move {
-                    serve_connection(stream, transport, router, shutdown_rx).await;
+                    serve_connection(stream, transport, router, http_limits, shutdown_rx).await;
                 });
             }
             join_result = connections.join_next(), if !connections.is_empty() => {
@@ -135,18 +139,24 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     transport: TransportInfo,
     router: Arc<HostRouter>,
+    http_limits: HttpLimits,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let service = hyper::service::service_fn(move |request| {
         let router = Arc::clone(&router);
         async move { router.serve(request, transport).await }
     });
-    let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(http_limits.header_read_timeout())
+        .max_buf_size(http_limits.http1_max_buffer_size());
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
 
     tokio::select! {
         result = &mut connection => {
-            if let Err(error) = result {
+            if let Err(error) = result && should_report_connection_error(&error) {
                 eprintln!(
                     "failed to serve connection from {} to {}: {error}",
                     transport.peer_addr(),
@@ -157,7 +167,7 @@ async fn serve_connection(
         changed = shutdown.changed() => {
             if changed.is_ok() && *shutdown.borrow() {
                 connection.as_mut().graceful_shutdown();
-                if let Err(error) = connection.await {
+                if let Err(error) = connection.await && should_report_connection_error(&error) {
                     eprintln!(
                         "failed to gracefully close connection from {} to {}: {error}",
                         transport.peer_addr(),
@@ -167,6 +177,17 @@ async fn serve_connection(
             }
         }
     }
+}
+
+fn should_report_connection_error(error: &hyper::Error) -> bool {
+    // These are controlled by the remote peer and are expected admission
+    // outcomes. Synchronously logging every one would turn malformed traffic
+    // into a stderr backpressure path.
+    !(error.is_parse()
+        || error.is_timeout()
+        || error.is_incomplete_message()
+        || error.is_closed()
+        || error.is_canceled())
 }
 
 #[cfg(windows)]
@@ -206,6 +227,35 @@ mod tests {
             VirtualHost::new("127.0.0.1", locations).expect("valid host"),
         ])
         .expect("valid router")
+    }
+
+    async fn start_test_server(
+        http_limits: HttpLimits,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_router(
+            listener,
+            Arc::new(transport_router()),
+            http_limits,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        (listen_addr, shutdown_tx, server)
+    }
+
+    async fn connect(listen_addr: std::net::SocketAddr) -> TcpStream {
+        TcpStream::connect(listen_addr)
+            .await
+            .expect("connect client")
     }
 
     async fn read_response_body(stream: &mut TcpStream) -> String {
@@ -264,6 +314,7 @@ mod tests {
         let server = tokio::spawn(serve_with_router(
             listener,
             Arc::new(transport_router()),
+            HttpLimits::default(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -338,6 +389,161 @@ mod tests {
         while let Some(result) = clients.join_next().await {
             result.expect("join concurrent client");
         }
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn header_timeout_bounds_partial_and_idle_connections() {
+        let limits = HttpLimits::for_test(4, Duration::from_millis(200), 8 * 1_024);
+        let (listen_addr, shutdown_tx, server) = start_test_server(limits).await;
+
+        let mut partial = connect(listen_addr).await;
+        partial
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1")
+            .await
+            .expect("write partial header");
+        let mut byte = [0_u8; 1];
+        let count = tokio::time::timeout(Duration::from_secs(1), partial.read(&mut byte))
+            .await
+            .expect("partial header should time out")
+            .expect("read partial connection close");
+        assert_eq!(count, 0, "timed-out partial header must close");
+
+        let mut idle = connect(listen_addr).await;
+        idle.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write complete request");
+        let body = read_response_body(&mut idle).await;
+        assert!(body.starts_with("peer="));
+        let count = tokio::time::timeout(Duration::from_secs(1), idle.read(&mut byte))
+            .await
+            .expect("idle keep-alive should time out")
+            .expect("read idle connection close");
+        assert_eq!(count, 0, "timed-out keep-alive must close");
+
+        let mut healthy = connect(listen_addr).await;
+        healthy
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write recovery request");
+        assert!(read_response_body(&mut healthy).await.starts_with("peer="));
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn connection_limit_pauses_accept_and_shutdown_remains_bounded() {
+        // Hyper's graceful shutdown finishes a request head already being read;
+        // the header deadline, rather than cancellation of a possible service
+        // future, is what bounds this case.
+        let limits = HttpLimits::for_test(1, Duration::from_millis(250), 8 * 1_024);
+        let (listen_addr, shutdown_tx, server) = start_test_server(limits).await;
+
+        let mut first = connect(listen_addr).await;
+        first
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write first request");
+        assert!(read_response_body(&mut first).await.starts_with("peer="));
+        first
+            .write_all(b"GET / HTTP/1.1\r\n")
+            .await
+            .expect("write partial next request");
+
+        let mut queued = connect(listen_addr).await;
+        queued
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write queued request");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_response_body(&mut queued))
+                .await
+                .is_err(),
+            "a second connection must not be dispatched while the slot is owned"
+        );
+
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), read_response_body(&mut queued))
+                .await
+                .expect("queued connection should be admitted after a slot is released")
+                .starts_with("peer=")
+        );
+        queued
+            .write_all(b"GET / HTTP/1.1\r\n")
+            .await
+            .expect("write partial request before shutdown");
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("shutdown at the connection limit must be bounded")
+            .expect("join server")
+            .expect("server result");
+
+        let mut byte = [0_u8; 1];
+        let count = queued
+            .read(&mut byte)
+            .await
+            .expect("read graceful shutdown close");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn http1_buffer_limit_rejects_oversized_head_and_server_recovers() {
+        let limits = HttpLimits::for_test(4, Duration::from_secs(1), 8 * 1_024);
+        let (listen_addr, shutdown_tx, server) = start_test_server(limits).await;
+
+        let mut oversized = connect(listen_addr).await;
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Oversized: {}\r\n\r\n",
+            "x".repeat(9 * 1_024)
+        );
+        oversized
+            .write_all(request.as_bytes())
+            .await
+            .expect("write oversized request head");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), oversized.read_to_end(&mut response))
+            .await
+            .expect("oversized request should be closed")
+            .expect("read oversized response");
+        assert!(
+            response.starts_with(b"HTTP/1.1 431 "),
+            "oversized request should receive 431, got {:?}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let mut too_many = connect(listen_addr).await;
+        let mut request = String::from("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        for index in 0..100 {
+            request.push_str(&format!("X-{index}: x\r\n"));
+        }
+        request.push_str("\r\n");
+        too_many
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request with too many headers");
+        response.clear();
+        tokio::time::timeout(Duration::from_secs(1), too_many.read_to_end(&mut response))
+            .await
+            .expect("too many headers should close")
+            .expect("read too-many-headers response");
+        assert!(
+            response.starts_with(b"HTTP/1.1 431 "),
+            "the locked 100-header parser bound should return 431, got {:?}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let mut healthy = connect(listen_addr).await;
+        healthy
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write recovery request");
+        assert!(read_response_body(&mut healthy).await.starts_with("peer="));
 
         shutdown_tx.send(()).expect("signal shutdown");
         server.await.expect("join server").expect("server result");

@@ -5,7 +5,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use hamster_wheel::{config::SERVER_NAME, router::HostRouter, server};
+use hamster_wheel::{
+    config::{HttpLimits, SERVER_NAME},
+    router::HostRouter,
+    server,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -62,7 +66,7 @@ impl TestServer {
                 HostRouter::default_static(document_root)
                     .expect("test static router should compile"),
             );
-            server::serve_with_router(listener, router, async {
+            server::serve_with_router(listener, router, HttpLimits::default(), async {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -113,6 +117,9 @@ async fn serves_index_mime_and_head() {
     std::fs::write(root.path.join("assets/app.js"), b"export {};")
         .expect("nested fixture should be written");
     std::fs::write(root.path.join("style.css"), b"body{}").expect("CSS fixture should be written");
+    let large_body = "x".repeat(256 * 1_024);
+    std::fs::write(root.path.join("large.txt"), &large_body)
+        .expect("large fixture should be written");
     let server = TestServer::start(root.path.clone()).await;
 
     let index = server
@@ -137,6 +144,13 @@ async fn serves_index_mime_and_head() {
     assert!(nested.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(nested.contains("content-type: text/javascript; charset=utf-8\r\n"));
     assert!(nested.ends_with("\r\n\r\nexport {};"));
+
+    let large = server
+        .request("GET /large.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await;
+    assert!(large.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(large.contains("content-length: 262144\r\n"));
+    assert!(large.ends_with(&format!("\r\n\r\n{large_body}")));
 
     server.stop().await;
 }

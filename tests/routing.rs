@@ -4,6 +4,7 @@ use std::{
 };
 
 use hamster_wheel::{
+    config::HttpLimits,
     router::{Handler, HostRouter, LocationRouter, VirtualHost},
     server,
 };
@@ -31,7 +32,7 @@ impl TestServer {
             .expect("listener should have an address");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            server::serve_with_router(listener, Arc::new(router), async {
+            server::serve_with_router(listener, Arc::new(router), HttpLimits::default(), async {
                 let _ = shutdown_rx.await;
             })
             .await
