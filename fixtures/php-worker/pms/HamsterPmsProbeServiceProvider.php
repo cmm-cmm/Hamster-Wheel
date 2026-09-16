@@ -26,6 +26,11 @@ final class HamsterPmsProbeServiceProvider extends ServiceProvider
             throw new \RuntimeException('scratch PMS probe provider is disabled');
         }
 
+        // Gate 2 control: the same controller path without the `web`
+        // middleware group separates kernel/routing/controller work from
+        // cookie and file-session middleware. This provider is scratch-only.
+        Route::get('/__hamster/bare', [HamsterPmsProbeController::class, 'light']);
+
         Route::middleware('web')->group(function (): void {
             Route::get('/__hamster/auth-seed', [HamsterPmsProbeController::class, 'seed']);
             Route::get('/__hamster/auth-state', [HamsterPmsProbeController::class, 'authState'])

@@ -1,0 +1,21 @@
+IPC_CONFIG,trials=3,cpu_metric=GetProcessTimes,php=D:\03 Project_demo\HamsterWheel\php/8.5/php.exe,echo=D:\03 Project_demo\HamsterWheel\fixtures/php-worker/ipc_echo.php,timeline=D:\03 Project_demo\HamsterWheel\fixtures/php-worker/ipc_timeline.php
+IPC_TIMELINE_RUN,mode=pipe_blocking,run=1,rust_encode_us=0.800,rust_write_us=43.900,combined_transfer_wait_us=19.400,php_decode_us=5.500,php_handler_us=0.200,php_encode_us=2.100,php_write_us=2.100,rust_decode_us=0.400,total_p50_us=75.500,parent_cpu_us=65.104,child_cpu_us=13.021,combined_cpu_us=78.125
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=1,window=first,p50_us=176.500,p95_us=176.500,p99_us=176.500,min_us=176.500,max_us=176.500,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=1,window=2_10,p50_us=93.400,p95_us=98.300,p99_us=98.300,min_us=73.300,max_us=101.100,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=1,window=100_999,p50_us=74.600,p95_us=110.400,p99_us=168.100,min_us=33.100,max_us=431.300,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=1,window=1000_plus,p50_us=80.300,p95_us=126.300,p99_us=173.200,min_us=42.600,max_us=374.500,quantum_pct=0.000
+IPC_TIMELINE_RUN,mode=pipe_blocking,run=2,rust_encode_us=0.700,rust_write_us=52.100,combined_transfer_wait_us=26.100,php_decode_us=5.600,php_handler_us=0.200,php_encode_us=2.100,php_write_us=2.300,rust_decode_us=0.400,total_p50_us=88.600,parent_cpu_us=91.146,child_cpu_us=26.042,combined_cpu_us=117.188
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=2,window=first,p50_us=85.600,p95_us=85.600,p99_us=85.600,min_us=85.600,max_us=85.600,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=2,window=2_10,p50_us=83.000,p95_us=95.300,p99_us=95.300,min_us=69.400,max_us=97.800,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=2,window=100_999,p50_us=90.200,p95_us=126.800,p99_us=175.800,min_us=44.600,max_us=315.700,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=2,window=1000_plus,p50_us=86.800,p95_us=138.300,p99_us=230.300,min_us=54.000,max_us=242.900,quantum_pct=0.000
+IPC_TIMELINE_RUN,mode=pipe_blocking,run=3,rust_encode_us=0.700,rust_write_us=52.500,combined_transfer_wait_us=26.000,php_decode_us=4.700,php_handler_us=0.200,php_encode_us=1.600,php_write_us=1.600,rust_decode_us=0.300,total_p50_us=86.900,parent_cpu_us=104.167,child_cpu_us=26.042,combined_cpu_us=130.208
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=3,window=first,p50_us=95.300,p95_us=95.300,p99_us=95.300,min_us=95.300,max_us=95.300,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=3,window=2_10,p50_us=85.800,p95_us=87.900,p99_us=87.900,min_us=73.200,max_us=92.000,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=3,window=100_999,p50_us=86.900,p95_us=120.100,p99_us=184.000,min_us=25.500,max_us=306.800,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=pipe_blocking,run=3,window=1000_plus,p50_us=86.800,p95_us=151.400,p99_us=231.700,min_us=25.400,max_us=308.300,quantum_pct=0.000
+IPC_TIMELINE_MEDIAN,mode=pipe_blocking,run=median,rust_encode_us=0.700,rust_write_us=52.100,combined_transfer_wait_us=26.000,php_decode_us=5.500,php_handler_us=0.200,php_encode_us=2.100,php_write_us=2.100,rust_decode_us=0.400,total_p50_us=86.900,parent_cpu_us=91.146,child_cpu_us=26.042,combined_cpu_us=117.188
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=pipe_blocking,run=median,window=first,p50_us=95.300,p95_us=95.300,p99_us=95.300,min_us=95.300,max_us=95.300,quantum_pct=0.000
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=pipe_blocking,run=median,window=2_10,p50_us=85.800,p95_us=95.300,p99_us=95.300,min_us=73.200,max_us=97.800,quantum_pct=0.000
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=pipe_blocking,run=median,window=100_999,p50_us=86.900,p95_us=120.100,p99_us=175.800,min_us=33.100,max_us=315.700,quantum_pct=0.000
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=pipe_blocking,run=median,window=1000_plus,p50_us=86.800,p95_us=138.300,p99_us=230.300,min_us=42.600,max_us=308.300,quantum_pct=0.000

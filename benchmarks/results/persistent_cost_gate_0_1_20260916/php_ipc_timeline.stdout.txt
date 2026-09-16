@@ -1,0 +1,21 @@
+IPC_CONFIG,trials=3,cpu_metric=GetProcessTimes,php=D:\03 Project_demo\HamsterWheel\php/8.5/php.exe,echo=D:\03 Project_demo\HamsterWheel\fixtures/php-worker/ipc_echo.php,timeline=D:\03 Project_demo\HamsterWheel\fixtures/php-worker/ipc_timeline.php
+IPC_TIMELINE_RUN,mode=default,run=1,rust_encode_us=2.200,rust_write_us=48.000,combined_transfer_wait_us=14964.100,php_decode_us=19.300,php_handler_us=1.100,php_encode_us=8.500,php_write_us=13.000,rust_decode_us=2.000,total_p50_us=15071.200,parent_cpu_us=52.083,child_cpu_us=117.188,combined_cpu_us=169.271
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=1,window=first,p50_us=10431.100,p95_us=10431.100,p99_us=10431.100,min_us=10431.100,max_us=10431.100,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=1,window=2_10,p50_us=15068.100,p95_us=15294.800,p99_us=15294.800,min_us=14606.000,max_us=15415.100,quantum_pct=88.889
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=1,window=100_999,p50_us=15067.400,p95_us=15704.800,p99_us=16063.200,min_us=13987.200,max_us=16276.400,quantum_pct=96.778
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=1,window=1000_plus,p50_us=15080.200,p95_us=15683.200,p99_us=15934.800,min_us=14400.400,max_us=16103.700,quantum_pct=96.020
+IPC_TIMELINE_RUN,mode=default,run=2,rust_encode_us=2.400,rust_write_us=47.900,combined_transfer_wait_us=14974.600,php_decode_us=19.400,php_handler_us=1.100,php_encode_us=8.500,php_write_us=12.900,rust_decode_us=2.000,total_p50_us=15081.100,parent_cpu_us=104.167,child_cpu_us=156.250,combined_cpu_us=260.417
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=2,window=first,p50_us=12452.100,p95_us=12452.100,p99_us=12452.100,min_us=12452.100,max_us=12452.100,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=2,window=2_10,p50_us=15146.600,p95_us=15486.600,p99_us=15486.600,min_us=14588.900,max_us=15506.300,quantum_pct=88.889
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=2,window=100_999,p50_us=15085.200,p95_us=15689.800,p99_us=16058.400,min_us=13844.500,max_us=17302.200,quantum_pct=95.778
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=2,window=1000_plus,p50_us=15054.900,p95_us=15650.200,p99_us=15966.800,min_us=14424.800,max_us=16510.200,quantum_pct=98.507
+IPC_TIMELINE_RUN,mode=default,run=3,rust_encode_us=2.600,rust_write_us=48.400,combined_transfer_wait_us=14931.100,php_decode_us=19.900,php_handler_us=1.100,php_encode_us=8.600,php_write_us=13.100,rust_decode_us=2.000,total_p50_us=15038.100,parent_cpu_us=208.333,child_cpu_us=65.104,combined_cpu_us=273.438
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=3,window=first,p50_us=13652.100,p95_us=13652.100,p99_us=13652.100,min_us=13652.100,max_us=13652.100,quantum_pct=0.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=3,window=2_10,p50_us=15089.100,p95_us=15402.800,p99_us=15402.800,min_us=14737.600,max_us=15621.800,quantum_pct=100.000
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=3,window=100_999,p50_us=15038.300,p95_us=15696.800,p99_us=16232.300,min_us=102.100,max_us=27313.700,quantum_pct=95.222
+IPC_TIMELINE_RUN_DISTRIBUTION,mode=default,run=3,window=1000_plus,p50_us=15028.900,p95_us=15744.300,p99_us=16062.400,min_us=14220.000,max_us=16949.300,quantum_pct=94.030
+IPC_TIMELINE_MEDIAN,mode=default,run=median,rust_encode_us=2.400,rust_write_us=48.000,combined_transfer_wait_us=14964.100,php_decode_us=19.400,php_handler_us=1.100,php_encode_us=8.500,php_write_us=13.000,rust_decode_us=2.000,total_p50_us=15071.200,parent_cpu_us=104.167,child_cpu_us=117.188,combined_cpu_us=221.354
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=default,run=median,window=first,p50_us=12452.100,p95_us=12452.100,p99_us=12452.100,min_us=12452.100,max_us=12452.100,quantum_pct=0.000
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=default,run=median,window=2_10,p50_us=15089.100,p95_us=15402.800,p99_us=15402.800,min_us=14606.000,max_us=15506.300,quantum_pct=88.889
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=default,run=median,window=100_999,p50_us=15067.400,p95_us=15696.800,p99_us=16063.200,min_us=13844.500,max_us=17302.200,quantum_pct=95.778
+IPC_TIMELINE_MEDIAN_DISTRIBUTION,mode=default,run=median,window=1000_plus,p50_us=15054.900,p95_us=15683.200,p99_us=15966.800,min_us=14400.400,max_us=16510.200,quantum_pct=96.020

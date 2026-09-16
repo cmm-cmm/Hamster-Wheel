@@ -1,0 +1,2 @@
+   Compiling hamster-wheel v0.3.1 (D:\03 Project_demo\HamsterWheel)
+    Finished `release` profile [optimized] target(s) in 3.13s

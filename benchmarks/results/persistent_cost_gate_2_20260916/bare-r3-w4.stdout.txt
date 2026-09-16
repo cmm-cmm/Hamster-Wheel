@@ -1,0 +1,2 @@
+LARAVEL_RUN candidate=persistent workload=bare run=1 requests=40721 wall_s=10.004 rps=4070.3 p50_ms=3.894 p95_ms=4.560 p99_ms=4.891 server_cpu_us=227.92 php_cpu_us=892.51 server_ram_mib=8.6 php_ram_mib=221.5
+LARAVEL_MEDIAN candidate=persistent workload=bare runs=1 workers=4 concurrency=16 minimum_requests=5000 minimum_seconds=10.0 rps_min=4070.3 rps_median=4070.3 rps_max=4070.3 p50_ms=3.894 p95_ms=4.560 p99_ms=4.891 server_cpu_us=227.92 php_cpu_us=892.51 server_ram_mib=8.6 php_ram_mib=221.5

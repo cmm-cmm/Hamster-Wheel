@@ -1,0 +1,3 @@
+{"Path":"/__hamster/bare","Status":200,"HeaderLength":34,"ActualLength":34,"ContentType":"application/json","Sha256":"E6B50B6DDED1E7E44DF3B4B9CA8475E6F024B2A38E1CBD61F032029D72452945"}
+{"Path":"/__hamster/light","Status":200,"HeaderLength":34,"ActualLength":34,"ContentType":"application/json","Sha256":"E6B50B6DDED1E7E44DF3B4B9CA8475E6F024B2A38E1CBD61F032029D72452945"}
+{"Path":"/login","Status":200,"HeaderLength":19059,"ActualLength":19059,"ContentType":"text/html; charset=utf-8","Sha256":"5BDA9115B749C78C769840ABEAB97FC6CBCEBF8F86320DF1D7F710A028CEEF4F"}

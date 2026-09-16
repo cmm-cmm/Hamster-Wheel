@@ -1,0 +1,2 @@
+    Finished `bench` profile [optimized] target(s) in 0.06s
+     Running benches\php_ipc.rs (target\x86_64-pc-windows-msvc\release\deps\php_ipc-5e8b6a64ec075a44.exe)

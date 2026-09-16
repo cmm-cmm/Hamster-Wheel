@@ -1,0 +1,19 @@
+2026-09-16 Windows ignored-integration companion checks
+
+one_worker_enforces_laravel_octane_ownership_contract: PASS (0.52s)
+pms_w1_isolates_auth_and_retires_after_cleanup_failure: PASS (1.32s)
+laravel_octane_adapter_stages_response_until_cleanup_commit: PASS (0.04s)
+possibly_started_request_is_never_retried: PASS (0.09s)
+worker_protocol_failure_respawns_without_retry: PASS (0.09s)
+all_0_2_cancellation_invariants_remain_unchanged: PASS (0.17s)
+no_orphan_php_processes: PASS (0.31s)
+
+Each test was run individually with:
+
+  cargo test --test php_worker <name> -- --ignored --exact --nocapture
+
+HAMSTER_LARAVEL_TEST_PATH pointed to the prepared Gate 0 PMS scratch and
+HAMSTER_LARAVEL_TEST_PHP_INI pointed to that scratch's php.ini for the Laravel
+tests. After the test batch, Get-Process reported zero hamster-wheel processes
+and the process table contained zero php.exe command lines referencing Hamster
+worker fixtures.

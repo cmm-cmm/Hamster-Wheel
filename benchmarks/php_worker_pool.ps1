@@ -6,7 +6,8 @@ param(
     [int[]]$WorkerCounts = @(1, 2, 4, 8),
     [int[]]$Concurrencies = @(1, 2, 4, 8, 16, 32),
     [ValidateSet('all', 'hello', 'json')]
-    [string]$Workload = 'all'
+    [string]$Workload = 'all',
+    [string]$OutputPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +47,19 @@ public sealed class PoolBenchClient : IDisposable
         using (HttpResponseMessage response = await client.GetAsync(path, HttpCompletionOption.ResponseContentRead))
         {
             response.EnsureSuccessStatusCode();
+            long expectedLength = path == "/hello" ? 14 : path == "/json" ? 28 : -1;
+            if (!response.Content.Headers.ContentLength.HasValue || response.Content.Headers.ContentLength.Value <= 0)
+                throw new InvalidOperationException("missing or empty content-length for " + path);
+            if (expectedLength >= 0 && response.Content.Headers.ContentLength.Value != expectedLength)
+                throw new InvalidOperationException("unexpected content-length for " + path);
         }
+    }
+
+    public async Task<double> Probe(string path)
+    {
+        long started = Stopwatch.GetTimestamp();
+        await Request(path);
+        return Stopwatch.GetElapsedTime(started).TotalMilliseconds;
     }
 
     public async Task RunWarmup(string path, int requests)
@@ -127,6 +140,10 @@ function Get-PhpChildren([int]$ParentId) {
     return @($ids | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
 }
 
+function Get-SystemCommittedBytes {
+    return [double](Get-CimInstance Win32_PerfRawData_PerfOS_Memory).CommittedBytes
+}
+
 function Stop-ProcessSet($Processes) {
     foreach ($process in @($Processes)) {
         if ($null -eq $process) { continue }
@@ -146,6 +163,8 @@ $workloads = if ($Workload -eq 'all') {
 } else {
     @([PSCustomObject]@{ Name = $Workload; Path = "/$Workload" })
 }
+
+$allMeasurements = @()
 
 foreach ($workers in $WorkerCounts) {
     if ($workers -notin 1, 2, 4, 8) { throw "Unsupported worker count $workers; expected 1, 2, 4, or 8" }
@@ -175,6 +194,8 @@ workers = $workers
 queue_capacity = 128
 "@
                 Set-Content -LiteralPath $configPath -Value $config -Encoding UTF8
+                $systemCommitBefore = Get-SystemCommittedBytes
+                $startup = [Diagnostics.Stopwatch]::StartNew()
                 $server = Start-Process -FilePath $executable -ArgumentList @('--config', $configPath) -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
                 $phpProcesses = @()
                 $client = $null
@@ -201,9 +222,12 @@ queue_capacity = 128
                     if ($phpProcesses.Count -ne $workers) {
                         throw "Expected $workers PHP children, found $($phpProcesses.Count)"
                     }
+                    $startup.Stop()
 
                     $client = [PoolBenchClient]::new($concurrency)
+                    $firstResponseMs = $client.Probe($case.Path).GetAwaiter().GetResult()
                     $null = $client.RunWarmup($case.Path, $WarmupRequests).GetAwaiter().GetResult()
+                    $systemCommitWarm = Get-SystemCommittedBytes
                     $server.Refresh()
                     foreach ($php in $phpProcesses) { $php.Refresh() }
                     $serverCpuBefore = $server.TotalProcessorTime.TotalSeconds
@@ -211,6 +235,7 @@ queue_capacity = 128
                     $result = $client.Run($case.Path, $Requests, $concurrency, $MinimumSeconds).GetAwaiter().GetResult()
                     $server.Refresh()
                     foreach ($php in $phpProcesses) { $php.Refresh() }
+                    $systemCommitAfter = Get-SystemCommittedBytes
                     $serverCpu = $server.TotalProcessorTime.TotalSeconds - $serverCpuBefore
                     $phpCpuAfter = ($phpProcesses | ForEach-Object { $_.TotalProcessorTime.TotalSeconds } | Measure-Object -Sum).Sum
                     $phpCpu = $phpCpuAfter - $phpCpuBefore
@@ -226,8 +251,27 @@ queue_capacity = 128
                         CombinedCpuUs = ($serverCpu + $phpCpu) * 1000000 / $result.Requests
                         ServerRamMiB = $server.WorkingSet64 / 1MB
                         PhpRamMiB = ($phpProcesses | Measure-Object WorkingSet64 -Sum).Sum / 1MB
+                        ServerPrivateMiB = $server.PrivateMemorySize64 / 1MB
+                        PhpPrivateMiB = ($phpProcesses | Measure-Object PrivateMemorySize64 -Sum).Sum / 1MB
+                        ServerPeakWorkingMiB = $server.PeakWorkingSet64 / 1MB
+                        PhpPeakWorkingMiB = ($phpProcesses | Measure-Object PeakWorkingSet64 -Sum).Sum / 1MB
+                        ServerHandles = $server.HandleCount
+                        PhpHandles = ($phpProcesses | Measure-Object HandleCount -Sum).Sum
+                        ServerThreads = $server.Threads.Count
+                        PhpThreads = ($phpProcesses | ForEach-Object { $_.Threads.Count } | Measure-Object -Sum).Sum
+                        SystemCommitWarmDeltaMiB = ($systemCommitWarm - $systemCommitBefore) / 1MB
+                        SystemCommitAfterDeltaMiB = ($systemCommitAfter - $systemCommitBefore) / 1MB
+                        StartupMs = $startup.Elapsed.TotalMilliseconds
+                        FirstResponseMs = $firstResponseMs
                     }
                     $measurements += $measurement
+                    $allMeasurements += [PSCustomObject]@{
+                        Workload = $case.Name
+                        Workers = $workers
+                        Concurrency = $concurrency
+                        Run = $run
+                        Measurement = $measurement
+                    }
                     Write-Output ("PHP_POOL_RUN workload={0} workers={1} concurrency={2} run={3} requests={4} wall_s={5:F3} rps={6:F0} p50_ms={7:F3} p95_ms={8:F3} p99_ms={9:F3} server_cpu_us={10:F3} php_cpu_us={11:F3} combined_cpu_us={12:F3} server_ram_mib={13:F1} php_ram_mib={14:F1} pids={15}" -f
                         $case.Name, $workers, $concurrency, $run, $measurement.Requests,
                         $measurement.WallSeconds, $measurement.Rps,
@@ -257,4 +301,23 @@ queue_capacity = 128
                 (Get-Median $measurements.PhpRamMiB))
         }
     }
+}
+
+if ($OutputPath -ne '') {
+    $metadata = [PSCustomObject]@{
+        Timestamp = [DateTimeOffset]::Now.ToString('o')
+        Platform = [Environment]::OSVersion.VersionString
+        ProcessorCount = [Environment]::ProcessorCount
+        Php = (& '.\php\8.5\php.exe' -v | Select-Object -First 1)
+        Runs = $Runs
+        MinimumRequests = $Requests
+        WarmupRequests = $WarmupRequests
+        MinimumSeconds = $MinimumSeconds
+        WorkerCounts = $WorkerCounts
+        Concurrencies = $Concurrencies
+        ResponseValidation = 'status, complete body via ResponseContentRead, exact Content-Length'
+        ContextSwitches = 'unavailable: stable per-PID cumulative Windows counter not exposed by the existing harness'
+        Measurements = $allMeasurements
+    }
+    $metadata | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
 }

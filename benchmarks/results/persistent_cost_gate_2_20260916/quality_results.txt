@@ -1,0 +1,19 @@
+Gate 2 quality and reliability checks, 2026-09-16
+
+PASS  cargo fmt --all -- --check
+PASS  cargo clippy --all-targets --all-features -- -D warnings
+PASS  cargo bench --no-run --features profiling
+      Linked all library, binary and six profiling bench executables.
+PASS  cargo test
+      60 non-ignored tests passed; 55 environment/process tests remained ignored.
+PASS  cargo test --test php_worker one_worker_enforces_laravel_octane_ownership_contract -- --ignored --nocapture
+      1 passed in 0.50 s.
+PASS  cargo test --test php_worker pms_w1_isolates_auth_and_retires_after_cleanup_failure -- --ignored --nocapture
+      1 passed in 1.30 s; the injected cleanup failure retired generation 1 and generation 2 recovered.
+PASS  PowerShell parser for the Gate 2 generator, benchmark, summarizer and response validator.
+PASS  PHP syntax for the profiler, scratch probe provider and generated no-I/O worker.
+PASS  git diff --check (line-ending conversion warnings only).
+PASS  post-run process check: zero hamster-wheel processes and zero PHP processes whose command line referenced the Hamster fixtures or PMS scratch.
+
+Windows x86_64 MSVC was exercised. Linux was not run or newly qualified by Gate 2.
+

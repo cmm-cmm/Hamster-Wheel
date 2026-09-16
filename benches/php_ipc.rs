@@ -17,7 +17,8 @@ use tokio::{
 };
 
 const TRIALS: usize = 3;
-const SUITES: &str = "all, raw, variants, blocking, sync, stderr, timeline, timeline_blocking";
+const SUITES: &str =
+    "all, raw, raw_blocking, variants, blocking, sync, stderr, timeline, timeline_blocking";
 const ECHO_CHILD_FLAG: &str = "--rust-echo-child";
 const STDERR_FLOOD_MODE: &str = "stderr_flood";
 /// Bytes the flood child writes to stderr before echoing. Far above the 64 KiB
@@ -68,6 +69,7 @@ async fn main() -> io::Result<()> {
             timeline_suite(&paths, "pipe_blocking").await?;
         }
         "raw" => raw_payload_suite(&paths).await?,
+        "raw_blocking" => blocking_payload_suite(&paths).await?,
         "stderr" => stderr_drain_suite().await?,
         "variants" => framing_and_buffering_suite(&paths).await?,
         "blocking" => blocking_pipe_suite(&paths).await?,
@@ -414,6 +416,22 @@ async fn raw_payload_suite(paths: &FixturePaths) -> io::Result<()> {
             ParentWriteMode::Split,
             payload_size,
             iterations,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn blocking_payload_suite(paths: &FixturePaths) -> io::Result<()> {
+    for payload_size in RAW_SIZES {
+        run_async_raw_case(
+            PeerKind::Php {
+                paths,
+                mode: "pipe_blocking",
+            },
+            ParentWriteMode::Split,
+            payload_size,
+            raw_iterations(payload_size),
         )
         .await?;
     }

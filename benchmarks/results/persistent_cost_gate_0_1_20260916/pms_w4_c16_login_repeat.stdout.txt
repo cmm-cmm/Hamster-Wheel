@@ -1,0 +1,4 @@
+LARAVEL_RUN candidate=persistent workload=login run=1 requests=11211 wall_s=10.013 rps=1119.7 p50_ms=13.037 p95_ms=24.621 p99_ms=30.831 server_cpu_us=248.08 php_cpu_us=2705.21 server_ram_mib=9.0 php_ram_mib=236.3
+LARAVEL_RUN candidate=persistent workload=login run=2 requests=11483 wall_s=10.013 rps=1146.8 p50_ms=12.950 p95_ms=21.993 p99_ms=29.058 server_cpu_us=276.22 php_cpu_us=2642.49 server_ram_mib=9.3 php_ram_mib=236.3
+LARAVEL_RUN candidate=persistent workload=login run=3 requests=11161 wall_s=10.016 rps=1114.3 p50_ms=13.065 p95_ms=24.512 p99_ms=30.947 server_cpu_us=349.99 php_cpu_us=2592.73 server_ram_mib=9.2 php_ram_mib=236.5
+LARAVEL_MEDIAN candidate=persistent workload=login runs=3 workers=4 concurrency=16 minimum_requests=5000 minimum_seconds=10.0 rps_min=1114.3 rps_median=1119.7 rps_max=1146.8 p50_ms=13.037 p95_ms=24.512 p99_ms=30.831 server_cpu_us=276.22 php_cpu_us=2642.49 server_ram_mib=9.2 php_ram_mib=236.3

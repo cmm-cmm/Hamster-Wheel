@@ -1451,3 +1451,112 @@ lock, syscall or proxy-header parsing. A design using request `Extensions` was
 not benchmarked because inspecting `http` 1.5.0 showed that the first insertion
 would allocate its lazy type map on every request; it was rejected before
 implementation.
+
+## External Research Evidence — FrankenPHP PMS Worker Mode
+
+This is an additive research record, not a Hamster release benchmark or a
+cross-server ranking. The canonical consolidated report is
+[`doc/FRANKENPHP_BENCHMARK.md`](FRANKENPHP_BENCHMARK.md); independent analysis
+is in
+[`doc/research/FRANKENPHP_PMS_EVIDENCE.md`](research/FRANKENPHP_PMS_EVIDENCE.md).
+
+On the same Windows 11 / 12-logical-CPU machine, FrankenPHP 1.12.7 with PHP
+8.5.10 ZTS served PMS with 12 Laravel Octane workers. The consolidated evidence
+covers `/login` plus four authenticated database-backed routes at C1/C5/C20,
+and retains the first-round `/login` C1/C10/C50 ceiling probe. No replicated
+raw sample file was supplied.
+
+At C1, worker mode reduced observed latency by an absolute 23.1-58.8 ms/request
+across the five routes. The resulting worker/classic ratio ranged from 11.0x on
+`/login` to 1.3x on the expense report. This isolates persistent versus repeated
+Laravel bootstrap inside the same FrankenPHP process; it does not isolate
+in-process versus subprocess placement. Laravel caches raised the observed
+classic C50 result from 366 to 577 RPS while the worker result remained 2,663
+versus 2,643 RPS. Tuning therefore changes the fresh-bootstrap baseline but
+does not turn its speedup ratio into native-runtime evidence.
+
+Coarse `/login` normalization gives FrankenPHP about 223.5 RPS/worker at C20
+and 243.8 at C50, versus Hamster's 232.8 at W4/C16. The available FrankenPHP
+cells therefore straddle Hamster rather than show a stable placement advantage.
+This remains an invalid product comparison because PMS commits, PHP ZTS/NTS
+builds, application cache/environment settings, compression, concurrency and
+session/cache configuration differ. It does show that total RPS, which mostly
+scales with worker count, cannot justify a native embedding rewrite.
+
+The heavy expense-report worker cell plateaus around 15.4-15.7 RPS from C5 to
+C20 while latency grows sharply. That is evidence of application/backend
+saturation, not server-runtime cost. First-request versus warm observations
+also differ by as much as 65x, but the largest gaps could not be isolated from
+shared Redis/application cache state. Cold behavior, warm steady state and
+database saturation must therefore remain separate measurements.
+
+No CPU breakdown, comparable private-memory accounting, replicated runs,
+multi-user lifecycle qualification, recycle, crash/recovery, cleanup-failure
+or long memory soak was recorded. The reported 317 MB covers one process
+containing Caddy, Go, classic PHP capacity and 12 persistent workers, so it
+cannot be compared with summed multi-process working sets.
+
+## Persistent Worker Cost Gate 0–1
+
+Windows 11 build 26200, Core i5-12400, 32 GiB, Balanced power plan. Release
+MSVC Hamster at `fc75f705`, PHP 8.5.10 NTS, PMS `552e2752`, Laravel 12.66.0
+and Octane 2.19.1. Each accepted cell used three fresh servers and at least ten
+measured seconds. Raw evidence and rejected runs are under
+[`benchmarks/results/persistent_cost_gate_0_1_20260916/`](../benchmarks/results/persistent_cost_gate_0_1_20260916/);
+analysis is in
+[`doc/research/PERSISTENT_WORKER_COST_GATE_0_1_RESULTS.md`](research/PERSISTENT_WORKER_COST_GATE_0_1_RESULTS.md).
+
+Production-format blocking IPC measured 86.9 us P50. Its production blocking
+payload curve was 68.6 us P50 at 16 KiB, 104.5 us at 64 KiB and 950.9 us at
+1 MiB, with no Windows timer-quantum samples. The default PHP negative control
+still reproduced the known 15.071 ms timer-quantum failure.
+
+| Workload | W/C | median RPS | P50 | Rust CPU/request | PHP CPU/request | private/working set |
+|---|---:|---:|---:|---:|---:|---:|
+| trivial JSON | 1/1 | 5,394 | .173 ms | 161.9 us | 28.4 us | 9.6/24.0 MiB |
+| trivial JSON | 4/16 | 27,134 | .542 ms | 200.1 us | 29.4 us | 36.4/76.0 MiB |
+| PMS light | 1/1 | 465 | 2.048 ms | 275.0 us | 1,815.6 us | 26.3/70.1 MiB |
+| PMS login | 1/1 | 365 | 2.618 ms | 321.9 us | 2,343.8 us | 28.5/73.2 MiB |
+| PMS light, isolated sessions | 4/16 | 1,361 | 11.560 ms | 318.1 us | 2,519.7 us | 102.0/235.6 MiB |
+| PMS login, isolated sessions | 4/16 | 1,095 | 14.016 ms | 332.1 us | 3,266.4 us | 110.7/245.3 MiB |
+
+The comparable W1 trivial JSON interval is .185 ms, versus 2.151 ms for the
+minimal Laravel controller. The 1.965 ms difference is a combined framework,
+middleware and Octane-lifecycle budget; Gate 1 cannot attribute it further.
+Process-private memory scaled approximately linearly from W1 to W4. System
+commit was rejected as a metric because unrelated workstation activity moved
+it from -576 MiB to +1,037 MiB while process-tree private bytes stayed stable.
+
+An initial W4 harness shared one CookieContainer across all lanes and therefore
+measured one concurrent Laravel session. It is retained only as diagnostic raw
+evidence. Accepted W4 cells use an independent client and cookie jar per lane.
+One externally contaminated shared-session run and the full repeat are also
+preserved rather than silently discarded.
+
+## 2026-09-16 — Persistent worker cost Gate 2
+
+Gate 2 used a generated, measurement-only Laravel worker behind the existing
+`profiling` feature build. It sampled PHP lifecycle boundaries at 1/64 and
+dumped buffered records only after throughput and CPU counters were captured.
+The accepted observer changed median throughput by -1.5% at W1 and -2.4% at
+W4, both below the 3% band and normal run spread. Earlier designs that wrote
+profile batches during the timed window slowed W4 by 6.7-7.8% and are retained
+as rejected evidence.
+
+On the PMS light route, PHP P50 decomposed to 1.224 ms Laravel
+kernel/middleware/controller, 0.536 ms Octane lifecycle and 0.085 ms direct
+Hamster PHP adapter at W1/C1. At W4/C16 these became 1.515 ms, 0.670 ms and
+0.099 ms. PHP CPU/request rose from a 2.209 ms median to 2.690 ms; Rust rose
+only from 0.253 ms to 0.271 ms.
+
+A scratch-only controller without the `web` middleware group measured
+0.779 ms PHP P50 at W1 and 0.866 ms at W4, while scaling from 998 to 3,977 RPS
+(approximately 3.98x). The session-bearing light route scaled about 3.40x.
+This locates most multi-worker efficiency loss in the PHP `web` middleware
+workload, not Hamster pool/IPC, but does not isolate file sessions from the
+rest of the middleware group.
+
+Raw records, hashes, run ranges, observer failures and commands are in
+`benchmarks/results/persistent_cost_gate_2_20260916/`. Detailed interpretation
+is in `doc/research/PERSISTENT_WORKER_COST_GATE_2_RESULTS.md`. Gate 3 was not
+opened and no production architecture or protocol was changed.
