@@ -2,6 +2,8 @@
 listen = "127.0.0.1:8080"
 max_connections = 1024
 header_read_timeout = 30
+body_read_timeout = 30
+max_body_memory = 67108864
 http1_max_buffer_size = 65536
 
 [[hosts]]
