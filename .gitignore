@@ -9,3 +9,10 @@
 !.env.example
 Thumbs.db
 Desktop.ini
+
+# Claude Code local state: personal settings, permission caches, local agents,
+# commands and the project instruction file. These stay on disk for the tool to
+# read; the repository conventions live in AGENTS.md and doc/.
+/.claude/
+/CLAUDE.md
+CLAUDE.local.md
