@@ -23,6 +23,10 @@ executable = "php/8.5/php.exe"
 script = "fixtures/php-worker/worker.php"
 workers = 4
 queue_capacity = 32
+# Ceiling on one application transaction, in seconds (1-3600, default 5).
+# Exceeding it kills and replaces the worker, so set it from the application's
+# own p99 plus headroom; see doc/CONFIGURATION.md.
+request_timeout = 5
 
 [[hosts.locations]]
 path = "/"

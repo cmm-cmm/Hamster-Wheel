@@ -47,6 +47,8 @@ executable = "php/8.5/php.exe"
 script = "fixtures/php-worker/worker.php"
 workers = 4
 queue_capacity = 32
+# Ceiling on one application transaction, in seconds. Defaults to 5.
+request_timeout = 30
 # Optional lifecycle policies; omitted means OFF.
 max_requests = 10000
 max_worker_age = 3600
@@ -81,6 +83,50 @@ defaults to 30 and must be 1-3600. The timer is lazy: it starts only when the
 underlying TCP write returns `Pending`, is cleared by a positive socket write,
 and does not run during request reads, keep-alive idle time, or application/PHP
 execution. It is an inactivity interval, not a total response deadline.
+
+`request_timeout` is the maximum number of seconds one application
+transaction may take, measured from the REQUEST frame write through the
+RESPONSE frame read. It is configured per `php_worker` location, defaults to 5
+and must be between 1 and 3600.
+
+The default is a compatibility choice, not a recommendation. Five seconds is
+what the value was hard-coded to before it became configurable; nothing
+establishes it as a universal or recommended optimum. Set it from the
+application's own observed request latency plus headroom: measure the routes
+this location actually serves, take a high percentile rather than an average,
+and leave room for a cold cache and a slow dependency. A value below the
+application's real p99 converts ordinary slow requests into killed workers and
+`502`s.
+
+Exceeding it is not an ordinary request failure. Protocol v1 has no cancel
+frame, so the only way to reclaim a worker that is still mid-transaction is to
+kill it; the request is answered `502` with the body
+`PHP Worker Execution Timeout`, the child is killed and reaped, and a
+replacement is started immediately. The request is never dispatched again,
+because a deadline that expires says nothing about how far PHP already got.
+
+Because exceeding it costs a worker, the value also bounds a slot's worst-case
+respawn rate at `1 / (request_timeout + bootstrap)`. That relationship was
+measured and holds exactly. The practical consequence is that a slot spends
+`bootstrap / (request_timeout + bootstrap)` of its time bootstrapping while
+every request is timing out, so **set `request_timeout` to at least ten times
+the application's bootstrap time** to keep that under 10%. This repository has
+measured 58 ms median and 403 ms worst bootstrap for real Laravel
+applications. The 1-second floor exists for the same reason, and because the
+deadline also covers Hamster's own protocol I/O: the worst legal payload, a
+1 MiB body echoed back, round-trips in 18.1 ms, so one second still leaves the
+application over 98% of the smallest allowed deadline.
+
+An execution timeout is deliberately *not* charged to the slot's
+infrastructure failure history, so repeated slow requests cannot walk a slot
+into the replacement backoff ladder or its cooldown band. Crashes, I/O faults
+and protocol faults still are. Both counts are visible in the pool snapshot,
+and each timeout writes one line to standard error naming the condition. The
+status is deliberately `502` rather than `504`: the request is already started
+and may already have had side effects, and `504` more readily invites the
+external retry that Hamster itself refuses to perform. See
+`doc/EXECUTION_TIMEOUT_POLICY.md` for the measured failure this separation
+fixes.
 
 `max_body_memory` is the total number of request-body bytes Hamster may have
 buffered process-wide at one time. It defaults to 67108864 (64 MiB) and must be

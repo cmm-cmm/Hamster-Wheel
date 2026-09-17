@@ -2565,3 +2565,262 @@ async fn replacement_generation_receives_the_configured_environment() {
 
     server.stop().await;
 }
+
+// --- Execution timeout policy -------------------------------------------
+//
+// These pin the distinction the policy exists for: an application that runs
+// past its deadline must not be charged to the slot's infrastructure failure
+// history, while a slot that genuinely cannot run still walks the backoff
+// ladder. The full fault-injection evidence that motivated them is in
+// `benchmarks/results/worker_request_timeout_investigation_20260917.md`; only
+// the minimum needed to detect a regression is kept here.
+
+fn php_runtime_with_request_timeout(
+    workers: usize,
+    request_timeout: u64,
+    script: &Path,
+) -> config::RuntimeConfig {
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    assert!(
+        executable.is_file(),
+        "PHP integration test requires repository php/8.5/php.exe"
+    );
+    let source = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = 8\nrequest_timeout = {request_timeout}\n",
+        toml_literal(&executable),
+        toml_literal(script)
+    );
+    config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("PHP request-timeout config should compile")
+}
+
+async fn timeout_policy_server(workers: usize, request_timeout: u64) -> TestServer {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+    TestServer::start_runtime(Arc::new(php_runtime_with_request_timeout(
+        workers,
+        request_timeout,
+        &script,
+    )))
+    .await
+}
+
+/// The configured deadline is the one that applies, and the worker is still
+/// killed and replaced when it expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires php/8.5/php.exe"]
+async fn a_configured_request_timeout_replaces_the_worker_that_exceeded_it() {
+    let server = timeout_policy_server(1, 1).await;
+    let pool = server.runtime.php_worker().unwrap();
+    let before = pool.snapshot().workers[0].clone();
+
+    let started = Instant::now();
+    let response = server.request(&close_request("/delay?ms=4000")).await;
+    let elapsed = started.elapsed();
+
+    let (head, body) = split_response(&response);
+    assert!(
+        String::from_utf8_lossy(head).starts_with("HTTP/1.1 502 "),
+        "an execution timeout answers 502: {}",
+        String::from_utf8_lossy(head)
+    );
+    // The body, not the status, is what separates this from the pool's other
+    // 502s. Changing it changes a client-visible contract.
+    assert_eq!(body, b"PHP Worker Execution Timeout");
+    // The one-second configuration must be what fired, not the five-second
+    // default; four seconds of application sleep would otherwise have run.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the configured one-second deadline should fire, not the default: {elapsed:?}"
+    );
+
+    let after = wait_for_pool(pool, |snapshot| {
+        snapshot.workers[0].generation > before.generation && all_workers_live(snapshot)
+    })
+    .await;
+    assert_ne!(
+        after.workers[0].pid, before.pid,
+        "the worker that timed out must be replaced"
+    );
+    server.stop().await;
+}
+
+/// The policy itself: repeated execution timeouts never move the slot onto the
+/// infrastructure backoff ladder, and ordinary traffic keeps being served.
+///
+/// Against the pre-policy tree this slot reaches `consecutive_failures == 5`
+/// and its replacements are delayed 100, 200, 400 and 800 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires php/8.5/php.exe"]
+async fn execution_timeouts_never_enter_the_infrastructure_backoff_ladder() {
+    let server = timeout_policy_server(1, 1).await;
+    let pool = server.runtime.php_worker().unwrap();
+
+    for round in 1..=5_u32 {
+        wait_for_pool(pool, |snapshot| snapshot.ready_workers > 0).await;
+        let response = server.request(&close_request("/delay?ms=4000")).await;
+        let (_, body) = split_response(&response);
+        assert_eq!(body, b"PHP Worker Execution Timeout", "round {round}");
+
+        let snapshot = pool.snapshot();
+        assert_eq!(
+            snapshot.workers[0].consecutive_failures, 0,
+            "an execution timeout is not an infrastructure failure (round {round})"
+        );
+        assert_eq!(
+            snapshot.workers[0].execution_timeouts,
+            u64::from(round),
+            "every execution timeout stays observable (round {round})"
+        );
+        assert_eq!(snapshot.total_execution_timeouts, u64::from(round));
+    }
+
+    // Five timeouts would have been failure 5 on the old ladder, which is an
+    // 800 ms replacement delay. The pool must instead be immediately usable.
+    wait_for_pool(pool, all_workers_live).await;
+    let response = server.request(&close_request("/json")).await;
+    assert!(
+        String::from_utf8_lossy(split_response(&response).0).starts_with("HTTP/1.1 200 "),
+        "ordinary traffic must be unaffected by execution timeouts"
+    );
+    assert_eq!(pool.snapshot().workers[0].consecutive_failures, 0);
+    server.stop().await;
+}
+
+/// The other half of the policy: a slot that genuinely cannot run is still
+/// charged, so separating the timeout did not disarm the ladder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires php/8.5/php.exe"]
+async fn an_infrastructure_failure_still_counts_against_the_slot() {
+    let server = timeout_policy_server(1, 1).await;
+    let pool = server.runtime.php_worker().unwrap();
+
+    // `/crash` exits mid-transaction, which is a possibly-started worker
+    // failure rather than an application deadline.
+    let response = server.request(&close_request("/crash?ms=0")).await;
+    assert!(
+        String::from_utf8_lossy(split_response(&response).0).starts_with("HTTP/1.1 502 "),
+        "a crashed worker still answers 502"
+    );
+    let snapshot = wait_for_pool(pool, |snapshot| {
+        snapshot.workers[0].consecutive_failures > 0
+    })
+    .await;
+    assert_eq!(
+        snapshot.workers[0].execution_timeouts, 0,
+        "a crash is not an execution timeout"
+    );
+    server.stop().await;
+}
+
+/// An execution timeout is possibly-started, so its job is never dispatched
+/// again. This is the at-most-once invariant, restated for the new class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires php/8.5/php.exe"]
+async fn a_timed_out_request_is_never_executed_twice() {
+    let server = timeout_policy_server(1, 1).await;
+    let marker = marker_path("execution-timeout-once");
+    let target = format!(
+        "/delay?ms=4000&execution_marker={}&execution_id=timed-out",
+        url_encode(&marker)
+    );
+
+    let response = server.request(&close_request(&target)).await;
+    assert_eq!(split_response(&response).1, b"PHP Worker Execution Timeout");
+
+    // Give any redispatch time to reach a replacement worker before counting.
+    wait_for_pool(server.runtime.php_worker().unwrap(), all_workers_live).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        marker_lines(&marker),
+        vec!["timed-out".to_owned()],
+        "a possibly-started request must never run a second time"
+    );
+    let _ = std::fs::remove_file(&marker);
+    server.stop().await;
+}
+
+// --- Pool health signal ---------------------------------------------------
+//
+// `ready_workers` counts idle workers, not healthy ones, so it reads zero on a
+// perfectly healthy pool that is serving at full concurrency. `live_workers`
+// is the health signal and the one `execute` gates its 503 on. These pin that
+// distinction, because a degradation check built on the wrong counter would
+// fire constantly under load.
+
+/// The two counters measure different things, and only one of them is health.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires php/8.5/php.exe"]
+async fn live_workers_is_the_health_signal_and_ready_workers_is_not() {
+    let server = TestServer::start_with(2, 16).await;
+    let pool = server.runtime.php_worker().unwrap();
+
+    let idle = pool.snapshot();
+    assert_eq!(idle.live_workers, 2, "a started pool has every worker live");
+    assert_eq!(idle.ready_workers, 2, "and every worker idle");
+
+    // Occupy one worker with a request that is slow but well inside the
+    // deadline, so the pool stays completely healthy throughout.
+    let address = server.address;
+    let busy =
+        tokio::spawn(async move { request_at(address, &close_request("/delay?ms=700")).await });
+    let occupied = wait_for_pool(pool, |snapshot| snapshot.ready_workers < 2).await;
+    assert_eq!(
+        occupied.live_workers, 2,
+        "a busy worker is still a live worker: {occupied:#?}"
+    );
+    assert!(
+        occupied.ready_workers < occupied.live_workers,
+        "ready_workers measures spare capacity, not health: {occupied:#?}"
+    );
+
+    let response = busy.await.expect("slow request task");
+    assert!(
+        String::from_utf8_lossy(split_response(&response).0).starts_with("HTTP/1.1 200 "),
+        "the pool was healthy the whole time"
+    );
+    wait_for_pool(pool, |snapshot| snapshot.ready_workers == 2).await;
+    server.stop().await;
+}
+
+/// `live_workers` tracks replacement, so it returns to target after a death.
+///
+/// The dip below target is deliberately not asserted: a replacement reaches
+/// READY in about 35 ms, so observing the transient from outside is a race.
+/// What matters for a health signal is that it is not stale afterwards, which
+/// is what this pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires php/8.5/php.exe"]
+async fn live_workers_returns_to_target_after_a_worker_is_killed() {
+    let server = TestServer::start_with(2, 16).await;
+    let pool = server.runtime.php_worker().unwrap();
+    assert_eq!(pool.snapshot().live_workers, 2);
+
+    let victim = pool.pids()[0];
+    kill_process(victim).await;
+
+    // An idle worker's death is detected passively, on its next assignment;
+    // there is no stdout probe. `live_workers` therefore stays stale until
+    // traffic reaches the dead generation, which is a real property of the
+    // signal and the reason this drives requests rather than just waiting.
+    let mut attempts = 0_u32;
+    while pool.snapshot().total_respawns == 0 && attempts < 40 {
+        let _ = server.request(&close_request("/json")).await;
+        attempts += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pool.snapshot().total_respawns > 0,
+        "the pool must notice a killed worker once traffic reaches it"
+    );
+
+    let recovered = wait_for_pool(pool, |snapshot| {
+        snapshot.live_workers == snapshot.target_workers && all_workers_live(snapshot)
+    })
+    .await;
+    assert_eq!(
+        recovered.live_workers, 2,
+        "the health signal must follow the replacement, not go stale: {recovered:#?}"
+    );
+    assert!(!pool.pids().contains(&victim), "the dead PID is gone");
+    server.stop().await;
+}

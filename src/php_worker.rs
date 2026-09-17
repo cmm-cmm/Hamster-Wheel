@@ -44,13 +44,43 @@ pub const MAX_WORKERS: usize = 64;
 pub const MAX_QUEUE_CAPACITY: usize = 128;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default ceiling on one application transaction, from the REQUEST frame
+/// write through the RESPONSE read.
+///
+/// Kept at the historical five seconds so making the value configurable does
+/// not silently change any existing deployment. No measurement establishes
+/// five seconds as correct for a given application; it is a compatibility
+/// default, and `doc/PHP_WORKER.md` says so.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Smallest configurable `request_timeout`.
+///
+/// This is not a taste threshold; it is derived from two measurements in
+/// `benchmarks/results/worker_request_timeout_floor_20260917.md`.
+///
+/// The deadline covers the REQUEST frame write, PHP execution and the RESPONSE
+/// frame read, so it must not be able to expire on Hamster's own protocol I/O
+/// and be reported as an application timeout. The worst legal payload, a 1 MiB
+/// body echoed back, round-tripped in 18.1 ms worst of twelve samples, so one
+/// second leaves the application over 98% of the smallest allowed deadline.
+///
+/// Exceeding the deadline kills the worker, so the configured value is also
+/// what bounds a slot's worst-case respawn rate at
+/// `1 / (request_timeout + bootstrap)`. That model was measured and holds
+/// exactly: 56.5 respawns per minute per slot at one second against 56.6
+/// predicted. One second keeps a slot's bootstrap duty cycle under 30% even
+/// against the worst real-application bootstrap this repository has measured
+/// (403 ms), and that worst case only occurs when every request is already
+/// timing out.
+pub const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+/// Largest configurable `request_timeout`. An application that legitimately
+/// runs longer than an hour does not belong behind a synchronous HTTP request.
+pub const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a generation must stay READY, with at least one successful
 /// request, before its slot's failure history is forgiven.
 ///
 /// Measured from the instant the generation reached READY, so bootstrap time
-/// is excluded. Three times `REQUEST_TIMEOUT`: a generation that has served
+/// is excluded. Three times the default `request_timeout`: a generation that has served
 /// successfully for longer than its own worst-case single-request budget,
 /// three times over, has demonstrated more than "did not crash immediately".
 ///
@@ -70,6 +100,16 @@ const COOLDOWN_BASE: Duration = Duration::from_secs(30);
 /// operator restart after a transient host problem.
 const COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const RECYCLE_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// How long a pool must have no live worker before that is worth reporting.
+///
+/// A pool briefly drops to zero live workers during any ordinary replacement,
+/// for exactly as long as the new child takes to reach READY. That is measured
+/// at 38 ms for the test fixture and 58-403 ms for real Laravel applications
+/// (`doc/BENCHMARKS.md`), so a threshold above the worst of those keeps routine
+/// churn silent while still reporting anything a client could notice: the
+/// backoff ladder holds a slot down for up to 5 s and the cooldown band for 30
+/// to 300 s. One second is about 2.5 times the worst measured bootstrap.
+const POOL_OUTAGE_NOTICE_AFTER: Duration = Duration::from_secs(1);
 /// How many times a single job may be queued again after a worker proved it
 /// never received the request. One covers the case this exists for -- a worker
 /// that died while idle, detected by the next request -- while keeping a
@@ -116,8 +156,20 @@ impl fmt::Debug for RedactedEnv<'_> {
 #[derive(Clone, Debug)]
 pub struct PhpWorkerPoolConfig {
     pub worker: PhpWorkerConfig,
+    /// How this pool names itself in diagnostics, normally its location path.
+    ///
+    /// Only one `php_worker` location is permitted today, so every line this
+    /// appears on is currently unambiguous without it. It exists so that the
+    /// diagnostics do not have to be revisited when more than one pool becomes
+    /// possible, and so an operator greps one pool's lines by the same string
+    /// they configured.
+    pub label: Arc<str>,
     pub workers: usize,
     pub queue_capacity: usize,
+    /// Ceiling on one application transaction for this pool. Exceeding it
+    /// kills the worker, so the value also bounds the slot's worst-case
+    /// respawn rate; `config` enforces the floor that keeps that bound useful.
+    pub request_timeout: Duration,
     pub max_requests: Option<u64>,
     pub max_worker_age: Option<Duration>,
     /// The process-wide request-body ceiling. Every PHP pool compiled from one
@@ -156,14 +208,33 @@ pub struct WorkerSnapshot {
     pub request_count: u64,
     pub spawned_at: Option<Instant>,
     pub consecutive_failures: usize,
+    /// Generations of this slot killed by the application execution timeout.
+    ///
+    /// Deliberately separate from `consecutive_failures`: it never decays and
+    /// never schedules anything, so it stays a faithful count of how often the
+    /// application ran past its deadline on this slot.
+    pub execution_timeouts: u64,
     pub last_exit_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
     pub target_workers: usize,
+    /// Workers that exist and have reached READY, whether idle or serving.
+    ///
+    /// This is the pool's health signal and the one `execute` gates its 503
+    /// on. Compare it against `target_workers`, never `ready_workers`.
+    pub live_workers: usize,
+    /// Workers that are READY *and idle*.
+    ///
+    /// `mark_busy` decrements this, so it is a measure of spare capacity, not
+    /// of health: a completely healthy pool serving at full concurrency
+    /// reports zero. Measured at 20% of samples on a four-worker pool that
+    /// served 23,072 requests without a single failure. Do not build a
+    /// degradation check on it.
     pub ready_workers: usize,
     pub total_respawns: u64,
+    pub total_execution_timeouts: u64,
     pub workers: Vec<WorkerSnapshot>,
 }
 
@@ -210,10 +281,12 @@ pub enum WorkerState {
     Stopped,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkerStart {
     pub pid: u32,
     pub elapsed: Duration,
+    /// The pool this worker belongs to, so a startup line names its pool.
+    pub label: Arc<str>,
 }
 
 #[derive(Debug)]
@@ -230,13 +303,26 @@ pub enum PhpWorkerError {
     /// write failed without transferring anything. The job may be dispatched
     /// again; every other failure may not.
     NotStarted(String),
+    /// The application did not answer within its configured `request_timeout`.
+    ///
+    /// This is a *possibly-started* failure and is treated as such everywhere
+    /// that matters: the worker is still killed and reaped, and the job is
+    /// never dispatched again. It is separated from `Request` only so the
+    /// lifecycle supervisor can tell an application that ran too long from a
+    /// slot that cannot run, because those need opposite recovery policies.
+    ExecutionTimeout(String),
     Shutdown(String),
 }
 
-/// A failed transaction plus the only fact that decides whether its job may be
-/// dispatched again.
+/// A failed transaction plus the two facts the caller classifies it by.
+///
+/// `started` decides whether its job may be dispatched again and is the older,
+/// stricter of the two. `timed_out` decides only which recovery policy the
+/// slot receives; it never widens what may be retried, because a deadline that
+/// expires says nothing about how far PHP got.
 struct TransactionFailure {
     started: bool,
+    timed_out: bool,
     message: String,
 }
 
@@ -257,6 +343,10 @@ impl fmt::Display for PhpWorkerError {
                 formatter,
                 "PHP worker failed before the request started: {message}"
             ),
+            Self::ExecutionTimeout(message) => write!(
+                formatter,
+                "PHP application exceeded its execution timeout: {message}"
+            ),
             Self::Shutdown(message) => write!(formatter, "PHP worker shutdown failed: {message}"),
         }
     }
@@ -270,6 +360,7 @@ impl std::error::Error for PhpWorkerError {
             | Self::Unavailable(_)
             | Self::Request(_)
             | Self::NotStarted(_)
+            | Self::ExecutionTimeout(_)
             | Self::Shutdown(_) => None,
         }
     }
@@ -286,7 +377,7 @@ impl Default for WorkerTimeouts {
     fn default() -> Self {
         Self {
             startup: STARTUP_TIMEOUT,
-            request: REQUEST_TIMEOUT,
+            request: DEFAULT_REQUEST_TIMEOUT,
             shutdown: SHUTDOWN_TIMEOUT,
         }
     }
@@ -295,6 +386,10 @@ impl Default for WorkerTimeouts {
 pub struct PhpWorker {
     config: PhpWorkerConfig,
     timeouts: WorkerTimeouts,
+    /// The owning pool's label, carried so the child's own standard error can
+    /// be attributed. Application output is the line that most needs a pool
+    /// name once more than one application can be served.
+    label: Arc<str>,
     inner: WorkerSlot,
 }
 
@@ -320,12 +415,31 @@ impl PhpWorker {
         Self::with_timeouts(config, WorkerTimeouts::default())
     }
 
-    fn with_timeouts(config: PhpWorkerConfig, timeouts: WorkerTimeouts) -> Self {
+    fn with_label(config: PhpWorkerConfig, timeouts: WorkerTimeouts, label: Arc<str>) -> Self {
         Self {
             config,
             timeouts,
+            label,
             inner: WorkerSlot::Starting,
         }
+    }
+
+    /// Builds a worker whose transaction deadline comes from its pool's
+    /// configuration. Startup and shutdown deadlines stay fixed: they bound
+    /// Hamster's own handshake, not application execution.
+    fn with_request_timeout(config: PhpWorkerConfig, request: Duration, label: Arc<str>) -> Self {
+        Self::with_label(
+            config,
+            WorkerTimeouts {
+                request,
+                ..WorkerTimeouts::default()
+            },
+            label,
+        )
+    }
+
+    fn with_timeouts(config: PhpWorkerConfig, timeouts: WorkerTimeouts) -> Self {
+        Self::with_label(config, timeouts, Arc::from("php"))
     }
 
     pub async fn start(&mut self) -> Result<WorkerStart, PhpWorkerError> {
@@ -393,7 +507,7 @@ impl PhpWorker {
             .stderr
             .take()
             .ok_or_else(|| PhpWorkerError::Startup("PHP worker stderr was not piped".to_owned()))?;
-        let stderr_task = spawn_stderr_drain(stderr);
+        let stderr_task = spawn_stderr_drain(stderr, Arc::clone(&self.label));
 
         let handshake = match shutdown_phase {
             Some(shutdown_phase) => {
@@ -441,6 +555,7 @@ impl PhpWorker {
         let report = WorkerStart {
             pid: ready.pid,
             elapsed: started.elapsed(),
+            label: Arc::clone(&self.label),
         };
         self.inner = WorkerSlot::Running(Box::new(RunningWorker {
             child,
@@ -528,6 +643,7 @@ impl PhpWorker {
                 if let Err(error) = write_frame_tracked(&mut worker.stdin, &payload).await {
                     return Err(TransactionFailure {
                         started: error.transferred > 0,
+                        timed_out: false,
                         message: error.to_string(),
                     });
                 }
@@ -545,15 +661,19 @@ impl PhpWorker {
                 read.await
                     .map_err(|error: ProtocolError| TransactionFailure {
                         started: true,
+                        timed_out: false,
                         message: error.to_string(),
                     })
             };
             match timeout(self.timeouts.request, operation).await {
                 Ok(result) => result,
                 // A timeout says nothing about how far PHP got, so it is
-                // always treated as started.
+                // always treated as started and is never dispatched again.
+                // `timed_out` changes only which recovery policy the slot
+                // receives, never what may be retried.
                 Err(_) => Err(TransactionFailure {
                     started: true,
+                    timed_out: true,
                     message: format!("timeout after {} ms", self.timeouts.request.as_millis()),
                 }),
             }
@@ -567,11 +687,16 @@ impl PhpWorker {
                 Ok(response)
             }
             Err(failure) => {
+                // The kill is unconditional and stays that way. Protocol v1
+                // has no cancel frame, so an abandoned transaction's worker
+                // would write its RESPONSE into the next request's read. The
+                // classification below decides recovery policy, not whether
+                // the child is reaped.
                 fail_worker(&mut self.inner, &failure.message).await;
-                Err(if failure.started {
-                    PhpWorkerError::Request(failure.message)
-                } else {
-                    PhpWorkerError::NotStarted(failure.message)
+                Err(match (failure.timed_out, failure.started) {
+                    (true, _) => PhpWorkerError::ExecutionTimeout(failure.message),
+                    (false, true) => PhpWorkerError::Request(failure.message),
+                    (false, false) => PhpWorkerError::NotStarted(failure.message),
                 })
             }
         }
@@ -659,7 +784,16 @@ struct PoolShared {
     live_workers: AtomicUsize,
     ready_workers: AtomicUsize,
     total_respawns: AtomicU64,
+    total_execution_timeouts: AtomicU64,
     recycle_owner: AtomicUsize,
+    /// Milliseconds since `started` at which this pool last dropped to zero
+    /// live workers, or 0 when it has at least one.
+    ///
+    /// A plain timestamp rather than a lock: the two writers are the
+    /// `live_workers` transitions, and each is already serialized by the
+    /// fetch that observed the crossing.
+    outage_since_ms: AtomicU64,
+    started: Instant,
 }
 
 enum PoolLifecycle {
@@ -692,6 +826,7 @@ struct PhpJob {
 
 enum PoolJobError {
     Worker(String),
+    ExecutionTimeout(String),
     Unavailable,
 }
 
@@ -700,6 +835,7 @@ enum PoolExecuteError {
     QueueFull,
     Unavailable,
     Worker(String),
+    ExecutionTimeout(String),
 }
 
 enum WorkerCommand {
@@ -721,6 +857,11 @@ struct IdleWorker {
 
 enum GenerationOutcome {
     Failed(String),
+    /// The generation was killed because the application exceeded its
+    /// execution timeout. Replacement is immediate and the slot's
+    /// infrastructure failure history is untouched: a slot whose replacement
+    /// reaches READY has not demonstrated that it cannot run.
+    ExecutionTimeout(String),
     Recycle(WorkerSpawnReason),
     Stopped(Result<(), PhpWorkerError>),
     BootstrapFailed(String),
@@ -777,7 +918,10 @@ impl PhpWorkerPool {
                 live_workers: AtomicUsize::new(0),
                 ready_workers: AtomicUsize::new(0),
                 total_respawns: AtomicU64::new(0),
+                total_execution_timeouts: AtomicU64::new(0),
                 recycle_owner: AtomicUsize::new(0),
+                outage_since_ms: AtomicU64::new(0),
+                started: Instant::now(),
             }),
         }
     }
@@ -789,6 +933,8 @@ impl PhpWorkerPool {
             worker: worker_configs[0].clone(),
             workers,
             queue_capacity,
+            label: Arc::from("test"),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -808,7 +954,10 @@ impl PhpWorkerPool {
                 live_workers: AtomicUsize::new(0),
                 ready_workers: AtomicUsize::new(0),
                 total_respawns: AtomicU64::new(0),
+                total_execution_timeouts: AtomicU64::new(0),
                 recycle_owner: AtomicUsize::new(0),
+                outage_since_ms: AtomicU64::new(0),
+                started: Instant::now(),
             }),
         }
     }
@@ -819,6 +968,10 @@ impl PhpWorkerPool {
 
     pub fn queue_capacity(&self) -> usize {
         self.shared.config.queue_capacity
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.shared.config.request_timeout
     }
 
     pub fn max_requests(&self) -> Option<u64> {
@@ -840,8 +993,10 @@ impl PhpWorkerPool {
     pub fn snapshot(&self) -> PoolSnapshot {
         PoolSnapshot {
             target_workers: self.shared.config.workers,
+            live_workers: self.shared.live_workers.load(Ordering::Acquire),
             ready_workers: self.shared.ready_workers.load(Ordering::Acquire),
             total_respawns: self.shared.total_respawns.load(Ordering::Acquire),
+            total_execution_timeouts: self.shared.total_execution_timeouts.load(Ordering::Acquire),
             workers: self
                 .shared
                 .slots
@@ -870,7 +1025,11 @@ impl PhpWorkerPool {
         for (index, config) in self.shared.worker_configs.iter().cloned().enumerate() {
             let shared = Arc::clone(&self.shared);
             startup.spawn(async move {
-                let mut worker = PhpWorker::new(config);
+                let mut worker = PhpWorker::with_request_timeout(
+                    config,
+                    shared.config.request_timeout,
+                    Arc::clone(&shared.config.label),
+                );
                 let result = worker.start_guarded(&shared.spawn_gate, None).await;
                 (index, worker, result)
             });
@@ -1049,6 +1208,17 @@ impl PhpWorkerPool {
                 eprintln!("PHP worker request failed: {error}");
                 simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Unavailable")
             }
+            // 502, not 504, by owner decision. The request is already
+            // started and may already have had side effects, and 504 invites
+            // the idempotent-retry heuristics that clients and proxies apply
+            // to a "slow upstream". Hamster will not replay a possibly-started
+            // request, so it must not advertise a status that encourages a peer
+            // to. The body is what distinguishes this condition, exactly as the
+            // body budget's 503 does. See `doc/EXECUTION_TIMEOUT_POLICY.md`.
+            Err(PoolExecuteError::ExecutionTimeout(error)) => {
+                eprintln!("PHP worker execution timeout: {error}");
+                simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Execution Timeout")
+            }
         }
     }
 
@@ -1110,6 +1280,9 @@ impl PhpWorkerPool {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(PoolJobError::Unavailable)) => Err(PoolExecuteError::Unavailable),
             Ok(Err(PoolJobError::Worker(error))) => Err(PoolExecuteError::Worker(error)),
+            Ok(Err(PoolJobError::ExecutionTimeout(error))) => {
+                Err(PoolExecuteError::ExecutionTimeout(error))
+            }
             Err(_) => Err(PoolExecuteError::Unavailable),
         }
     }
@@ -1125,6 +1298,7 @@ fn initial_worker_snapshot(slot: usize) -> WorkerSnapshot {
         request_count: 0,
         spawned_at: None,
         consecutive_failures: 0,
+        execution_timeouts: 0,
         last_exit_reason: None,
     }
 }
@@ -1174,8 +1348,9 @@ impl PoolShared {
             snapshot.request_count = 0;
             snapshot.spawned_at = Some(spawned_at);
         });
-        self.live_workers.fetch_add(1, Ordering::AcqRel);
+        let previous_live = self.live_workers.fetch_add(1, Ordering::AcqRel);
         self.ready_workers.fetch_add(1, Ordering::AcqRel);
+        self.note_worker_live(previous_live);
     }
 
     fn mark_busy(&self, slot: usize, generation: u64) {
@@ -1233,13 +1408,14 @@ impl PoolShared {
         });
     }
 
-    fn record_exit(&self, exit: &GenerationExit, reason: String) {
+    fn record_exit(self: &Arc<Self>, exit: &GenerationExit, reason: String) {
+        let mut previous_live = 0;
         self.update_slot(exit.slot, |snapshot| {
             if snapshot.generation != exit.generation {
                 return;
             }
             if snapshot.pid.take().is_some() {
-                self.live_workers.fetch_sub(1, Ordering::AcqRel);
+                previous_live = self.live_workers.fetch_sub(1, Ordering::AcqRel);
             }
             if snapshot.state == WorkerLifecycleState::Ready {
                 self.ready_workers.fetch_sub(1, Ordering::AcqRel);
@@ -1247,6 +1423,87 @@ impl PoolShared {
             snapshot.last_exit_reason = Some(reason);
             snapshot.state = WorkerLifecycleState::Unavailable;
         });
+        self.note_worker_lost(previous_live);
+    }
+
+    /// Notes that a worker became live, reporting the end of a real outage.
+    ///
+    /// Called after `live_workers` has been incremented. Only the transition
+    /// out of zero is interesting, and only when the pool was down longer than
+    /// an ordinary replacement takes.
+    fn note_worker_live(&self, previous_live: usize) {
+        if previous_live != 0 || !self.spawn_gate.is_serving() {
+            return;
+        }
+        let since_ms = self.outage_since_ms.swap(0, Ordering::AcqRel);
+        if since_ms == 0 {
+            return;
+        }
+        let outage = self.elapsed_ms().saturating_sub(since_ms);
+        if outage < POOL_OUTAGE_NOTICE_AFTER.as_millis() as u64 {
+            return;
+        }
+        eprintln!(
+            "PHP worker pool {} recovered: {} of {} workers live after {outage} ms with none",
+            self.config.label,
+            self.live_workers.load(Ordering::Acquire),
+            self.config.workers
+        );
+    }
+
+    /// Notes that the pool may have lost its last worker.
+    ///
+    /// Called after `live_workers` has been decremented. It does not report
+    /// immediately: every ordinary replacement passes through zero live
+    /// workers for as long as a bootstrap takes, and announcing those produced
+    /// far more "no live worker" lines than recoveries, which reads as a pile
+    /// of unresolved outages. Instead it records the start and schedules one
+    /// check, so a pool that is still down after `POOL_OUTAGE_NOTICE_AFTER`
+    /// says so and a pool that simply replaced a worker stays silent. Both
+    /// lines therefore use the same threshold and always appear in pairs.
+    fn note_worker_lost(self: &Arc<Self>, previous_live: usize) {
+        // Losing every worker is the point of a shutdown, not an outage.
+        if previous_live != 1 || !self.spawn_gate.is_serving() {
+            return;
+        }
+        let began = self.elapsed_ms().max(1);
+        self.outage_since_ms.store(began, Ordering::Release);
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(POOL_OUTAGE_NOTICE_AFTER).await;
+            // Still the same outage, and still ongoing. A recovery clears
+            // `outage_since_ms`, and a later outage overwrites it, so an
+            // unchanged value is what proves this check still applies.
+            if shared.outage_since_ms.load(Ordering::Acquire) != began
+                || shared.live_workers.load(Ordering::Acquire) != 0
+                || !shared.spawn_gate.is_serving()
+            {
+                return;
+            }
+            eprintln!(
+                "PHP worker pool {} has no live worker after {} ms; requests are refused until one is READY",
+                shared.config.label,
+                POOL_OUTAGE_NOTICE_AFTER.as_millis()
+            );
+        });
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Counts one execution timeout for a slot and for the pool.
+    ///
+    /// Deliberately does not touch `consecutive_failures`: the application ran
+    /// too long, which is no evidence about whether this slot can start.
+    fn record_execution_timeout(&self, slot: usize) -> u64 {
+        self.total_execution_timeouts.fetch_add(1, Ordering::AcqRel);
+        let mut timeouts = 0;
+        self.update_slot(slot, |snapshot| {
+            snapshot.execution_timeouts = snapshot.execution_timeouts.saturating_add(1);
+            timeouts = snapshot.execution_timeouts;
+        });
+        timeouts
     }
 
     fn increment_failure(&self, slot: usize) -> usize {
@@ -1258,11 +1515,12 @@ impl PoolShared {
         failures
     }
 
-    fn stop_slot(&self, slot: usize, generation: u64) {
+    fn stop_slot(self: &Arc<Self>, slot: usize, generation: u64) {
+        let mut previous_live = 0;
         self.update_slot(slot, |snapshot| {
             if snapshot.generation == generation {
                 if snapshot.pid.take().is_some() {
-                    self.live_workers.fetch_sub(1, Ordering::AcqRel);
+                    previous_live = self.live_workers.fetch_sub(1, Ordering::AcqRel);
                 }
                 if snapshot.state == WorkerLifecycleState::Ready {
                     self.ready_workers.fetch_sub(1, Ordering::AcqRel);
@@ -1270,6 +1528,7 @@ impl PoolShared {
                 snapshot.state = WorkerLifecycleState::Stopped;
             }
         });
+        self.note_worker_lost(previous_live);
     }
 
     fn try_acquire_recycle(&self, slot: usize) -> bool {
@@ -1518,17 +1777,18 @@ async fn run_worker_generation(
                     Err(error) => {
                         let message = error.to_string();
                         if let Some(job) = redispatch_not_started(&shared, &error, job) {
-                            let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                            let _ = job.response_tx.send(Err(job_error(&error, message)));
                         }
                         shared.mark_unavailable(slot, generation);
                         eprintln!(
-                            "PHP worker slot {slot} generation {generation} became unavailable: {error}"
+                            "PHP worker pool {} slot {slot} generation {generation} became unavailable: {error}",
+                            shared.config.label
                         );
                         return GenerationExit {
                             slot,
                             generation,
                             idle_tx,
-                            outcome: GenerationOutcome::Failed(error.to_string()),
+                            outcome: classify_generation_exit(&error),
                         };
                     }
                 }
@@ -1557,6 +1817,33 @@ async fn run_worker_generation(
 ///
 /// Returns the job when it must be failed instead, and `None` when it has been
 /// queued again or its client has already disconnected.
+/// Maps a failed transaction onto the recovery policy its slot receives.
+///
+/// An execution timeout is the application's fault; every other failure is
+/// evidence about the slot itself. Only the latter may move a slot along the
+/// backoff ladder, because that ladder exists to stop a slot that cannot start
+/// from spawning in a tight loop.
+/// Maps a failed transaction onto what its client is told.
+///
+/// Mirrors `classify_generation_exit`: the same distinction that decides the
+/// slot's recovery policy also decides which response the client receives, so
+/// the two can never disagree about what happened.
+fn job_error(error: &PhpWorkerError, message: String) -> PoolJobError {
+    match error {
+        PhpWorkerError::ExecutionTimeout(_) => PoolJobError::ExecutionTimeout(message),
+        _ => PoolJobError::Worker(message),
+    }
+}
+
+fn classify_generation_exit(error: &PhpWorkerError) -> GenerationOutcome {
+    match error {
+        PhpWorkerError::ExecutionTimeout(message) => {
+            GenerationOutcome::ExecutionTimeout(message.clone())
+        }
+        other => GenerationOutcome::Failed(other.to_string()),
+    }
+}
+
 fn redispatch_not_started(
     shared: &PoolShared,
     error: &PhpWorkerError,
@@ -1607,10 +1894,10 @@ async fn drain_and_stop_generation(
                 // queue will refuse the job and it is failed exactly as before.
                 // The call is kept so there is one rule, not two.
                 if let Some(job) = redispatch_not_started(shared, &error, job) {
-                    let _ = job.response_tx.send(Err(PoolJobError::Worker(message)));
+                    let _ = job.response_tx.send(Err(job_error(&error, message)));
                 }
                 shared.mark_unavailable(slot, generation);
-                return GenerationOutcome::Failed(error.to_string());
+                return classify_generation_exit(&error);
             }
         }
     }
@@ -1653,7 +1940,11 @@ async fn replacement_generation_task(mut spec: GenerationSpec) -> GenerationExit
     spec.shared.update_slot(spec.slot, |snapshot| {
         snapshot.state = WorkerLifecycleState::Bootstrapping;
     });
-    let mut worker = PhpWorker::new(spec.shared.worker_configs[spec.slot].clone());
+    let mut worker = PhpWorker::with_request_timeout(
+        spec.shared.worker_configs[spec.slot].clone(),
+        spec.shared.config.request_timeout,
+        Arc::clone(&spec.shared.config.label),
+    );
     match worker
         .start_guarded(&spec.shared.spawn_gate, Some(&mut spec.phase_rx))
         .await
@@ -1801,6 +2092,37 @@ fn handle_serving_exit(
         )
     };
     match &exit.outcome {
+        GenerationOutcome::ExecutionTimeout(reason) => {
+            shared.record_exit(&exit, reason.clone());
+            if was_recycling
+                || matches!(
+                    prior_reason,
+                    WorkerSpawnReason::MaxRequests | WorkerSpawnReason::MaxAge
+                )
+            {
+                shared.release_recycle(exit.slot);
+            }
+            let timeouts = shared.record_execution_timeout(exit.slot);
+            eprintln!(
+                "PHP worker pool {} slot {} scheduling generation {} immediately (execution timeout {timeouts}; slot failure history unchanged)",
+                shared.config.label,
+                exit.slot,
+                exit.generation.saturating_add(1)
+            );
+            // Zero delay, and no `increment_failure`. The respawn rate is
+            // already bounded by the deadline itself: a slot cannot time out
+            // more often than once per `request_timeout` plus its bootstrap,
+            // which is why `request_timeout` has a validated floor.
+            spawn_replacement(
+                tasks,
+                exit,
+                WorkerSpawnReason::Respawn,
+                Duration::ZERO,
+                phase_rx,
+                worker_shutdown_rx,
+                shared,
+            );
+        }
         GenerationOutcome::Failed(reason) | GenerationOutcome::BootstrapFailed(reason) => {
             shared.record_exit(&exit, reason.clone());
             if was_recycling
@@ -1814,7 +2136,8 @@ fn handle_serving_exit(
             let failures = shared.increment_failure(exit.slot);
             let delay = replacement_delay(failures);
             eprintln!(
-                "PHP worker slot {} scheduling generation {} after {} ms (failure {failures}{})",
+                "PHP worker pool {} slot {} scheduling generation {} after {} ms (failure {failures}{})",
+                shared.config.label,
                 exit.slot,
                 exit.generation.saturating_add(1),
                 delay.as_millis(),
@@ -1853,8 +2176,8 @@ fn handle_serving_exit(
                 Err(error) => error.to_string(),
             };
             eprintln!(
-                "PHP worker slot {} generation {} stopped unexpectedly: {reason}",
-                exit.slot, exit.generation
+                "PHP worker pool {} slot {} generation {} stopped unexpectedly: {reason}",
+                shared.config.label, exit.slot, exit.generation
             );
             shared.record_exit(&exit, reason);
             shared.stop_slot(exit.slot, exit.generation);
@@ -1867,7 +2190,7 @@ fn handle_serving_exit(
 
 fn handle_shutdown_exit(
     exit: GenerationExit,
-    shared: &PoolShared,
+    shared: &Arc<PoolShared>,
     first_error: &mut Option<PhpWorkerError>,
 ) {
     let (prior_reason, was_recycling) = {
@@ -1888,9 +2211,9 @@ fn handle_shutdown_exit(
         shared.release_recycle(exit.slot);
     }
     let reason = match &exit.outcome {
-        GenerationOutcome::Failed(reason) | GenerationOutcome::BootstrapFailed(reason) => {
-            reason.clone()
-        }
+        GenerationOutcome::Failed(reason)
+        | GenerationOutcome::BootstrapFailed(reason)
+        | GenerationOutcome::ExecutionTimeout(reason) => reason.clone(),
         GenerationOutcome::Recycle(reason) => format!("planned recycle: {reason:?}"),
         GenerationOutcome::Stopped(Ok(())) => "generation stopped during shutdown".to_owned(),
         GenerationOutcome::Stopped(Err(error)) => {
@@ -2147,8 +2470,8 @@ async fn dispatcher_task(
                 }
                 Err(mpsc::error::TrySendError::Full(WorkerCommand::Job(returned))) => {
                     eprintln!(
-                        "PHP worker slot {} generation {} published an invalid full idle mailbox",
-                        idle_worker.slot, idle_worker.generation
+                        "PHP worker pool {} slot {} generation {} published an invalid full idle mailbox",
+                        shared.config.label, idle_worker.slot, idle_worker.generation
                     );
                     let _ = returned.response_tx.send(Err(PoolJobError::Unavailable));
                     break;
@@ -2181,18 +2504,18 @@ async fn startup_io_context(child: &mut Child, error: ProtocolError) -> String {
     }
 }
 
-fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> JoinHandle<()> {
+fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr, label: Arc<str>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buffer = [0_u8; 4096];
         loop {
             match stderr.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(length) => eprintln!(
-                    "PHP worker stderr: {}",
+                    "PHP worker pool {label} stderr: {}",
                     String::from_utf8_lossy(&buffer[..length]).trim_end()
                 ),
                 Err(error) => {
-                    eprintln!("failed to drain PHP worker stderr: {error}");
+                    eprintln!("failed to drain PHP worker pool {label} stderr: {error}");
                     break;
                 }
             }
@@ -2419,6 +2742,8 @@ mod tests {
             worker: fixture(script),
             workers,
             queue_capacity,
+            label: Arc::from("test"),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -2581,6 +2906,8 @@ mod tests {
             },
             workers: 1,
             queue_capacity: 8,
+            label: Arc::from("test"),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -2628,6 +2955,8 @@ mod tests {
             },
             workers: 1,
             queue_capacity: 8,
+            label: Arc::from("test"),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -2844,8 +3173,17 @@ mod tests {
         // A generation counts as stable only after staying READY for longer
         // than its own worst-case single request, with margin. Keeping this
         // time based is what decouples respawn rate from throughput.
-        assert!(STABILITY_RESET_PERIOD > REQUEST_TIMEOUT);
-        assert_eq!(STABILITY_RESET_PERIOD, REQUEST_TIMEOUT * 3);
+        // The outage notice must not fire for an ordinary replacement. The
+        // worst bootstrap-to-READY this repository has measured is 403 ms for
+        // a real Laravel application (`doc/BENCHMARKS.md`); the fixture is
+        // ~38 ms. Anything at or below that would make routine churn look like
+        // an outage.
+        assert!(
+            POOL_OUTAGE_NOTICE_AFTER >= Duration::from_millis(806),
+            "the outage threshold must clear the worst measured bootstrap twice over"
+        );
+        assert!(STABILITY_RESET_PERIOD > DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(STABILITY_RESET_PERIOD, DEFAULT_REQUEST_TIMEOUT * 3);
         let worst_case_spawns_per_minute = 60 / STABILITY_RESET_PERIOD.as_secs();
         assert!(
             worst_case_spawns_per_minute <= 4,
@@ -3044,6 +3382,13 @@ mod tests {
             .execute(&request("GET", "/delay", "ms=500", Vec::new()))
             .await
             .unwrap_err();
+        // The variant, not just the message. This is what routes the failure
+        // away from the slot's infrastructure backoff ladder, so a regression
+        // that reclassified it would otherwise pass on the message alone.
+        assert!(
+            matches!(error, PhpWorkerError::ExecutionTimeout(_)),
+            "an expired deadline is an application execution timeout: {error}"
+        );
         assert!(error.to_string().contains("timeout"));
         assert_eq!(worker.state(), WorkerState::Unavailable);
         worker.shutdown().await.unwrap();

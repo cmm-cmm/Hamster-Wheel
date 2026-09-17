@@ -13,8 +13,9 @@ use serde::Deserialize;
 
 use crate::body_budget::BodyBudget;
 use crate::php_worker::{
-    MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY, MAX_WORKERS, PhpWorkerConfig, PhpWorkerError,
-    PhpWorkerPool, PhpWorkerPoolConfig, WorkerStart,
+    DEFAULT_REQUEST_TIMEOUT, MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY, MAX_REQUEST_TIMEOUT,
+    MAX_WORKERS, MIN_REQUEST_TIMEOUT, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool,
+    PhpWorkerPoolConfig, WorkerStart,
 };
 use crate::router::{
     Handler, HostRouter, LocationRouter, RouterBuildError, VirtualHost, normalize_location,
@@ -126,6 +127,7 @@ struct RawPhpWorker {
     #[serde(default = "default_php_workers")]
     workers: usize,
     queue_capacity: Option<usize>,
+    request_timeout: Option<u64>,
     max_requests: Option<u64>,
     max_worker_age: Option<u64>,
     /// Extra environment for the worker process. The server never interprets
@@ -454,6 +456,7 @@ enum ValidatedHandler {
         script: PathBuf,
         workers: usize,
         queue_capacity: usize,
+        request_timeout: Duration,
         max_requests: Option<u64>,
         max_worker_age: Option<Duration>,
         env: BTreeMap<String, String>,
@@ -645,6 +648,20 @@ pub(crate) fn validate_raw(
                             "{context}.php.queue_capacity must be between 1 and {MAX_QUEUE_CAPACITY}"
                         )));
                     }
+                    let request_timeout = match php.request_timeout {
+                        None => DEFAULT_REQUEST_TIMEOUT,
+                        Some(seconds) => {
+                            let configured = Duration::from_secs(seconds);
+                            if !(MIN_REQUEST_TIMEOUT..=MAX_REQUEST_TIMEOUT).contains(&configured) {
+                                return Err(ConfigError::Validation(format!(
+                                    "{context}.php.request_timeout must be between {} and {} seconds",
+                                    MIN_REQUEST_TIMEOUT.as_secs(),
+                                    MAX_REQUEST_TIMEOUT.as_secs()
+                                )));
+                            }
+                            configured
+                        }
+                    };
                     if php.max_requests == Some(0) {
                         return Err(ConfigError::Validation(format!(
                             "{context}.php.max_requests must be at least 1 when configured"
@@ -685,6 +702,7 @@ pub(crate) fn validate_raw(
                         script: resolve_path(base_directory, php.script),
                         workers: php.workers,
                         queue_capacity,
+                        request_timeout,
                         max_requests: php.max_requests,
                         max_worker_age: php.max_worker_age.map(Duration::from_secs),
                         env: php.env,
@@ -795,6 +813,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     script,
                     workers,
                     queue_capacity,
+                    request_timeout,
                     max_requests,
                     max_worker_age,
                     env,
@@ -813,14 +832,21 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                             host.name
                         ),
                     )?;
+                    // Host and location together, so the label stays unique
+                    // once more than one pool can exist, and matches strings
+                    // the operator already wrote in their configuration.
+                    let label: Arc<str> =
+                        Arc::from(format!("{}{}", host.name, location.path).as_str());
                     let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
                         worker: PhpWorkerConfig {
                             executable,
                             script,
                             env,
                         },
+                        label,
                         workers,
                         queue_capacity,
+                        request_timeout,
                         max_requests,
                         max_worker_age,
                         body_budget: Arc::clone(&body_budget),

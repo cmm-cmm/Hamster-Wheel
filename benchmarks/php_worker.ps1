@@ -131,7 +131,9 @@ function Find-PhpChild([int]$ParentId) {
 function Get-WorkerBootstrapMilliseconds([string]$StdoutPath) {
     if (-not (Test-Path -LiteralPath $StdoutPath)) { return [double]::NaN }
     $text = Get-Content -Raw -LiteralPath $StdoutPath
-    $match = [regex]::Match($text, 'PHP worker \d+ ready after ([0-9.]+) ms')
+    # Tolerates both the pre- and post-pool-label startup line, so this
+    # script keeps working against older binaries kept for A/B comparison.
+    $match = [regex]::Match($text, 'PHP worker (?:pool \S+ worker )?\d+ ready after ([0-9.]+) ms')
     if (-not $match.Success) { return [double]::NaN }
     return [double]::Parse($match.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
 }

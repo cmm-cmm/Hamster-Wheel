@@ -404,6 +404,10 @@ fn validates_php_pool_worker_and_queue_bounds() {
         "queue_capacity = 129",
         "max_requests = 0",
         "max_worker_age = 0",
+        // Below the floor the deadline could expire on Hamster's own protocol
+        // I/O rather than on application execution.
+        "request_timeout = 0",
+        "request_timeout = 3601",
     ] {
         let source = not_found_config(&format!("{base}{field}\n"));
         assert!(matches!(
@@ -419,6 +423,13 @@ fn validates_php_pool_worker_and_queue_bounds() {
     assert_eq!(pool.queue_capacity(), 32);
     assert_eq!(pool.max_requests(), None);
     assert_eq!(pool.max_worker_age(), None);
+    // Omitting it must keep the historical five seconds, so making the value
+    // configurable does not silently change an existing deployment.
+    assert_eq!(
+        pool.request_timeout(),
+        std::time::Duration::from_secs(5),
+        "an unset request_timeout keeps the compatibility default"
+    );
 
     let source = not_found_config(&format!(
         "{base}max_requests = 1000\nmax_worker_age = 3600\n"

@@ -52,7 +52,8 @@ impl From<PhpWorkerError> for ServerError {
 pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     for worker in config.start_workers().await? {
         println!(
-            "PHP worker {} ready after {:.3} ms",
+            "PHP worker pool {} worker {} ready after {:.3} ms",
+            worker.label,
             worker.pid,
             worker.elapsed.as_secs_f64() * 1_000.0
         );

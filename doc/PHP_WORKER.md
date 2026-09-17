@@ -9,9 +9,9 @@ only a process property. Each idle capability carries
 `{ slot, generation, mailbox }`, and the mailbox belongs to that exact
 generation. The dispatcher has no worker lookup table.
 
-Unexpected process, pipe, timeout, or protocol failure fails the affected
-request once and schedules a replacement. A possibly-started request is never
-retried. The first replacement is immediate; subsequent failures back off for
+Unexpected process, pipe, or protocol failure fails the affected request once
+and schedules a replacement. A possibly-started request is never retried. The
+first replacement is immediate; subsequent failures back off for
 100, 200, 400, 800, 1600, 3200, then at most 5000 ms. After the tenth failure
 the slot moves into a bounded cooldown band instead of being retired: 30, 60,
 120, 240, then 300 seconds, repeating at that ceiling. **Slots are never
@@ -20,6 +20,16 @@ problem restores itself without an operator restart. Failure history resets
 only after a generation has stayed READY for 15 seconds and completed a
 request successfully; the 15 seconds are measured from READY, so bootstrap
 time does not count toward it.
+
+An application execution timeout is deliberately outside that ladder. It also
+kills and reaps the worker, and its request is also never retried, but it does
+not increment the slot's failure history and its replacement is immediate no
+matter how often it happens. A slot whose replacement reaches READY has not
+demonstrated that it cannot start, which is the only thing the ladder protects
+against; charging it there was measured to cost 30 seconds of total outage for
+eleven slow requests. The respawn rate stays bounded because the deadline
+itself bounds it, at `1 / (request_timeout + bootstrap)`. See
+`doc/EXECUTION_TIMEOUT_POLICY.md`.
 
 Stability is time based on purpose. Treating successful request *count* as
 proof of health would tie the respawn rate to application throughput, because
@@ -75,8 +85,56 @@ Laravel Worker milestone. The full contract is in
 
 `PoolSnapshot` reports target and READY counts, total respawns, and per-slot
 `WorkerSnapshot` values: slot, generation, PID, lifecycle state, spawn reason,
-request count, spawn time, consecutive failures, and last exit reason. These
-values are observational; correctness does not poll them.
+request count, spawn time, consecutive failures, execution timeouts, and last
+exit reason.
+
+`live_workers` is the pool's health signal and the counter `execute` gates its
+503 on. `ready_workers` counts workers that are READY *and idle*, because
+`mark_busy` decrements it, so it measures spare capacity rather than health: a
+four-worker pool that served 23,072 requests with no failure at all reported
+zero ready workers in 20% of samples taken during that load. A degradation
+check built on `ready_workers` would fire constantly under ordinary traffic.
+Compare `live_workers` against `target_workers` instead.
+
+`live_workers` is only as fresh as the last dispatch. An idle worker's death is
+detected passively on its next assignment, so a pool with no traffic reports
+workers that are already gone until something is dispatched to them. `consecutive_failures` decays and schedules replacements;
+`execution_timeouts` does neither, so it stays a faithful count of how often
+the application ran past its deadline on that slot. `PoolSnapshot` carries the
+pool-wide `total_execution_timeouts` and `live_workers` beside
+`total_respawns`.
+
+Every pool-scoped diagnostic names its pool, as `PHP worker pool <host><path>`,
+including the child's own drained standard error. Only one `php_worker`
+location is permitted today, so nothing is currently ambiguous without it; it
+exists so the diagnostics do not have to be revisited when more than one pool
+becomes possible, and so an operator can grep one pool's lines by a string they
+already wrote in their configuration.
+
+A pool that loses its last live worker reports that, and reports again when one
+returns:
+
+```text
+PHP worker pool localhost/ has no live worker after 1000 ms; requests are refused until one is READY
+PHP worker pool localhost/ recovered: 1 of 1 workers live after 1636 ms with none
+```
+
+Both lines use the same threshold, `POOL_OUTAGE_NOTICE_AFTER`, so they always
+appear in pairs. The threshold exists because every ordinary replacement passes
+through zero live workers for as long as a bootstrap takes -- 38 ms for the
+fixture, 58 to 403 ms for real Laravel applications -- and announcing those
+produced far more outage lines than recoveries, which reads as a pile of
+unresolved outages. One second clears the worst measured bootstrap about 2.5
+times over while still reporting anything a client could notice, since the
+backoff ladder holds a slot down for up to 5 s and the cooldown band for 30 to
+300 s. Reporting is suppressed during shutdown, where losing every worker is
+the goal rather than a fault.
+
+Partial degradation is deliberately not reported. A pool that is serving on two
+of four workers still answers every request, and the measured user-visible
+failure was total refusal. Adding a second threshold for partial capacity would
+need its own evidence. These values are
+observational; correctness does not poll them.
 
 ## 0.2.0 Architecture
 
@@ -233,7 +291,7 @@ one Tokio async mutex from request write through response read, so concurrent
 HTTP requests queue and protocol bytes cannot interleave. This serialization is
 intentional correctness scaffolding, not the 0.2.0 pool architecture.
 
-An I/O, protocol, ID, or five-second request-timeout failure marks the worker
+An I/O, protocol, ID, or request-timeout failure marks the worker
 unavailable and terminates it. The failed and later requests receive controlled
 `502 Bad Gateway` responses; 0.1.0 never respawns automatically.
 

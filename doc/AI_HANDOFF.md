@@ -2,6 +2,89 @@
 
 ## Current Milestone
 
+Pool Identity + Degradation Visibility is implemented in the working tree for
+owner review, on top of the closed Execution Timeout Policy slice. It is not
+committed, tagged or released.
+
+The investigation challenged its own premise and the premise was half wrong.
+Pool identity has no present value: only one `php_worker` location is permitted,
+so `slot N generation M` is already unambiguous, and the label was added only so
+the diagnostics need not be revisited when multi-pool arrives. The real defect
+was the opposite of the stated one. Degradation was already *over*-reported at
+three stderr lines per event, while recovery was reported not at all: a
+measured run ended on four consecutive failure lines while the pool was serving
+`200 200 200 200 200`. Worse, the one aggregate `PoolSnapshot` exposed,
+`ready_workers`, is not a health signal -- `mark_busy` decrements it, and it
+read zero in 20% of samples on a four-worker pool that served 23,072 requests
+without a single failure. The counter that answers the question, `live_workers`,
+was not exposed at all despite being what `execute` gates its 503 on.
+
+The slice therefore exposes `live_workers`, documents `ready_workers` as spare
+capacity, names every pool-scoped diagnostic (including drained application
+stderr) after its pool, and reports an outage and its recovery as a matched
+pair once the pool has had no live worker for longer than
+`POOL_OUTAGE_NOTICE_AFTER` (1 s, about 2.5x the worst measured bootstrap of
+403 ms). Ordinary replacement churn produces no outage lines. A first
+implementation that reported every drop to zero produced seven alarms against
+two all-clears, which was the same asymmetry in a new form and was fixed.
+Evidence: `benchmarks/results/pool_visibility_20260917.md`.
+
+Known limitations carried out of this slice:
+
+- FACT: `live_workers` is only as fresh as the last dispatch. An idle worker's
+  death is detected passively on its next assignment, so an idle pool reports
+  workers that are already gone and the outage notice cannot fire for one.
+- FACT: partial degradation is not reported. A pool serving on two of four
+  workers still answers every request; the measured user-visible failure was
+  total refusal. A partial-capacity threshold would need its own evidence.
+- FACT: a per-request failure still emits its own line, so a failing generation
+  produces one line per queued request on top of the two slot lines. Reducing
+  that duplication was left alone as outside the scope.
+- HYPOTHESIS: the 1 s threshold is derived from bootstrap times measured on
+  this host with this fixture and the recorded Laravel figures. A materially
+  slower application bootstrap would make ordinary replacements visible as
+  outages.
+
+Execution Timeout Policy is **closed by owner decision**. It is implemented in
+the working tree on top of the uncommitted 0.6.x response work and is not
+committed, tagged or released. Do not extend or reopen this slice unless new
+evidence requires it. An application execution
+timeout is now its own failure class: it still kills and reaps the worker and
+its request is still never retried, but it no longer increments the slot's
+infrastructure failure history, so repeated slow requests cannot walk a pool
+into the replacement backoff ladder or its 30-to-300 second cooldown band.
+`request_timeout` is configurable per `php_worker` location, 1 to 3600 seconds,
+defaulting to the historical 5. Fault injection measured the failure this
+fixes: eleven paced slow requests put a one-worker pool into the cooldown band
+and refused ordinary traffic for 30 151 ms, while 52 of 52 timeout-driven
+replacements reached READY, so the ladder never prevented anything. Mixed
+traffic with headroom never degraded (629 of 629 ordinary requests served). The
+HTTP status is `502` with the body `PHP Worker Execution Timeout`, by owner
+decision: the request is possibly-started, so Hamster must not emit a status
+that encourages an external retry it cannot make safe. Evidence:
+`benchmarks/results/worker_request_timeout_investigation_20260917.md` and
+`benchmarks/results/worker_request_timeout_floor_20260917.md`. The policy, what
+deliberately did not change, and the rejected alternatives are in
+`doc/EXECUTION_TIMEOUT_POLICY.md`.
+
+Known limitations carried out of the slice, and the hypotheses it did not
+test:
+
+- HYPOTHESIS: the same escalation still applies to every failure that happens
+  after the REQUEST frame is written -- I/O and protocol faults -- because they
+  share the `GenerationOutcome::Failed` path. The slice deliberately left their
+  recovery policy unchanged, and no probe drove them at rate.
+- HYPOTHESIS: a real Laravel bootstrap is 58-403 ms against the fixture's
+  ~60 ms, so the sustained-churn duty cycle in production is higher than the
+  measured G1 worst case. The arithmetic is in the floor derivation; it was
+  never measured against a real application because that needs
+  `HAMSTER_LARAVEL_TEST_PATH`.
+- FACT: five seconds is a compatibility default and nothing more. Nothing in
+  this repository establishes it as correct for any application.
+- FACT: `tests/timeout_probe.rs` is historical instrumentation, not a
+  regression suite. All of it is `#[ignore]`d and several probes take minutes.
+  The four permanent regressions live in `tests/php_worker.rs`.
+
 0.6.2 — Response Liveness is implemented in the working tree for owner review,
 on top of the uncommitted 0.6.1 streaming response. A lazy per-connection timer
 now covers only a backpressured socket write with zero byte progress; it does
@@ -301,7 +384,8 @@ committed or released.
 
 ## Next Action
 
-Owner review of 0.6.1 Concrete Streaming Response. The measured response-memory
+Owner review of the Execution Timeout Policy slice, then of 0.6.1 Concrete
+Streaming Response. The measured response-memory
 failure is closed and no static or PHP performance regression was detected.
 The pass also falsified the 0.5 inference that `header_read_timeout` reclaims an
 active response write: a streaming slow reader remains active past it. Graceful
