@@ -15,6 +15,11 @@ declare(strict_types=1);
 
 require __DIR__ . '/protocol.php';
 
+$pidMarker = getenv('HAMSTER_TEST_PID_FILE');
+if (is_string($pidMarker) && $pidMarker !== '') {
+    file_put_contents($pidMarker, (string) getmypid() . PHP_EOL, FILE_APPEND | LOCK_EX);
+}
+
 $stdin = hamster_open_worker_stdin();
 $stdout = fopen('php://stdout', 'wb');
 if ($stdout === false) {

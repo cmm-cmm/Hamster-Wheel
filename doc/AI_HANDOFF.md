@@ -1,15 +1,76 @@
 # AI Handoff
 
-## Current Milestone
+## Closed Scope — Multiple Persistent Application Pools
+
+The owner closed the implementation scope on 2026-09-18. Multiple
+`php_worker` locations are implemented in the working tree; they are not yet
+committed, tagged or released. The former validation guard was removed only
+after orchestration gained transactional ownership semantics.
+
+FACT: every location compiles to a distinct `Arc<PhpWorkerPool>` and keeps its
+own processes, queue, supervisor, spawn gate, slot/generation state, health and
+recovery counters. Request dispatch, recovery and worker lifecycle paths are
+unchanged. The one intentional cross-pool resource is the process-wide
+`BodyBudget`, because it bounds Rust process memory rather than an application.
+
+FACT: startup policy is all-or-nothing. `RuntimeConfig::start_workers` starts pools
+in configuration order and, on failure, shuts already-started pools down in
+reverse order before returning. `server::run` also converges every pool on its
+startup-error path and never binds the listener first. There is deliberately no
+degraded startup or startup retry.
+
+FACT: `shutdown_workers` attempts every pool before returning an aggregate error.
+`PhpPoolsError` keeps the initiating pool failure as its error source and lists
+cleanup failures as additional, pool-labelled evidence. The same causal rule
+now covers partial startup inside a pool when one worker reaches READY and
+another fails.
+
+FACT: nine permanent ignored regressions in `tests/multipool_probe.rs` cover healthy
+multi-pool routing, cross-pool crash isolation, partial-startup rollback,
+startup failure before bind, best-effort shutdown after an earlier pool fails,
+multiple simultaneous shutdown failures, bind failure plus cleanup failure,
+cross-pool body-budget ownership, PID reaping, and primary-versus-cleanup
+diagnostics. The test-only
+`record_pid_worker.php` records exact child PIDs, avoiding repository-wide
+process counts that can be contaminated by parallel tests.
+
+FACT: the final falsification pass found no new production correctness defect.
+The nine-test multi-pool suite, 92-test default suite, formatting, strict
+clippy and Windows MSVC release build passed; no repository PHP process
+remained. Linux was not natively verified. PMS multi-pool verification was not
+run because the prepared external environment was unavailable.
+
+Known limitations, not closure blockers without new evidence:
+
+- FACT: pool startup and shutdown are sequential; shutdown worst-case can
+  scale with pool count.
+- FACT: 64 workers is a per-pool limit; there is no process-wide worker or
+  pool ceiling.
+- FACT: direct cancellation/abort of the startup future and concurrent
+  lifecycle calls are not a qualified public contract.
+- FACT: PMS multi-pool was not verified because the prepared external
+  environment was unavailable.
+- FACT: Linux was not natively verified; Windows evidence cannot be promoted
+  to a Linux support claim.
+- HYPOTHESIS: concurrent shutdown or a global ceiling may become useful at a
+  deployment scale not represented by current evidence. Do not implement them
+  pre-emptively.
+
+INFERENCE: the verified ownership and failure paths meet this slice's contract;
+the limitations above do not invalidate it. See the authoritative record in
+`doc/MULTIPLE_PERSISTENT_APPLICATION_POOLS.md`.
+
+## Previous Milestone — Pool Identity + Degradation Visibility
 
 Pool Identity + Degradation Visibility is implemented in the working tree for
 owner review, on top of the closed Execution Timeout Policy slice. It is not
 committed, tagged or released.
 
 The investigation challenged its own premise and the premise was half wrong.
-Pool identity has no present value: only one `php_worker` location is permitted,
-so `slot N generation M` is already unambiguous, and the label was added only so
-the diagnostics need not be revisited when multi-pool arrives. The real defect
+At that milestone only one `php_worker` location was permitted, so pool identity
+had no immediate disambiguation value and the label was added in preparation
+for a later multi-pool capability. That statement is historical: the current
+contract permits multiple independently owned pools. The real defect
 was the opposite of the stated one. Degradation was already *over*-reported at
 three stderr lines per event, while recovery was reported not at all: a
 measured run ended on four consecutive failure lines while the pool was serving

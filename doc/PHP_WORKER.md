@@ -105,11 +105,17 @@ pool-wide `total_execution_timeouts` and `live_workers` beside
 `total_respawns`.
 
 Every pool-scoped diagnostic names its pool, as `PHP worker pool <host><path>`,
-including the child's own drained standard error. Only one `php_worker`
-location is permitted today, so nothing is currently ambiguous without it; it
-exists so the diagnostics do not have to be revisited when more than one pool
-becomes possible, and so an operator can grep one pool's lines by a string they
-already wrote in their configuration.
+including the child's own drained standard error. Each `php_worker` location
+owns a distinct pool, so an operator can grep one application's lifecycle by a
+string already present in the configuration. Pool state remains independent;
+only the process-wide request-body memory budget is shared deliberately.
+
+Initial startup is all-or-nothing across pools. A later pool failure rolls back
+every earlier pool before startup returns, and the listener is never bound.
+There is no degraded startup or startup retry. Normal shutdown attempts every
+pool even after one reports an error. The initiating startup/shutdown failure
+keeps its pool identity and remains the primary error source; rollback errors
+are additional evidence rather than replacements for it.
 
 A pool that loses its last live worker reports that, and reports again when one
 returns:
@@ -221,10 +227,12 @@ queue_capacity = 32
 ```
 
 `workers` defaults to 1 and is validated in 1-64. `queue_capacity` defaults to
-`min(workers * 8, 128)` and is validated in 1-128. At most one PHP worker
-location is still permitted. The 128 hard maximum caps queued request payload
-at approximately 128 MiB when every admitted job carries the 1 MiB maximum,
-before request metadata and allocator overhead.
+`min(workers * 8, 128)` and is validated in 1-128. In milestone 0.2 this section
+permitted at most one PHP worker location; the current contract permits one
+independent pool per `php_worker` location. See
+`doc/MULTIPLE_PERSISTENT_APPLICATION_POOLS.md`. The 128 hard maximum caps one
+pool's queued request payload at approximately 128 MiB when every admitted job
+carries the 1 MiB maximum, before request metadata and allocator overhead.
 
 This bounded queue limits the number of jobs admitted to the PHP pool; it is
 not complete memory backpressure for the HTTP server. HTTP bodies are buffered
@@ -286,8 +294,9 @@ validated `READY` frame, and refuses traffic until the handshake succeeds.
 Exit, EOF, malformed framing, a wrong protocol version, or the fixed five-second
 startup timeout fails server startup before the listener binds.
 
-There is exactly one worker in a runtime configuration. Every transaction holds
-one Tokio async mutex from request write through response read, so concurrent
+In the historical 0.1.0 implementation there was exactly one worker in a
+runtime configuration. Every transaction held one Tokio async mutex from
+request write through response read, so concurrent
 HTTP requests queue and protocol bytes cannot interleave. This serialization is
 intentional correctness scaffolding, not the 0.2.0 pool architecture.
 
@@ -343,11 +352,13 @@ script = "fixtures/php-worker/worker.php"
 Both paths may be absolute or relative to the directory containing
 `hamster.toml`. Startup validation requires each path to exist and be a regular
 file, then canonicalizes it once. `php` is required only for `php_worker` and is
-rejected for other handlers. More than one PHP worker location is invalid in
-this milestone. The development setup uses a locally supplied PHP 8.5 NTS at
-`php/8.5/php.exe`; the `php/` directory is intentionally ignored by Git. Place
-the PHP distribution at that path before using the checked-in `hamster.toml`,
-which exposes the fixture at `/php`. PHP is never searched from `PATH`.
+rejected for other handlers. More than one PHP worker location was invalid in
+the historical 0.1.x milestone described by this section; it is valid under
+the current multi-pool contract. The development setup uses a locally supplied
+PHP 8.5 NTS at `php/8.5/php.exe`; the `php/` directory is intentionally ignored
+by Git. Place the PHP distribution at that path before using the checked-in
+`hamster.toml`, which exposes the fixture at `/php`. PHP is never searched
+from `PATH`.
 
 ## Shutdown
 

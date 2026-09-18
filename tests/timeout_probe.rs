@@ -455,6 +455,20 @@ async fn e7_cost_of_one_timeout_wave_to_ordinary_traffic() {
             "[{:>6} ms] slow {round:>2}: {status} | fail={failures}",
             probe.now_ms()
         );
+        // This probe predates the accepted execution-timeout policy. A slow
+        // application transaction now increments its dedicated counter and
+        // deliberately does not enter the infrastructure backoff ladder, so
+        // the old open-ended loop could never reach `fail > 10`. Keep the
+        // historical probe runnable under `cargo test -- --ignored` without
+        // pretending it still measures a reachable policy.
+        if round == 2 && failures == 0 {
+            assert_eq!(probe.snapshot().total_execution_timeouts, 2);
+            println!(
+                "E7 not applicable: execution timeouts do not enter the infrastructure cooldown ladder"
+            );
+            probe.stop().await;
+            return;
+        }
         if failures > 10 {
             break;
         }

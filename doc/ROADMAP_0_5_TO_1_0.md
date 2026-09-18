@@ -30,11 +30,13 @@ acquiring a Hamster-specific worker protocol before evidence justifies one.
 
 ## Evidence from 0.0 through 0.4
 
-FACT: the server currently accepts HTTP/1.1 only and discards the socket peer
-address before routing. Handler responses use one fully buffered body type.
-Static GET canonicalizes a path and reads the complete file for every request.
-The compiled configuration allows one PHP-worker location and has no runtime
-reload. Protocol v1 has a 1 MiB request-body limit and no typed transport
+FACT (historical 0.0-0.4 baseline): the server accepted HTTP/1.1 only and
+discarded the socket peer address before routing. Handler responses used one
+fully buffered body type. Static GET canonicalized a path and read the complete
+file for every request. The compiled configuration allowed one PHP-worker
+location and had no runtime reload. These are baseline facts, not current
+claims; the current configuration supports multiple persistent application
+pools. Protocol v1 retains a 1 MiB request-body limit and no typed transport
 metadata.
 
 FACT: the Windows static investigations attributed the main cost to filesystem
@@ -396,10 +398,10 @@ latency and failures. 0.8 stabilizes export, access control and operator UX only
 
 ### Challenge: reload could precede proxy
 
-INFERENCE: implementing reload against only static plus one PHP pool would
-encode the wrong resource model. Startup-only configuration is acceptable
-during 0.5–0.7 development; transactional reload follows once all three backend
-shapes exist.
+INFERENCE (at roadmap design time): implementing reload before multi-pool and
+reverse-proxy ownership existed would encode the wrong resource model.
+Startup-only configuration is acceptable during 0.5–0.7 development;
+transactional reload follows once all three backend shapes exist.
 
 ### Alternative A: origin-first 1.0
 

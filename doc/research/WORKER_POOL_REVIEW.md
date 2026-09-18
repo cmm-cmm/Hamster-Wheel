@@ -6,6 +6,11 @@ review decisions.
 Baseline: 0.1.2, Windows-accepted (see the platform status in
 `doc/PHP_WORKER.md`).
 
+Historical scope note: statements below that 0.1/0.2 permits exactly one
+`php_worker` location describe those milestones, not the current product. The
+closed current contract is one independently owned `PhpWorkerPool` per
+`php_worker` location; see `doc/MULTIPLE_PERSISTENT_APPLICATION_POOLS.md`.
+
 Accepted decisions reflected in this revision:
 
 1. No 0.1.3 hotfix. The 0.1.2 cancellation defect is recorded as a known

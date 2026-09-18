@@ -148,6 +148,92 @@ pub struct RuntimeConfig {
     php_pools: Vec<Arc<PhpWorkerPool>>,
 }
 
+#[derive(Debug)]
+pub struct PhpPoolFailure {
+    label: Arc<str>,
+    source: PhpWorkerError,
+}
+
+impl PhpPoolFailure {
+    fn new(pool: &PhpWorkerPool, source: PhpWorkerError) -> Self {
+        Self {
+            label: Arc::from(pool.label()),
+            source,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn error(&self) -> &PhpWorkerError {
+        &self.source
+    }
+}
+
+impl fmt::Display for PhpPoolFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "PHP worker pool {:?}: {}",
+            self.label, self.source
+        )
+    }
+}
+
+impl std::error::Error for PhpPoolFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// One primary pool failure plus failures encountered while converging the
+/// remaining pools. The primary error always stays first and remains the
+/// error source; cleanup evidence must never replace the initiating failure.
+#[derive(Debug)]
+pub struct PhpPoolsError {
+    primary: PhpPoolFailure,
+    additional: Vec<PhpPoolFailure>,
+}
+
+impl PhpPoolsError {
+    fn new(primary: PhpPoolFailure, additional: Vec<PhpPoolFailure>) -> Self {
+        Self {
+            primary,
+            additional,
+        }
+    }
+
+    pub const fn primary(&self) -> &PhpPoolFailure {
+        &self.primary
+    }
+
+    pub fn additional(&self) -> &[PhpPoolFailure] {
+        &self.additional
+    }
+
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.additional.push(other.primary);
+        self.additional.append(&mut other.additional);
+    }
+}
+
+impl fmt::Display for PhpPoolsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.primary)?;
+        for failure in &self.additional {
+            write!(formatter, "; additional cleanup failure: {failure}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PhpPoolsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpLimits {
     max_connections: usize,
@@ -238,23 +324,49 @@ impl RuntimeConfig {
         self.http_limits
     }
 
-    pub async fn start_workers(&self) -> Result<Vec<WorkerStart>, PhpWorkerError> {
+    pub async fn start_workers(&self) -> Result<Vec<WorkerStart>, PhpPoolsError> {
         let mut starts = Vec::new();
-        for pool in &self.php_pools {
-            starts.extend(pool.start().await?);
+        for (index, pool) in self.php_pools.iter().enumerate() {
+            match pool.start().await {
+                Ok(pool_starts) => starts.extend(pool_starts),
+                Err(error) => {
+                    let primary = PhpPoolFailure::new(pool, error);
+                    let mut cleanup_failures = Vec::new();
+                    // Roll acquisition back in reverse order. Every earlier
+                    // pool is attempted even when one cleanup reports an
+                    // error, because each pool owns independent children.
+                    for started_pool in self.php_pools[..index].iter().rev() {
+                        if let Err(error) = started_pool.shutdown().await {
+                            cleanup_failures.push(PhpPoolFailure::new(started_pool, error));
+                        }
+                    }
+                    return Err(PhpPoolsError::new(primary, cleanup_failures));
+                }
+            }
         }
         Ok(starts)
     }
 
-    pub async fn shutdown_workers(&self) -> Result<(), PhpWorkerError> {
+    pub async fn shutdown_workers(&self) -> Result<(), PhpPoolsError> {
+        let mut failures = Vec::new();
         for pool in &self.php_pools {
-            pool.shutdown().await?;
+            if let Err(error) = pool.shutdown().await {
+                failures.push(PhpPoolFailure::new(pool, error));
+            }
         }
-        Ok(())
+        let mut failures = failures.into_iter();
+        match failures.next() {
+            Some(primary) => Err(PhpPoolsError::new(primary, failures.collect())),
+            None => Ok(()),
+        }
     }
 
     pub fn php_worker(&self) -> Option<&Arc<PhpWorkerPool>> {
         self.php_pools.first()
+    }
+
+    pub fn php_workers(&self) -> &[Arc<PhpWorkerPool>] {
+        &self.php_pools
     }
 }
 
@@ -529,7 +641,6 @@ pub(crate) fn validate_raw(
 
     let mut names = HashMap::<String, HostnameRole>::new();
     let mut hosts = Vec::with_capacity(raw.hosts.len());
-    let mut php_worker_count = 0_usize;
     for (host_index, host) in raw.hosts.into_iter().enumerate() {
         validate_hostname_field(&host.name, &format!("hosts[{host_index}].name"))?;
         register_hostname(
@@ -670,12 +781,6 @@ pub(crate) fn validate_raw(
                     if php.max_worker_age == Some(0) {
                         return Err(ConfigError::Validation(format!(
                             "{context}.php.max_worker_age must be at least 1 second when configured"
-                        )));
-                    }
-                    php_worker_count += 1;
-                    if php_worker_count > 1 {
-                        return Err(ConfigError::Validation(format!(
-                            "{context}: milestone 0.3.0 permits exactly one php_worker location"
                         )));
                     }
                     for name in php.env.keys() {

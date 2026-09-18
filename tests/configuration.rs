@@ -1,12 +1,15 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use hamster_wheel::{
     config::{self, ConfigError},
-    router::HandlerKind,
+    router::{Handler, HandlerKind},
     server,
 };
 use hyper::{HeaderMap, header::HOST};
@@ -448,7 +451,7 @@ fn validates_php_pool_worker_and_queue_bounds() {
 }
 
 #[test]
-fn rejects_missing_invalid_and_multiple_php_worker_configuration() {
+fn rejects_missing_and_invalid_php_worker_configuration() {
     let temporary = TestDirectory::new();
     std::fs::write(temporary.path.join("php.exe"), "fixture executable").unwrap();
     std::fs::write(temporary.path.join("worker.php"), "<?php").unwrap();
@@ -474,14 +477,37 @@ fn rejects_missing_invalid_and_multiple_php_worker_configuration() {
             Err(ConfigError::Compile(_))
         ));
     }
+}
 
+#[test]
+fn compiles_multiple_php_worker_locations_as_distinct_pools() {
+    let temporary = TestDirectory::new();
+    std::fs::write(temporary.path.join("php.exe"), "fixture executable").unwrap();
+    std::fs::write(temporary.path.join("worker.php"), "<?php").unwrap();
     let multiple = not_found_config(
         "\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/one\"\nhandler = \"php_worker\"\n[hosts.locations.php]\nexecutable = \"php.exe\"\nscript = \"worker.php\"\n\n[[hosts.locations]]\npath = \"/two\"\nhandler = \"php_worker\"\n[hosts.locations.php]\nexecutable = \"php.exe\"\nscript = \"worker.php\"\n",
     );
-    assert!(matches!(
-        config::compile_str(&multiple, &temporary.path),
-        Err(ConfigError::Validation(_))
-    ));
+    let runtime = config::compile_str(&multiple, &temporary.path).unwrap();
+    assert_eq!(runtime.php_workers().len(), 2);
+    assert_eq!(runtime.php_workers()[0].label(), "localhost/one");
+    assert_eq!(runtime.php_workers()[1].label(), "localhost/two");
+    let Handler::PhpWorker { pool: first_route } = runtime
+        .router()
+        .route(&headers("localhost"), "/one/request")
+        .unwrap()
+    else {
+        panic!("/one did not compile to a PHP pool");
+    };
+    let Handler::PhpWorker { pool: second_route } = runtime
+        .router()
+        .route(&headers("localhost"), "/two/request")
+        .unwrap()
+    else {
+        panic!("/two did not compile to a PHP pool");
+    };
+    assert!(Arc::ptr_eq(first_route, &runtime.php_workers()[0]));
+    assert!(Arc::ptr_eq(second_route, &runtime.php_workers()[1]));
+    assert!(!Arc::ptr_eq(first_route, second_route));
 }
 
 #[test]

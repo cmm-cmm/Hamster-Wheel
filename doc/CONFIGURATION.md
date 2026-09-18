@@ -248,8 +248,21 @@ requires `root`; a PHP worker location requires `php.executable` and
 defaults to `min(workers * 8, 128)` and must be 1-128. Handler-specific fields
 on another handler are errors. `max_requests` is an optional positive request
 count. `max_worker_age` is an optional integer number of seconds and must be at
-least 1. Both default OFF. Milestone 0.3.0 permits one PHP worker pool location.
-Unknown fields are errors.
+least 1. Both default OFF. Each `php_worker` location owns an independent fixed
+pool. Multiple locations may coexist on one host or across virtual hosts;
+diagnostics identify a pool as `<host><normalized-location-path>`. Unknown
+fields are errors.
+
+All configured pools must complete their READY handshakes before the listener
+binds. If any pool fails startup, pools that already started are shut down in
+reverse startup order and the server fails startup. There is no degraded
+startup or startup retry. Pool queues, processes, lifecycle state, health and
+recycling policy are independent. `server.max_body_memory` is intentionally
+different: one process-wide `BodyBudget` is shared by every pool because it
+bounds Rust process memory rather than an application's queue.
+
+The complete ownership, rollback, diagnostics and shutdown contract is recorded
+in `doc/MULTIPLE_PERSISTENT_APPLICATION_POOLS.md`.
 
 `php.env` is an optional table of extra environment variables for the worker
 process, applied on top of the server's own environment and given to every
@@ -271,7 +284,8 @@ See the recycling limitation in `doc/PHP_WORKER.md`.
 The queue bound limits the number of jobs admitted to the PHP pool, not total
 HTTP request memory. PHP request bodies are buffered before pool admission. A
 full queue plus busy workers can retain up to
-`min(max_connections, workers + queue_capacity) * 1 MiB` of completed payload,
+`min(max_connections, sum(workers + queue_capacity for every pool)) * 1 MiB`
+of completed payload,
 but those jobs originated from the already accepted connection set; it does not
 add another independent `max_connections` population. Bodies still being read
 can approach `max_connections * 1 MiB` under coordinated slow uploads, before
@@ -303,8 +317,7 @@ invalid explicit files never fall back to the built-in configuration.
 Configuration fails fast for an invalid listen address or HTTP bound; empty or invalid host
 names; case-insensitive primary/alias collisions; absent hosts or locations;
 invalid or duplicate normalized location paths; unknown handlers; missing or
-unexpected handler fields; multiple PHP worker locations; invalid pool bounds;
-static roots that cannot be
+unexpected handler fields; invalid pool bounds; static roots that cannot be
 canonicalized or are not directories; and PHP executable/script paths that are
 missing or not files. Errors identify the field plus the host/location index or
 name where applicable. No dangerous input is silently repaired, and PHP is not
@@ -316,9 +329,15 @@ searched from `PATH`.
 address, checks global host uniqueness, normalizes location definitions, and
 resolves roots against a stable base directory. Compilation canonicalizes static
 roots and executable/script paths and constructs the existing vector-based
-routers and handler enum. A compiled `PhpWorker` starts and completes its READY
-handshake before the listener binds. Only the finished `RuntimeConfig` reaches
-the server.
+routers and handler enum. Every compiled `PhpWorkerPool` starts and completes
+all READY handshakes before the listener binds. Partial startup is rolled back;
+only the completely started `RuntimeConfig` reaches the server.
+
+Shutdown is best-effort across the complete pool set. A failure in one pool is
+reported with that pool's identity but does not prevent later pools from being
+drained, shut down and reaped. When startup rollback also fails, the original
+startup error remains the primary error/source and cleanup failures are
+reported as additional evidence.
 
 Configuration failures use `ConfigError` categories for arguments, I/O, parse,
 validation, and compile errors. User input never causes a panic; the executable

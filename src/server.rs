@@ -6,8 +6,7 @@ use tokio::time::timeout;
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{
-    config::{HttpLimits, RuntimeConfig},
-    php_worker::PhpWorkerError,
+    config::{HttpLimits, PhpPoolsError, RuntimeConfig},
     router::HostRouter,
     transport::TransportInfo,
     write_progress::WriteProgressTimeout,
@@ -16,7 +15,11 @@ use crate::{
 #[derive(Debug)]
 pub enum ServerError {
     Io(io::Error),
-    Worker(PhpWorkerError),
+    Worker(PhpPoolsError),
+    IoWithWorkerCleanup {
+        source: io::Error,
+        cleanup: PhpPoolsError,
+    },
 }
 
 impl fmt::Display for ServerError {
@@ -24,6 +27,10 @@ impl fmt::Display for ServerError {
         match self {
             Self::Io(error) => write!(formatter, "server I/O: {error}"),
             Self::Worker(error) => write!(formatter, "{error}"),
+            Self::IoWithWorkerCleanup { source, cleanup } => write!(
+                formatter,
+                "server I/O: {source}; additional worker cleanup failure: {cleanup}"
+            ),
         }
     }
 }
@@ -33,6 +40,7 @@ impl std::error::Error for ServerError {
         match self {
             Self::Io(error) => Some(error),
             Self::Worker(error) => Some(error),
+            Self::IoWithWorkerCleanup { source, .. } => Some(source),
         }
     }
 }
@@ -43,14 +51,27 @@ impl From<io::Error> for ServerError {
     }
 }
 
-impl From<PhpWorkerError> for ServerError {
-    fn from(error: PhpWorkerError) -> Self {
+impl From<PhpPoolsError> for ServerError {
+    fn from(error: PhpPoolsError) -> Self {
         Self::Worker(error)
     }
 }
 
 pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
-    for worker in config.start_workers().await? {
+    let workers = match config.start_workers().await {
+        Ok(workers) => workers,
+        Err(mut startup_error) => {
+            // start_workers rolls back pools that completed startup. This
+            // second convergence is intentional: the top-level owner must
+            // still attempt every pool, including the pool that failed and
+            // pools not yet reached, before it returns without a listener.
+            if let Err(cleanup_error) = config.shutdown_workers().await {
+                startup_error.append(cleanup_error);
+            }
+            return Err(ServerError::Worker(startup_error));
+        }
+    };
+    for worker in workers {
         println!(
             "PHP worker pool {} worker {} ready after {:.3} ms",
             worker.label,
@@ -62,15 +83,25 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     let listener = match TcpListener::bind(address).await {
         Ok(listener) => listener,
         Err(error) => {
-            let _ = config.shutdown_workers().await;
-            return Err(ServerError::Io(error));
+            return match config.shutdown_workers().await {
+                Ok(()) => Err(ServerError::Io(error)),
+                Err(cleanup) => Err(ServerError::IoWithWorkerCleanup {
+                    source: error,
+                    cleanup,
+                }),
+            };
         }
     };
     let shutdown = match shutdown_signal() {
         Ok(shutdown) => shutdown,
         Err(error) => {
-            let _ = config.shutdown_workers().await;
-            return Err(ServerError::Io(error));
+            return match config.shutdown_workers().await {
+                Ok(()) => Err(ServerError::Io(error)),
+                Err(cleanup) => Err(ServerError::IoWithWorkerCleanup {
+                    source: error,
+                    cleanup,
+                }),
+            };
         }
     };
     // Printed once at startup, beside the other readiness lines. A refused
@@ -86,9 +117,12 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     let router = config.router_arc();
     let serve_result = serve_with_router(listener, router, config.http_limits(), shutdown).await;
     let shutdown_result = config.shutdown_workers().await;
-    serve_result?;
-    shutdown_result?;
-    Ok(())
+    match (serve_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(ServerError::Io(error)),
+        (Ok(()), Err(error)) => Err(ServerError::Worker(error)),
+        (Err(source), Err(cleanup)) => Err(ServerError::IoWithWorkerCleanup { source, cleanup }),
+    }
 }
 
 pub async fn serve_with_router<F>(

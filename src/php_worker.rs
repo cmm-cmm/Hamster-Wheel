@@ -296,6 +296,10 @@ pub enum PhpWorkerError {
         source: io::Error,
     },
     Startup(String),
+    StartupCleanup {
+        source: Box<PhpWorkerError>,
+        cleanup: Vec<String>,
+    },
     Unavailable(String),
     Request(String),
     /// The worker failed while it was provably still ignorant of the request:
@@ -337,6 +341,13 @@ impl fmt::Display for PhpWorkerError {
                 )
             }
             Self::Startup(message) => write!(formatter, "PHP worker startup failed: {message}"),
+            Self::StartupCleanup { source, cleanup } => {
+                write!(formatter, "{source}")?;
+                for failure in cleanup {
+                    write!(formatter, "; additional startup cleanup failure: {failure}")?;
+                }
+                Ok(())
+            }
             Self::Unavailable(message) => write!(formatter, "PHP worker unavailable: {message}"),
             Self::Request(message) => write!(formatter, "PHP worker request failed: {message}"),
             Self::NotStarted(message) => write!(
@@ -356,6 +367,7 @@ impl std::error::Error for PhpWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Spawn { source, .. } => Some(source),
+            Self::StartupCleanup { source, .. } => Some(source.as_ref()),
             Self::Startup(_)
             | Self::Unavailable(_)
             | Self::Request(_)
@@ -899,6 +911,28 @@ struct InitialGenerationSpec {
     spawned_at: Instant,
 }
 
+async fn cleanup_startup_workers(workers: Vec<Option<(PhpWorker, WorkerStart)>>) -> Vec<String> {
+    let mut cleanup = JoinSet::new();
+    for (slot, entry) in workers.into_iter().enumerate() {
+        if let Some((mut worker, _)) = entry {
+            cleanup.spawn(async move { (slot, worker.shutdown().await) });
+        }
+    }
+    let mut cleanup_errors = Vec::new();
+    while let Some(result) = cleanup.join_next().await {
+        match result {
+            Ok((_, Ok(()))) => {}
+            Ok((slot, Err(cleanup_error))) => {
+                cleanup_errors.push(format!("worker {slot}: {cleanup_error}"));
+            }
+            Err(join_error) => {
+                cleanup_errors.push(format!("worker cleanup task failed: {join_error}"));
+            }
+        }
+    }
+    cleanup_errors
+}
+
 impl PhpWorkerPool {
     pub fn new(config: PhpWorkerPoolConfig) -> Self {
         let workers = config.workers;
@@ -964,6 +998,10 @@ impl PhpWorkerPool {
 
     pub fn worker_count(&self) -> usize {
         self.shared.config.workers
+    }
+
+    pub fn label(&self) -> &str {
+        &self.shared.config.label
     }
 
     pub fn queue_capacity(&self) -> usize {
@@ -1055,25 +1093,31 @@ impl PhpWorkerPool {
         }
 
         if let Some(error) = first_error {
-            let mut cleanup = JoinSet::new();
-            for (mut worker, _) in workers.into_iter().flatten() {
-                cleanup.spawn(async move { worker.shutdown().await });
-            }
-            while cleanup.join_next().await.is_some() {}
+            let cleanup_errors = cleanup_startup_workers(workers).await;
             *self.shared.lifecycle.lock().await = PoolLifecycle::Stopped;
-            return Err(error);
+            return if cleanup_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(PhpWorkerError::StartupCleanup {
+                    source: Box::new(error),
+                    cleanup: cleanup_errors,
+                })
+            };
         }
 
         if !self.shared.spawn_gate.is_serving() {
-            let mut cleanup = JoinSet::new();
-            for (mut worker, _) in workers.into_iter().flatten() {
-                cleanup.spawn(async move { worker.shutdown().await });
-            }
-            while cleanup.join_next().await.is_some() {}
+            let cleanup_errors = cleanup_startup_workers(workers).await;
             *self.shared.lifecycle.lock().await = PoolLifecycle::Stopped;
-            return Err(PhpWorkerError::Startup(
-                "worker pool shutdown started during startup".to_owned(),
-            ));
+            let error =
+                PhpWorkerError::Startup("worker pool shutdown started during startup".to_owned());
+            return if cleanup_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(PhpWorkerError::StartupCleanup {
+                    source: Box::new(error),
+                    cleanup: cleanup_errors,
+                })
+            };
         }
 
         let (jobs_tx, jobs_rx) = mpsc::channel(self.shared.config.queue_capacity);
@@ -2718,7 +2762,7 @@ fn reserved_response_header(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{error::Error, sync::Arc};
 
     use super::*;
 
@@ -3344,6 +3388,32 @@ mod tests {
         );
         let error = pool.start().await.unwrap_err();
         assert!(error.to_string().contains("worker"));
+        assert!(pool.pids().is_empty());
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires repository php/8.5/php.exe"]
+    async fn partial_pool_startup_preserves_cause_and_reports_cleanup_failure() {
+        let pool = PhpWorkerPool::with_worker_configs(
+            vec![
+                fixture("ignores_shutdown.php"),
+                fixture("malformed_ready.php"),
+            ],
+            8,
+        );
+        let error = pool.start().await.unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("expected READY frame"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("additional startup cleanup failure"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("worker 0"), "{diagnostic}");
+        assert!(
+            error.source().is_some(),
+            "startup cause must remain chained"
+        );
         assert!(pool.pids().is_empty());
         pool.shutdown().await.unwrap();
     }
