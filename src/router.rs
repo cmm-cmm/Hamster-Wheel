@@ -164,6 +164,10 @@ impl HostRouter {
 
     pub fn find_host(&self, headers: &HeaderMap) -> Result<&LocationRouter, RouteError> {
         let hostname = request_hostname(headers)?;
+        self.find_hostname(hostname)
+    }
+
+    fn find_hostname(&self, hostname: &str) -> Result<&LocationRouter, RouteError> {
         self.hosts
             .iter()
             .find(|host| host.hostname.eq_ignore_ascii_case(hostname))
@@ -177,15 +181,46 @@ impl HostRouter {
 
     pub(crate) async fn serve(
         &self,
-        request: Request<Incoming>,
+        mut request: Request<Incoming>,
         transport: TransportInfo,
         body_read_timeout: Duration,
     ) -> Result<HandlerResponse, std::convert::Infallible> {
-        let handler = match self.route(request.headers(), request.uri().path()) {
+        let handler = match self.route_request(&mut request) {
             Ok(handler) => handler,
             Err(error) => return Ok(simple_response(error.status(), error.message())),
         };
         handler.serve(request, transport, body_read_timeout).await
+    }
+
+    fn route_request<B>(&self, request: &mut Request<B>) -> Result<&Handler, RouteError> {
+        // HTTP/1.1 still requires exactly one valid Host field for every
+        // request. For absolute-form, however, RFC 9112 requires an origin
+        // server to ignore that field's identity and use the request-target
+        // authority. Replace Host before routing so handlers cannot observe a
+        // different authority from the one that selected their virtual host.
+        let target_authority = if request.uri().scheme().is_some() {
+            Some(
+                request
+                    .uri()
+                    .authority()
+                    .cloned()
+                    .ok_or(RouteError::InvalidHost)?,
+            )
+        } else {
+            None
+        };
+        let received_hostname = request_hostname(request.headers())?;
+
+        let locations = if let Some(authority) = target_authority {
+            let hostname = parse_authority(authority.as_str())?;
+            let host =
+                HeaderValue::from_str(authority.as_str()).map_err(|_| RouteError::InvalidHost)?;
+            request.headers_mut().insert(HOST, host);
+            self.find_hostname(hostname)?
+        } else {
+            self.find_hostname(received_hostname)?
+        };
+        locations.route(request.uri().path())
     }
 
     #[cfg(feature = "profiling")]
@@ -218,6 +253,10 @@ fn request_hostname(headers: &HeaderMap) -> Result<&str, RouteError> {
 
 fn parse_host(value: &HeaderValue) -> Result<&str, RouteError> {
     let authority = value.to_str().map_err(|_| RouteError::InvalidHost)?;
+    parse_authority(authority)
+}
+
+fn parse_authority(authority: &str) -> Result<&str, RouteError> {
     let (hostname, port) = match authority.rsplit_once(':') {
         Some((hostname, port)) => (hostname, Some(port)),
         None => (authority, None),
@@ -374,5 +413,98 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn absolute_form_replaces_host_before_routing_and_downstream_dispatch() {
+        let router = test_router();
+        let mut request = Request::builder()
+            .uri("http://EXAMPLE.TEST:8443/api?value=1")
+            .header(HOST, "other.test:9000")
+            .body(())
+            .unwrap();
+
+        let handler = router.route_request(&mut request).unwrap();
+
+        assert!(matches!(handler, Handler::Simple { body: "api", .. }));
+        assert_eq!(request.headers().get_all(HOST).iter().count(), 1);
+        assert_eq!(request.headers()[HOST], "EXAMPLE.TEST:8443");
+        assert_eq!(request.uri().authority().unwrap(), "EXAMPLE.TEST:8443");
+    }
+
+    #[test]
+    fn origin_form_keeps_the_validated_host_as_effective_authority() {
+        let router = test_router();
+        let mut request = Request::builder()
+            .uri("/api")
+            .header(HOST, "Example.Test:8080")
+            .body(())
+            .unwrap();
+
+        let handler = router.route_request(&mut request).unwrap();
+
+        assert!(matches!(handler, Handler::Simple { body: "api", .. }));
+        assert_eq!(request.headers()[HOST], "Example.Test:8080");
+        assert!(request.uri().authority().is_none());
+    }
+
+    #[test]
+    fn absolute_form_still_requires_one_valid_host_field() {
+        let router = test_router();
+        let mut missing = Request::builder()
+            .uri("http://example.test/api")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            router.route_request(&mut missing),
+            Err(RouteError::MissingHost)
+        ));
+
+        let mut invalid = Request::builder()
+            .uri("http://example.test/api")
+            .header(HOST, "bad_host")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            router.route_request(&mut invalid),
+            Err(RouteError::InvalidHost)
+        ));
+
+        let mut duplicate = Request::builder()
+            .uri("http://example.test/api")
+            .header(HOST, "example.test")
+            .body(())
+            .unwrap();
+        duplicate
+            .headers_mut()
+            .append(HOST, HeaderValue::from_static("example.test"));
+        assert!(matches!(
+            router.route_request(&mut duplicate),
+            Err(RouteError::InvalidHost)
+        ));
+    }
+
+    #[test]
+    fn absolute_form_rejects_invalid_and_unknown_target_authority() {
+        let router = test_router();
+        let mut invalid = Request::builder()
+            .uri("http://example.test:99999/api")
+            .header(HOST, "example.test")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            router.route_request(&mut invalid),
+            Err(RouteError::InvalidHost)
+        ));
+
+        let mut unknown = Request::builder()
+            .uri("http://unknown.test/api")
+            .header(HOST, "example.test")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            router.route_request(&mut unknown),
+            Err(RouteError::UnknownHost)
+        ));
     }
 }

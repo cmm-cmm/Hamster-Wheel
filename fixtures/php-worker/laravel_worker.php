@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /**
- * Persistent Laravel worker for Hamster protocol v1.
+ * Persistent Laravel worker for Hamster protocol v2.
  *
  * Laravel Octane owns application/container request isolation. Hamster owns
  * protocol framing, request reconstruction, upload temporaries and the final

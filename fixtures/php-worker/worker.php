@@ -95,6 +95,20 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
                 'body' => $request['body'],
             ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
             break;
+        case '/metadata':
+            $response['headers'] = [['content-type', 'application/json']];
+            $response['body'] = json_encode([
+                'pid' => getmypid(),
+                'http_version' => $request['http_version'],
+                'peer_addr' => $request['peer_addr'],
+                'peer_port' => $request['peer_port'],
+                'local_addr' => $request['local_addr'],
+                'local_port' => $request['local_port'],
+                'method' => $request['method'],
+                'uri' => $request['uri'],
+                'headers' => $request['headers'],
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+            break;
         case '/echo':
             $response['status'] = 201;
             $response['headers'] = [

@@ -228,7 +228,8 @@ waiting. It defaults to 64 MiB, reports its configured value at startup and its
 refusals on standard error at most once per minute, and `0` is an explicit
 unlimited opt-out. Static response bodies now stream in bounded 128 KiB frames;
 32 slow clients serving 256 MiB files used 9.39 MiB additional private memory.
-PHP responses remain buffered protocol-v1 frames. `header_read_timeout` still
+PHP responses remain buffered protocol-v2 frames; their response-frame layout
+is unchanged. `header_read_timeout` still
 does not cover response writes; `write_progress_timeout` now releases an active
 response after its socket write makes zero progress for a configured interval.
 This is deliberately not a total-duration or minimum-rate policy, so a peer
@@ -401,10 +402,10 @@ Raw results and reproduction scripts are under `benchmarks/`.
 
 The original PMS remains untouched and does not declare Octane. Its pinned
 PhpSpreadsheet 1.30.6 declares PHP `<8.5`, so the scratch dependency install
-needed an explicit platform-ignore. Protocol v1 also lacks typed peer metadata,
-leaving `REMOTE_ADDR=127.0.0.1`; a stripped server-owned pseudo-header could
-carry it without changing framing, while a typed solution requires v2. This is
-an owner decision. See
+needed an explicit platform-ignore. At 0.4 closure, protocol v1 still lacked
+typed peer metadata and left `REMOTE_ADDR=127.0.0.1`; that historical decision
+was subsequently resolved by strict typed protocol v2. See the current handoff
+section below and
 `doc/research/LARAVEL_LIFECYCLE_0_4_REVIEW.md`.
 
 ## Accepted 0.5-1.0 Production Spine direction
@@ -466,8 +467,8 @@ Remaining 0.4 decisions and out-of-scope qualifications:
   contract. Do not infer it from an untrusted forwarded header.
 
 - Raise the 1 MiB request body limit, or stream bodies, so uploads larger than
-  that work. This is a protocol change and needs a milestone that owns the
-  protocol; do not change protocol v1 outside one.
+  that work. This remains a protocol change and needs a milestone that owns the
+  current protocol v2 contract.
 - Exercise the supplied application's own import endpoints. Not done here
   because they write to the owner's database.
 - Native Linux verification, still deferred.
@@ -477,9 +478,54 @@ Remaining 0.4 decisions and out-of-scope qualifications:
 
 Roadmap decisions, due at their relevant design gates:
 
-- select the protocol-v1 compatibility and typed transport-metadata policy
-  before any backend wire mapping ships;
+- DONE: strict typed protocol v2 owns transport metadata; protocol v1 workers
+  fail startup before listener bind and there is no fallback;
 - choose managed versus externally managed Windows FastCGI before 0.6 is
   finalized;
 - choose edge-capable versus origin-only and the HTTP/2 gate before 0.9;
 - identify 1.0-stable config/protocol surfaces before the release candidate.
+
+## Current working-tree handoff: Application Request Metadata (2026-09-18)
+
+This section supersedes the older `Next Action` and protocol-v1 decision notes
+above. Those passages are retained as historical context, not current work.
+
+FACT: the owner selected typed protocol v2. The PHP handler now passes the
+accepted connection's immutable `TransportInfo` plus the actual HTTP version
+into each independently owned `WorkerRequest`. V2 encodes HTTP/1.0 versus 1.1,
+peer IP/port and local IP/port before the existing request fields. IPv4 and
+IPv6 use family-tagged fixed-width bytes. READY compatibility is strict v2;
+there is no v1 fallback or optional tail.
+
+FACT: Laravel's Symfony request server bag now receives `REMOTE_ADDR/PORT`,
+`SERVER_ADDR/PORT`, actual `SERVER_PROTOCOL`, cleartext
+`REQUEST_SCHEME=http`/`HTTPS=off`, effective `HTTP_HOST`, and `SERVER_NAME`
+derived from that same effective authority hostname. No PHP `$_SERVER` globals
+are hydrated. Forwarded headers remain ordinary untrusted client input.
+
+FACT: checked-in regressions cover PHP decoder corruption, old-worker startup
+mismatch before listener bind, `.2`/`.3` real loopback peers and ports,
+HTTP/1.0, absolute-form authority conflict, keep-alive request separation,
+W1 reuse and independent multi-pool delivery. The checked-in scratch PMS probe
+configures Symfony to trust only `127.0.0.1`; an actual `.2` peer with forged
+forwarded client/host/scheme/port values remains `.2`/`localhost`/`http`, and a
+following `.3` request replaces all request-owned metadata on the same W1 PID.
+
+FACT: Windows verification passed the 100,000-request protocol soak, the full
+nine-test multi-pool fault matrix, PHP decoder/request reconstruction checks,
+PMS W1/W4 lifecycle and cleanup recovery, cancellation stress, crash recovery,
+at-most-once execution timeout and shutdown drain. The temporary prepared PMS
+copy was updated for the probe; the original PMS was not modified.
+
+INFERENCE: a four-pair alternating release comparison demonstrates no material
+trivial-worker regression, but its spread cannot exclude a low-single-digit
+cost. Paired RPS and CPU signs split two/two. Do not claim v2 is zero-cost.
+Raw samples and exact contract are in
+`doc/APPLICATION_REQUEST_METADATA.md`.
+
+Known limits are not blockers without new evidence: PHP globals and duplicate
+header semantics remain separate adapter compatibility work; TLS/trusted proxy
+implementation was not opened; IPv6 was binary-decoder tested but not exercised
+end to end; IPv6 scope IDs are not represented; Linux remains not natively
+verified. The working tree is not committed, tagged, pushed, merged or released.
+Owner decides closure and repository actions.

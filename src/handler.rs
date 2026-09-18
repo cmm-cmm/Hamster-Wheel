@@ -114,7 +114,7 @@ impl Handler {
     pub(crate) async fn serve(
         &self,
         request: Request<Incoming>,
-        _transport: TransportInfo,
+        transport: TransportInfo,
         body_read_timeout: Duration,
     ) -> Result<HandlerResponse, Infallible> {
         match self {
@@ -122,13 +122,16 @@ impl Handler {
                 static_files::serve(request, Arc::clone(document_root)).await
             }
             Self::Simple { status, body } => Ok(simple_response(*status, body)),
-            Self::PhpWorker { pool } => Ok(pool.serve_http(request, body_read_timeout).await),
+            Self::PhpWorker { pool } => {
+                Ok(pool.serve_http(request, transport, body_read_timeout).await)
+            }
             #[cfg(test)]
-            Self::TransportEcho => Ok(transport_response(_transport)),
+            Self::TransportEcho => Ok(transport_response(transport)),
             #[cfg(test)]
             Self::BodyEcho { budget, hold } => {
                 Ok(crate::php_worker::PhpWorkerPool::test_body_echo(
                     request,
+                    transport,
                     body_read_timeout,
                     budget,
                     *hold,

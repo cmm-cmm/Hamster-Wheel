@@ -191,7 +191,8 @@ Tokio, Hyper/socket and allocator overhead were included. `max_connections`
 bounds how many such streams the process owns. `max_body_memory` continues to
 count request bodies only.
 
-PHP responses remain buffered protocol-v1 frames and are unchanged. Their frame
+PHP responses remain buffered protocol-v2 frames; the response frame shape is
+unchanged. Their frame
 limit, rather than the static file size, bounds one response.
 
 `header_read_timeout` is not a response-write timeout. `write_progress_timeout`

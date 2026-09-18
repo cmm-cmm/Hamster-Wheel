@@ -1786,3 +1786,21 @@ loss and 1.3% CPU increase, but within-arm RPS spread was about 10% and paired
 signs were unstable after reversing run order. This supports “possible
 low-single-digit C1 cost,” not a zero-cost claim or a demonstrated material
 regression.
+
+## Application request metadata / protocol v2 — working tree
+
+Full raw samples and baseline construction are recorded in
+[`APPLICATION_REQUEST_METADATA.md`](APPLICATION_REQUEST_METADATA.md). Windows
+11, Core i5-12400, 32 GiB, MSVC release builds; trivial persistent PHP hello,
+C1, 1,000 warm-ups and 30,000 measured requests. Four pairs alternated a v1
+snapshot with current effective-authority routing against protocol v2.
+
+| arm | RPS samples | combined CPU us/request samples | p50 ms samples |
+|---|---|---|---|
+| v1 | 5609, 6288, 6332, 6369 | 216.146, 195.833, 198.438, 188.542 | 0.168, 0.149, 0.146, 0.145 |
+| v2 | 5715, 5751, 6408, 6285 | 209.375, 209.375, 184.896, 195.312 | 0.167, 0.165, 0.144, 0.145 |
+
+Paired RPS and CPU signs split two/two. The repository script's upper-middle
+medians are 6,332 versus 6,285 RPS. Within-arm variance is larger than that
+difference. This run shows no material regression but cannot exclude a
+low-single-digit cost; it is not evidence for a zero-cost claim.

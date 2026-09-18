@@ -9,11 +9,24 @@ Request -> HostRouter -> LocationRouter -> Handler -> Response
 
 ## HostRouter
 
-`HostRouter` stores a small `Vec<VirtualHost>`. It reads exactly one `Host`
-header, validates a restricted DNS hostname plus optional `u16` port, ignores
-the port for selection, and compares hostnames case-insensitively. Missing,
-duplicate, or malformed Host values return `400`; an unconfigured hostname
-returns `404`. Wildcards are intentionally unsupported.
+`HostRouter` stores a small `Vec<VirtualHost>`. At the HTTP boundary it first
+requires exactly one `Host` header and validates a restricted DNS hostname plus
+optional `u16` port. For the usual origin-form request-target, that header is
+the effective request authority. For absolute-form, the request-target
+authority is validated, replaces `Host`, and becomes the effective authority
+for both virtual-host selection and the request passed to the handler. This
+implements the HTTP/1.1 requirement to ignore the received Host identity for
+absolute-form without allowing routing and application-visible authority to
+disagree.
+
+Missing, duplicate, or malformed Host fields still return `400`, including for
+absolute-form, because HTTP/1.1 requires a valid single field even when its
+identity is superseded. A missing or invalid absolute authority also returns
+`400`; an effective hostname that is not configured returns `404`. The port is
+preserved for downstream handlers but ignored for virtual-host selection, and
+hostname comparison is case-insensitive. Explicit port-based virtual hosts,
+wildcards, bracketed IPv6 literal authorities, authority-form and asterisk-form
+routing are intentionally unsupported.
 
 A vector avoids allocating a lowercase hostname on every request. It is the
 simplest representation for the two hard-coded milestone hosts; a different

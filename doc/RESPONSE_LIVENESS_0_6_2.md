@@ -68,8 +68,9 @@ policy.
 ## Lifecycle and failure semantics
 
 The timer cannot fire while the service future is executing because Hyper has
-not attempted a response socket write yet. PHP protocol v1 still reads and
-validates a complete staged response before the HTTP handler returns it.
+not attempted a response socket write yet. PHP protocol v2 still reads and
+validates a complete staged response before the HTTP handler returns it; the
+v2 request-metadata revision did not change response buffering or this boundary.
 Dropping a client connection after response writing begins does not cancel or
 replay a worker transaction; the worker pool remains the authority for that
 lifecycle.
@@ -129,4 +130,3 @@ are in `benchmarks/results/response_liveness_0_6_2_20260916.md`.
   failure; Tokio's Windows file implementation can also leave an already
   running blocking read alive until that OS read completes.
 - Native Linux behavior remains unverified.
-

@@ -1,8 +1,11 @@
-use std::{fmt, io};
+use std::{
+    fmt, io,
+    net::{IpAddr, SocketAddr},
+};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_HEADERS: usize = 128;
 
@@ -11,6 +14,10 @@ const REQUEST: u8 = 2;
 const RESPONSE: u8 = 3;
 const SHUTDOWN: u8 = 4;
 const SHUTDOWN_ACK: u8 = 5;
+const HTTP_10: u8 = 1;
+const HTTP_11: u8 = 2;
+const IPV4: u8 = 4;
+const IPV6: u8 = 6;
 
 #[derive(Debug)]
 pub(crate) enum ProtocolError {
@@ -54,12 +61,21 @@ pub(crate) struct ReadyFrame {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WorkerRequest {
+    pub http_version: WorkerHttpVersion,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
     pub method: Vec<u8>,
     pub uri: Vec<u8>,
     pub path: Vec<u8>,
     pub query: Vec<u8>,
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerHttpVersion {
+    Http10,
+    Http11,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -199,6 +215,12 @@ pub(crate) fn encode_request(
     let mut payload = Vec::new();
     payload.push(REQUEST);
     push_u64(&mut payload, request_id);
+    payload.push(match request.http_version {
+        WorkerHttpVersion::Http10 => HTTP_10,
+        WorkerHttpVersion::Http11 => HTTP_11,
+    });
+    push_endpoint(&mut payload, request.peer_addr);
+    push_endpoint(&mut payload, request.local_addr);
     push_bytes_u16(&mut payload, &request.method, "method")?;
     push_bytes_u32(&mut payload, &request.uri, "URI")?;
     push_bytes_u32(&mut payload, &request.path, "path")?;
@@ -217,6 +239,20 @@ pub(crate) fn encode_request(
         return Err(ProtocolError::FrameTooLarge(payload.len()));
     }
     Ok(payload)
+}
+
+fn push_endpoint(output: &mut Vec<u8>, endpoint: SocketAddr) {
+    match endpoint.ip() {
+        IpAddr::V4(address) => {
+            output.push(IPV4);
+            output.extend_from_slice(&address.octets());
+        }
+        IpAddr::V6(address) => {
+            output.push(IPV6);
+            output.extend_from_slice(&address.octets());
+        }
+    }
+    push_u16(output, endpoint.port());
 }
 
 pub(crate) fn decode_response(payload: &[u8]) -> Result<WorkerResponse, ProtocolError> {
@@ -361,10 +397,24 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn decode_endpoint(decoder: &mut Decoder<'_>) -> SocketAddr {
+        let family = decoder.bytes(1).unwrap()[0];
+        let address = match family {
+            IPV4 => IpAddr::V4(Ipv4Addr::from(decoder.array::<4>().unwrap())),
+            IPV6 => IpAddr::V6(Ipv6Addr::from(decoder.array::<16>().unwrap())),
+            _ => panic!("unexpected endpoint family"),
+        };
+        SocketAddr::new(address, decoder.u16().unwrap())
+    }
 
     #[test]
     fn request_encoding_is_binary_safe_and_preserves_repeated_headers() {
         let request = WorkerRequest {
+            http_version: WorkerHttpVersion::Http10,
+            peer_addr: "127.0.0.2:43210".parse().unwrap(),
+            local_addr: "[2001:db8::1]:8080".parse().unwrap(),
             method: b"POST".to_vec(),
             uri: b"/echo?q=a%0Ab".to_vec(),
             path: b"/echo".to_vec(),
@@ -376,8 +426,41 @@ mod tests {
             body: vec![0, 10, 13, 255],
         };
         let encoded = encode_request(7, &request).unwrap();
-        assert_eq!(encoded[0], REQUEST);
+        let mut decoder = Decoder::new(&encoded);
+        decoder.expect_kind(REQUEST, "REQUEST").unwrap();
+        assert_eq!(decoder.u64().unwrap(), 7);
+        assert_eq!(decoder.bytes(1).unwrap(), [HTTP_10]);
+        assert_eq!(decode_endpoint(&mut decoder), request.peer_addr);
+        assert_eq!(decode_endpoint(&mut decoder), request.local_addr);
+        assert_eq!(decoder.bytes_u16().unwrap(), request.method);
+        assert_eq!(decoder.bytes_u32().unwrap(), request.uri);
+        assert_eq!(decoder.bytes_u32().unwrap(), request.path);
+        assert_eq!(decoder.bytes_u32().unwrap(), request.query);
+        let header_count = decoder.u16().unwrap();
+        assert_eq!(header_count, 2);
+        for expected in &request.headers {
+            assert_eq!(decoder.bytes_u16().unwrap(), expected.0);
+            assert_eq!(decoder.bytes_u32().unwrap(), expected.1);
+        }
+        assert_eq!(decoder.bytes_u32().unwrap(), request.body);
+        decoder.finish().unwrap();
         assert!(encoded.windows(4).any(|bytes| bytes == [0, 10, 13, 255]));
+    }
+
+    #[test]
+    fn ready_rejects_every_version_except_v2() {
+        for version in [0_u16, 1, 3, u16::MAX] {
+            let mut ready = vec![READY];
+            push_u16(&mut ready, version);
+            push_u32(&mut ready, 123);
+            let error = decode_ready(&ready).expect_err("version mismatch must fail");
+            assert!(error.to_string().contains(&format!("version {version}")));
+        }
+
+        let mut ready = vec![READY];
+        push_u16(&mut ready, PROTOCOL_VERSION);
+        push_u32(&mut ready, 123);
+        assert_eq!(decode_ready(&ready).unwrap().pid, 123);
     }
 
     #[test]

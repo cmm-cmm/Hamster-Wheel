@@ -92,6 +92,28 @@ fn router() -> HostRouter {
     .expect("hosts should compile")
 }
 
+fn distinct_host_router() -> HostRouter {
+    let first = Arc::new(
+        LocationRouter::new(
+            Vec::new(),
+            Handler::simple(StatusCode::OK, "first application"),
+        )
+        .expect("first host locations should compile"),
+    );
+    let second = Arc::new(
+        LocationRouter::new(
+            Vec::new(),
+            Handler::simple(StatusCode::OK, "second application"),
+        )
+        .expect("second host locations should compile"),
+    );
+    HostRouter::new(vec![
+        VirtualHost::new("first.test", first).expect("first host should compile"),
+        VirtualHost::new("second.test", second).expect("second host should compile"),
+    ])
+    .expect("distinct hosts should compile")
+}
+
 #[tokio::test]
 async fn routes_host_case_and_port_and_rejects_unknown_host() {
     let server = TestServer::start(router()).await;
@@ -161,5 +183,74 @@ async fn missing_host_is_rejected() {
         .request("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
         .await;
     assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn absolute_form_authority_selects_the_virtual_host_instead_of_host_header() {
+    let server = TestServer::start(distinct_host_router()).await;
+
+    let response = server
+        .request(
+            "GET http://second.test/resource HTTP/1.1\r\n\
+             Host: first.test\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with("\r\n\r\nsecond application"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn effective_authority_is_request_scoped_across_keep_alive() {
+    let server = TestServer::start(distinct_host_router()).await;
+
+    let responses = server
+        .request(
+            "GET http://second.test:8080/absolute HTTP/1.1\r\n\
+             Host: first.test\r\n\r\n\
+             GET /origin HTTP/1.1\r\n\
+             Host: first.test:9090\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+
+    assert_eq!(responses.matches("HTTP/1.1 200 OK").count(), 2);
+    assert!(responses.contains("\r\n\r\nsecond applicationHTTP/1.1 200 OK"));
+    assert!(responses.ends_with("\r\n\r\nfirst application"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn absolute_form_validates_host_field_and_target_authority() {
+    let server = TestServer::start(distinct_host_router()).await;
+
+    for request in [
+        "GET http://second.test/resource HTTP/1.1\r\nConnection: close\r\n\r\n",
+        "GET http://second.test/resource HTTP/1.1\r\nHost: bad_host\r\nConnection: close\r\n\r\n",
+        "GET http://second.test/resource HTTP/1.1\r\nHost: first.test\r\nHost: second.test\r\nConnection: close\r\n\r\n",
+        "GET http://second.test:99999/resource HTTP/1.1\r\nHost: first.test\r\nConnection: close\r\n\r\n",
+        "GET http:/resource HTTP/1.1\r\nHost: first.test\r\nConnection: close\r\n\r\n",
+        "GET http://bad_host/resource HTTP/1.1\r\nHost: first.test\r\nConnection: close\r\n\r\n",
+        "GET http://user@second.test/resource HTTP/1.1\r\nHost: first.test\r\nConnection: close\r\n\r\n",
+    ] {
+        let response = server.request(request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "unexpected response for {request:?}: {response:?}"
+        );
+    }
+
+    let unknown = server
+        .request(
+            "GET http://unknown.test/resource HTTP/1.1\r\n\
+             Host: first.test\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+    assert!(unknown.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    assert!(unknown.ends_with("\r\n\r\nUnknown Host"));
     server.stop().await;
 }

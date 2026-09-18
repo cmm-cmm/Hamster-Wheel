@@ -16,7 +16,7 @@ use hamster_wheel::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{Mutex, oneshot},
     task::JoinHandle,
 };
@@ -107,7 +107,12 @@ impl TestServer {
             .shutdown_workers()
             .await
             .expect("PHP worker should stop cleanly");
-        assert!(self.runtime.php_worker().unwrap().pids().is_empty());
+        assert!(
+            self.runtime
+                .php_workers()
+                .iter()
+                .all(|pool| pool.pids().is_empty())
+        );
     }
 }
 
@@ -127,6 +132,34 @@ async fn request_at(address: SocketAddr, request: &[u8]) -> Vec<u8> {
     response
 }
 
+async fn request_at_from(
+    address: SocketAddr,
+    source_ip: Ipv4Addr,
+    request: &[u8],
+) -> (Vec<u8>, SocketAddr) {
+    let socket = TcpSocket::new_v4().expect("IPv4 client socket should be created");
+    socket
+        .bind(SocketAddr::new(IpAddr::V4(source_ip), 0))
+        .expect("loopback source address should bind");
+    let mut stream = socket
+        .connect(address)
+        .await
+        .expect("client should connect");
+    let client = stream
+        .local_addr()
+        .expect("client should have a local endpoint");
+    stream
+        .write_all(request)
+        .await
+        .expect("request should be written");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("response should be read");
+    (response, client)
+}
+
 fn php_runtime_with_script(
     workers: usize,
     queue_capacity: usize,
@@ -134,13 +167,31 @@ fn php_runtime_with_script(
     max_worker_age: Option<u64>,
     script: &Path,
 ) -> config::RuntimeConfig {
+    php_runtime_with_script_at(
+        workers,
+        queue_capacity,
+        max_requests,
+        max_worker_age,
+        script,
+        "127.0.0.1:8080",
+    )
+}
+
+fn php_runtime_with_script_at(
+    workers: usize,
+    queue_capacity: usize,
+    max_requests: Option<u64>,
+    max_worker_age: Option<u64>,
+    script: &Path,
+    listen: &str,
+) -> config::RuntimeConfig {
     let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
     assert!(
         executable.is_file(),
         "PHP integration test requires repository php/8.5/php.exe"
     );
     let mut source = format!(
-        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
+        "[server]\nlisten = \"{listen}\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
         toml_literal(&executable),
         toml_literal(script)
     );
@@ -379,6 +430,84 @@ async fn laravel_request_reconstruction_passes_its_own_checks() {
     );
 }
 
+fn metadata_multi_pool_runtime(script: &Path) -> config::RuntimeConfig {
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let source = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"one.test\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 8\n\n[[hosts]]\nname = \"two.test\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 8\n",
+        toml_literal(&executable),
+        toml_literal(script),
+        toml_literal(&executable),
+        toml_literal(script),
+    );
+    config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("multi-pool metadata config should compile")
+}
+
+async fn read_one_response(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        assert!(
+            response.len() < 16 * 1024,
+            "response head exceeded test limit"
+        );
+        let mut byte = [0_u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut byte))
+            .await
+            .expect("response head timeout")
+            .expect("response head should be complete");
+        response.push(byte[0]);
+    }
+    let head = std::str::from_utf8(&response).expect("response head should be UTF-8");
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .expect("buffered PHP response should have Content-Length");
+    let head_length = response.len();
+    response.resize(head_length + length, 0);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        stream.read_exact(&mut response[head_length..]),
+    )
+    .await
+    .expect("response body timeout")
+    .expect("response body should be complete");
+    response
+}
+
+fn assert_json_string(body: &[u8], field: &str, expected: &str) {
+    let body = std::str::from_utf8(body).expect("JSON response should be UTF-8");
+    let needle = format!("\"{field}\":\"{expected}\"");
+    let slash_escaped = format!("\"{field}\":\"{}\"", expected.replace('/', "\\/"));
+    assert!(
+        body.contains(&needle) || body.contains(&slash_escaped),
+        "missing {needle} in {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn protocol_v2_php_decoder_passes_adversarial_checks() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let executable = root.join("php/8.5/php.exe");
+    assert!(executable.is_file());
+    let output = tokio::process::Command::new(executable)
+        .arg(root.join("fixtures/php-worker/protocol_test.php"))
+        .output()
+        .await
+        .expect("php must be runnable");
+    assert!(
+        output.status.success(),
+        "protocol checks failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"14 checks passed\n");
+}
+
 #[tokio::test]
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn laravel_octane_adapter_stages_response_until_cleanup_commit() {
@@ -494,7 +623,7 @@ async fn one_worker_enforces_laravel_octane_ownership_contract() {
 
 #[tokio::test]
 #[ignore = "requires HAMSTER_LARAVEL_TEST_PATH pointing to an Octane-enabled Laravel app with /up"]
-async fn laravel_worker_serves_repeated_requests_through_protocol_v1() {
+async fn laravel_worker_serves_repeated_requests_through_protocol_v2() {
     let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let script = root.join("fixtures/php-worker/laravel_worker.php");
@@ -533,6 +662,86 @@ async fn laravel_worker_serves_repeated_requests_through_protocol_v1() {
     let after = server.runtime.php_worker().unwrap().snapshot().workers[0].clone();
     assert_eq!(after.generation, initial.generation);
     assert_eq!(after.pid, initial.pid);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a freshly prepared Octane-enabled scratch PMS with HamsterPmsProbeServiceProvider"]
+async fn laravel_receives_owned_metadata_and_does_not_trust_forged_forwarding_headers() {
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("fixtures/php-worker/laravel_worker.php");
+    let app_path = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the prepared scratch PMS"),
+    );
+    let provider_manifest = std::fs::read_to_string(app_path.join("bootstrap/providers.php"))
+        .expect("scratch PMS should have a provider manifest");
+    assert!(provider_manifest.contains("HamsterPmsProbeServiceProvider"));
+    let app = app_path.to_string_lossy().replace('\\', "/");
+    let php_ini = std::env::var("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .unwrap_or_else(|_| format!("{app}/php.ini"))
+        .replace('\\', "/");
+    let runtime = Arc::new(php_runtime_with_env(
+        1,
+        &script,
+        &[
+            ("HAMSTER_LARAVEL_PATH", app.as_str()),
+            ("PHPRC", php_ini.as_str()),
+            ("APP_ENV", "production"),
+            ("APP_DEBUG", "false"),
+            ("PERF_MONITOR_ENABLED", "false"),
+            ("HAMSTER_PMS_PROBE", "1"),
+        ],
+    ));
+    let server = TestServer::start_runtime(runtime).await;
+    let authority = format!("localhost:{}", server.address.port());
+    let request = format!(
+        "GET http://{authority}/__hamster/metadata HTTP/1.0\r\nHost: wrong.test\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Host: attacker.test\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Port: 443\r\nConnection: close\r\n\r\n"
+    );
+    let (response, client) = request_at_from(
+        server.address,
+        Ipv4Addr::new(127, 0, 0, 2),
+        request.as_bytes(),
+    )
+    .await;
+    let (head, body) = split_response(&response);
+    assert!(
+        head.starts_with(b"HTTP/1.0 200 OK\r\n"),
+        "PMS metadata probe failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_json_string(body, "remote_addr", "127.0.0.2");
+    assert_json_string(body, "remote_port", &client.port().to_string());
+    assert_json_string(body, "server_addr", "127.0.0.1");
+    assert_json_string(body, "server_port", &server.address.port().to_string());
+    assert_json_string(body, "server_protocol", "HTTP/1.0");
+    assert_json_string(body, "server_name", "localhost");
+    assert_json_string(body, "http_host", &authority);
+    assert_json_string(body, "request_scheme", "http");
+    assert_json_string(body, "https", "off");
+    assert_json_string(body, "client_ip", "127.0.0.2");
+    assert_json_string(body, "host", "localhost");
+    assert_json_string(body, "scheme", "http");
+    assert_eq!(json_number(body, "port"), server.address.port() as u64);
+    assert_json_string(body, "forwarded_for", "203.0.113.9");
+    let first_pid = json_number(body, "pid");
+
+    let (second, _) = request_at_from(
+        server.address,
+        Ipv4Addr::new(127, 0, 0, 3),
+        b"GET /__hamster/metadata HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (_, second_body) = split_response(&second);
+    assert_json_string(second_body, "remote_addr", "127.0.0.3");
+    assert_json_string(second_body, "server_protocol", "HTTP/1.1");
+    assert_eq!(json_number(second_body, "pid"), first_pid);
+    assert!(
+        !std::str::from_utf8(second_body)
+            .unwrap()
+            .contains("127.0.0.2")
+    );
     server.stop().await;
 }
 
@@ -851,6 +1060,173 @@ async fn pms_w4_isolates_controllers_and_recovers_only_failed_slot() {
 
 #[tokio::test]
 #[ignore = "requires repository php/8.5/php.exe"]
+async fn protocol_v1_worker_is_rejected_before_the_server_binds() {
+    let reserved = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/protocol_v1_ready.php");
+    let runtime = Arc::new(php_runtime_with_script_at(
+        1,
+        8,
+        None,
+        None,
+        &script,
+        &address.to_string(),
+    ));
+
+    let error = tokio::time::timeout(Duration::from_secs(5), server::run(Arc::clone(&runtime)))
+        .await
+        .expect("version mismatch startup must be bounded")
+        .expect_err("a protocol-v1 worker must not start a protocol-v2 server");
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("unsupported READY protocol version 1"),
+        "{diagnostic}"
+    );
+    assert!(
+        TcpStream::connect(address).await.is_err(),
+        "listener must never bind after a worker version mismatch"
+    );
+    assert!(runtime.php_worker().unwrap().pids().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn protocol_v2_delivers_socket_http_and_effective_authority_metadata() {
+    let server = TestServer::start().await;
+    let absolute_authority = format!("localhost:{}", server.address.port());
+    let request = format!(
+        "GET http://{absolute_authority}/metadata HTTP/1.0\r\nHost: wrong.test\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Real-IP: 198.51.100.7\r\nConnection: close\r\n\r\n"
+    );
+    let (response, client) = request_at_from(
+        server.address,
+        Ipv4Addr::new(127, 0, 0, 2),
+        request.as_bytes(),
+    )
+    .await;
+    let (head, body) = split_response(&response);
+    assert!(head.starts_with(b"HTTP/1.0 200 OK\r\n"));
+    assert_json_string(body, "http_version", "HTTP/1.0");
+    assert_json_string(body, "peer_addr", "127.0.0.2");
+    assert_eq!(json_number(body, "peer_port"), client.port() as u64);
+    assert_json_string(body, "local_addr", "127.0.0.1");
+    assert_eq!(
+        json_number(body, "local_port"),
+        server.address.port() as u64
+    );
+    assert_json_string(
+        body,
+        "uri",
+        &format!("http://{absolute_authority}/metadata"),
+    );
+    let text = std::str::from_utf8(body).unwrap();
+    assert!(
+        text.contains(&format!("[\"host\",\"{absolute_authority}\"]")),
+        "effective authority did not replace the conflicting Host: {text}"
+    );
+    assert!(text.contains("[\"x-forwarded-for\",\"203.0.113.9\"]"));
+    assert!(text.contains("[\"x-real-ip\",\"198.51.100.7\"]"));
+
+    // W1 forces both connections through the same persistent PHP process.
+    // The second request must replace, not inherit, the first connection's
+    // transport identity.
+    let (second, second_client) = request_at_from(
+        server.address,
+        Ipv4Addr::new(127, 0, 0, 3),
+        b"GET /metadata HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (_, second_body) = split_response(&second);
+    assert_json_string(second_body, "http_version", "HTTP/1.1");
+    assert_json_string(second_body, "peer_addr", "127.0.0.3");
+    assert_eq!(
+        json_number(second_body, "peer_port"),
+        second_client.port() as u64
+    );
+    assert!(
+        !std::str::from_utf8(second_body)
+            .unwrap()
+            .contains("127.0.0.2")
+    );
+    assert_eq!(json_number(body, "pid"), json_number(second_body, "pid"));
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn keep_alive_requests_reuse_connection_metadata_without_request_state_leak() {
+    let server = TestServer::start().await;
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind("127.0.0.2:0".parse().unwrap())
+        .expect("loopback source should bind");
+    let mut stream = socket.connect(server.address).await.unwrap();
+    let client = stream.local_addr().unwrap();
+
+    stream
+        .write_all(
+            b"GET /metadata HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 203.0.113.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let first = read_one_response(&mut stream).await;
+    let (_, first_body) = split_response(&first);
+    assert_json_string(first_body, "peer_addr", "127.0.0.2");
+    assert_eq!(json_number(first_body, "peer_port"), client.port() as u64);
+    assert!(
+        std::str::from_utf8(first_body)
+            .unwrap()
+            .contains("203.0.113.1")
+    );
+
+    stream
+        .write_all(
+            b"GET /metadata HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 198.51.100.2\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let second = read_one_response(&mut stream).await;
+    let (_, second_body) = split_response(&second);
+    assert_json_string(second_body, "peer_addr", "127.0.0.2");
+    assert_eq!(json_number(second_body, "peer_port"), client.port() as u64);
+    let text = std::str::from_utf8(second_body).unwrap();
+    assert!(text.contains("198.51.100.2"));
+    assert!(!text.contains("203.0.113.1"));
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn independent_pools_do_not_share_request_metadata() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+    let runtime = Arc::new(metadata_multi_pool_runtime(&script));
+    let server = TestServer::start_runtime(runtime).await;
+    assert_eq!(server.runtime.php_workers().len(), 2);
+
+    let one = request_at_from(
+        server.address,
+        Ipv4Addr::new(127, 0, 0, 2),
+        b"GET /metadata HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n",
+    );
+    let two = request_at_from(
+        server.address,
+        Ipv4Addr::new(127, 0, 0, 3),
+        b"GET /metadata HTTP/1.1\r\nHost: two.test\r\nConnection: close\r\n\r\n",
+    );
+    let ((one, one_client), (two, two_client)) = tokio::join!(one, two);
+    let (_, one_body) = split_response(&one);
+    let (_, two_body) = split_response(&two);
+    assert_json_string(one_body, "peer_addr", "127.0.0.2");
+    assert_eq!(json_number(one_body, "peer_port"), one_client.port() as u64);
+    assert_json_string(two_body, "peer_addr", "127.0.0.3");
+    assert_eq!(json_number(two_body, "peer_port"), two_client.port() as u64);
+    assert_ne!(json_number(one_body, "pid"), json_number(two_body, "pid"));
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
 async fn one_php_process_bootstraps_once_across_one_hundred_http_requests() {
     let server = TestServer::start().await;
     let mut pid = None;
@@ -906,6 +1282,25 @@ async fn http_mapping_preserves_query_headers_body_and_custom_response() {
             .any(|window| window.eq_ignore_ascii_case(b"x-php-worker: persistent"))
     );
     assert_eq!(body, binary);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn absolute_form_rewrites_host_before_persistent_application_dispatch() {
+    let server = TestServer::start().await;
+    let response = server
+        .request(
+            b"GET http://localhost/inspect?authority=target HTTP/1.1\r\nHost: ignored.test:9000\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+    let (headers, body) = split_response(&response);
+    assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let body = std::str::from_utf8(body).unwrap();
+    assert!(body.contains("\"uri\":\"http://localhost/inspect?authority=target\""));
+    assert!(body.contains("[\"host\",\"localhost\"]"));
+    assert!(!body.contains("ignored.test"));
     server.stop().await;
 }
 

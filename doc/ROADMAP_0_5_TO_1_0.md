@@ -479,9 +479,10 @@ Required to adopt the roadmap direction:
 3. decide whether 0.5 is one reviewable milestone or a 0.5.x sequence with the
    opened-handle static investigation isolated.
 
-Required during 0.5 design, before metadata ships:
+Resolved during 0.5 design:
 
-4. select the protocol-v1 compatibility policy and typed metadata mechanism.
+4. strict typed protocol v2 carries application request metadata; v1 workers
+   fail startup before traffic and no compatibility fallback is provided.
 
 Required before 0.6 implementation is finalized:
 

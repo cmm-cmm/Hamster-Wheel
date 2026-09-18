@@ -81,6 +81,11 @@ namespace {
     );
 
     $built = hamster_build_request([
+        'http_version' => 'HTTP/1.0',
+        'peer_addr' => '127.0.0.2',
+        'peer_port' => 43210,
+        'local_addr' => '127.0.0.1',
+        'local_port' => 8080,
         'method' => 'POST',
         'uri' => '/submit?q=two%20words',
         'query' => 'q=two%20words',
@@ -88,6 +93,7 @@ namespace {
             ['content-type', 'application/x-www-form-urlencoded'],
             ['cookie', 'session=abc%3Ddef; theme=dark'],
             ['x-review', 'present'],
+            ['host', 'example.test:8080'],
         ],
         'body' => 'name=Alice+Example&nested%5Ba%5D=1',
     ]);
@@ -103,6 +109,16 @@ namespace {
     check('the request builder preserves the raw body', $built->content, 'name=Alice+Example&nested%5Ba%5D=1');
     check('the request builder maps content type to the SAPI key', $built->server['CONTENT_TYPE'], 'application/x-www-form-urlencoded');
     check('the request builder maps ordinary headers to HTTP keys', $built->server['HTTP_X_REVIEW'], 'present');
+    check('the request builder preserves the HTTP version', $built->server['SERVER_PROTOCOL'], 'HTTP/1.0');
+    check('the request builder maps the immediate peer address', $built->server['REMOTE_ADDR'], '127.0.0.2');
+    check('the request builder maps the immediate peer port', $built->server['REMOTE_PORT'], '43210');
+    check('the request builder maps the local address', $built->server['SERVER_ADDR'], '127.0.0.1');
+    check('the request builder maps the local port', $built->server['SERVER_PORT'], '8080');
+    check('the request builder keeps the effective authority', $built->server['HTTP_HOST'], 'example.test:8080');
+    check('SERVER_NAME is the effective hostname without its port', $built->server['SERVER_NAME'], 'example.test');
+    check('cleartext requests use the http scheme', $built->server['REQUEST_SCHEME'], 'http');
+    check('cleartext requests do not set HTTPS', $built->server['HTTPS'], 'off');
+    check('an IPv6 effective authority yields an unbracketed SERVER_NAME', hamster_authority_hostname('[2001:db8::1]:8080'), '2001:db8::1');
 
     // --- field names -----------------------------------------------------
     $target = [];

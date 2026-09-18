@@ -79,7 +79,7 @@ function hamster_discard_uploads(?callable $remove = null): void
 /**
  * Rebuilds an Illuminate request from a decoded protocol frame.
  *
- * @param  array{method:string,uri:string,query:string,headers:list<array{0:string,1:string}>,body:string}  $decoded
+ * @param  array{http_version:string,peer_addr:string,peer_port:int,local_addr:string,local_port:int,method:string,uri:string,query:string,headers:list<array{0:string,1:string}>,body:string}  $decoded
  *
  * @throws HamsterBadRequest when the client's body cannot be parsed
  */
@@ -89,9 +89,12 @@ function hamster_build_request(array $decoded): Request
         'REQUEST_METHOD' => $decoded['method'],
         'REQUEST_URI' => $decoded['uri'],
         'QUERY_STRING' => $decoded['query'],
-        'SERVER_PROTOCOL' => 'HTTP/1.1',
-        'SERVER_NAME' => '127.0.0.1',
-        'REMOTE_ADDR' => '127.0.0.1',
+        'SERVER_PROTOCOL' => $decoded['http_version'],
+        'REMOTE_ADDR' => $decoded['peer_addr'],
+        'REMOTE_PORT' => (string) $decoded['peer_port'],
+        'SERVER_ADDR' => $decoded['local_addr'],
+        'SERVER_PORT' => (string) $decoded['local_port'],
+        'REQUEST_SCHEME' => 'http',
         'HTTPS' => 'off',
     ];
     $cookies = [];
@@ -106,6 +109,10 @@ function hamster_build_request(array $decoded): Request
         }
         $server[$key === 'CONTENT_TYPE' || $key === 'CONTENT_LENGTH' ? $key : 'HTTP_' . $key] = $value;
     }
+    if (! isset($server['HTTP_HOST']) || $server['HTTP_HOST'] === '') {
+        throw new HamsterBadRequest('request has no effective Host');
+    }
+    $server['SERVER_NAME'] = hamster_authority_hostname($server['HTTP_HOST']);
 
     parse_str($decoded['query'], $query);
 
@@ -122,6 +129,38 @@ function hamster_build_request(array $decoded): Request
     }
 
     return new Request($query, $parameters, [], $cookies, $files, $server, $decoded['body']);
+}
+
+/**
+ * Returns the hostname component of the already validated effective authority.
+ *
+ * Rust owns authority validation and rewrites Host before routing. This parser
+ * deliberately has no fallback identity: a missing or structurally invalid
+ * authority fails the request instead of manufacturing SERVER_NAME.
+ */
+function hamster_authority_hostname(string $authority): string
+{
+    if (str_starts_with($authority, '[')) {
+        $close = strpos($authority, ']');
+        if ($close === false || $close === 1) {
+            throw new HamsterBadRequest('invalid effective Host');
+        }
+        $remainder = substr($authority, $close + 1);
+        if ($remainder !== '' && preg_match('/^:[0-9]+$/D', $remainder) !== 1) {
+            throw new HamsterBadRequest('invalid effective Host');
+        }
+
+        return substr($authority, 1, $close - 1);
+    }
+
+    $separator = strrpos($authority, ':');
+    $hostname = $separator === false ? $authority : substr($authority, 0, $separator);
+    $port = $separator === false ? null : substr($authority, $separator + 1);
+    if ($hostname === '' || ($port !== null && ($port === '' || ! ctype_digit($port)))) {
+        throw new HamsterBadRequest('invalid effective Host');
+    }
+
+    return $hostname;
 }
 
 /** @return array<string, string> */

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-const HAMSTER_PROTOCOL_VERSION = 1;
+const HAMSTER_PROTOCOL_VERSION = 2;
 const HAMSTER_MAX_FRAME = 8 * 1024 * 1024;
 const HAMSTER_MAX_HEADERS = 128;
 const HAMSTER_READY = 1;
@@ -109,6 +109,11 @@ function hamster_u16(string $bytes, int &$offset): int
     return unpack('nvalue', hamster_take($bytes, $offset, 2))['value'];
 }
 
+function hamster_u8(string $bytes, int &$offset): int
+{
+    return ord(hamster_take($bytes, $offset, 1));
+}
+
 function hamster_u32(string $bytes, int &$offset): int
 {
     return unpack('Nvalue', hamster_take($bytes, $offset, 4))['value'];
@@ -147,8 +152,22 @@ function hamster_decode_request(string $payload): array
     if ($kind !== HAMSTER_REQUEST) {
         throw new RuntimeException("expected request frame, received {$kind}");
     }
+    $id = hamster_u64($payload, $offset);
+    $httpVersionCode = hamster_u8($payload, $offset);
+    $httpVersion = match ($httpVersionCode) {
+        1 => 'HTTP/1.0',
+        2 => 'HTTP/1.1',
+        default => throw new RuntimeException("unsupported HTTP version {$httpVersionCode}"),
+    };
+    $peer = hamster_decode_endpoint($payload, $offset);
+    $local = hamster_decode_endpoint($payload, $offset);
     $request = [
-        'id' => hamster_u64($payload, $offset),
+        'id' => $id,
+        'http_version' => $httpVersion,
+        'peer_addr' => $peer['address'],
+        'peer_port' => $peer['port'],
+        'local_addr' => $local['address'],
+        'local_port' => $local['port'],
         'method' => hamster_bytes_u16($payload, $offset),
         'uri' => hamster_bytes_u32($payload, $offset),
         'path' => hamster_bytes_u32($payload, $offset),
@@ -170,6 +189,22 @@ function hamster_decode_request(string $payload): array
         throw new RuntimeException('request has trailing bytes');
     }
     return $request;
+}
+
+/** @return array{address:string,port:int} */
+function hamster_decode_endpoint(string $payload, int &$offset): array
+{
+    $family = hamster_u8($payload, $offset);
+    $packed = match ($family) {
+        4 => hamster_take($payload, $offset, 4),
+        6 => hamster_take($payload, $offset, 16),
+        default => throw new RuntimeException("unsupported address family {$family}"),
+    };
+    $address = inet_ntop($packed);
+    if ($address === false) {
+        throw new RuntimeException("invalid address bytes for family {$family}");
+    }
+    return ['address' => $address, 'port' => hamster_u16($payload, $offset)];
 }
 
 function hamster_pack_u16(int $value): string

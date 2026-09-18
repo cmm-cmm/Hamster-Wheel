@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /**
- * Benchmark-only fresh-application baseline for protocol v1.
+ * Benchmark-only fresh-application baseline for protocol v2.
  *
  * This deliberately rebuilds Laravel for every request while keeping PHP,
  * OPcache, Rust HTTP handling and Hamster IPC alive. It is not a production

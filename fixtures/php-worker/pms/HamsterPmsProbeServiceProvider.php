@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Octane\Events\RequestTerminated;
+use Symfony\Component\HttpFoundation\Request as SymfonyRequest;
 
 /**
  * Scratch-only PMS routes used by Hamster's ignored end-to-end tests.
@@ -30,6 +31,7 @@ final class HamsterPmsProbeServiceProvider extends ServiceProvider
         // middleware group separates kernel/routing/controller work from
         // cookie and file-session middleware. This provider is scratch-only.
         Route::get('/__hamster/bare', [HamsterPmsProbeController::class, 'light']);
+        Route::get('/__hamster/metadata', [HamsterPmsProbeController::class, 'metadata']);
 
         Route::middleware('web')->group(function (): void {
             Route::get('/__hamster/auth-seed', [HamsterPmsProbeController::class, 'seed']);
@@ -80,6 +82,43 @@ final class HamsterPmsProbeController
         }
 
         return ['pid' => getmypid(), 'controller_calls' => ++$this->calls];
+    }
+
+    /** @return array<string, int|string|bool|null> */
+    public function metadata(): array
+    {
+        $forwarded = SymfonyRequest::HEADER_X_FORWARDED_FOR
+            | SymfonyRequest::HEADER_X_FORWARDED_HOST
+            | SymfonyRequest::HEADER_X_FORWARDED_PROTO
+            | SymfonyRequest::HEADER_X_FORWARDED_PORT;
+        // Trust only Hamster's immediate loopback address. A connection from
+        // 127.0.0.2/.3 must therefore ignore forged forwarding headers. Reset
+        // the process-global Symfony policy before returning from this
+        // scratch-only probe.
+        SymfonyRequest::setTrustedProxies(['127.0.0.1'], $forwarded);
+        try {
+            $request = request();
+
+            return [
+                'pid' => getmypid(),
+                'remote_addr' => $request->server->get('REMOTE_ADDR'),
+                'remote_port' => $request->server->get('REMOTE_PORT'),
+                'server_addr' => $request->server->get('SERVER_ADDR'),
+                'server_port' => $request->server->get('SERVER_PORT'),
+                'server_protocol' => $request->server->get('SERVER_PROTOCOL'),
+                'server_name' => $request->server->get('SERVER_NAME'),
+                'http_host' => $request->server->get('HTTP_HOST'),
+                'request_scheme' => $request->server->get('REQUEST_SCHEME'),
+                'https' => $request->server->get('HTTPS'),
+                'client_ip' => $request->getClientIp(),
+                'host' => $request->getHost(),
+                'scheme' => $request->getScheme(),
+                'port' => $request->getPort(),
+                'forwarded_for' => $request->headers->get('X-Forwarded-For'),
+            ];
+        } finally {
+            SymfonyRequest::setTrustedProxies([], $forwarded);
+        }
     }
 
     /** @return array{executions:int} */

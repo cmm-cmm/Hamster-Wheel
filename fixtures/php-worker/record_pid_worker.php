@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 /**
  * Test-only wrapper that records the child PID before entering the ordinary
- * protocol-v1 fixture. Multi-pool startup tests can therefore prove that a
+ * protocol-v2 fixture. Multi-pool startup tests can therefore prove that a
  * child created before a later pool failed was actually reaped.
  */
 

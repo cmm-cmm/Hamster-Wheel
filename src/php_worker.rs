@@ -15,7 +15,7 @@ use std::{
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::{
-    Request, Response, StatusCode,
+    Request, Response, StatusCode, Version,
     body::{Body, Incoming},
     header::{HeaderName, HeaderValue, SERVER},
 };
@@ -32,11 +32,12 @@ use crate::{
     config::SERVER_NAME,
     handler::{HandlerResponse, simple_response},
     php_protocol::{
-        MAX_HEADERS, ProtocolError, WorkerRequest, WorkerResponse, decode_ready, decode_response,
-        decode_shutdown_ack, encode_request, encode_shutdown, read_frame, write_frame,
-        write_frame_tracked,
+        MAX_HEADERS, ProtocolError, WorkerHttpVersion, WorkerRequest, WorkerResponse, decode_ready,
+        decode_response, decode_shutdown_ack, encode_request, encode_shutdown, read_frame,
+        write_frame, write_frame_tracked,
     },
     response_body::ResponseBody,
+    transport::TransportInfo,
 };
 
 pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
@@ -1225,13 +1226,20 @@ impl PhpWorkerPool {
     pub(crate) async fn serve_http(
         &self,
         request: Request<Incoming>,
+        transport: TransportInfo,
         body_read_timeout: Duration,
     ) -> HandlerResponse {
-        let admitted =
-            match http_request(request, body_read_timeout, &self.shared.config.body_budget).await {
-                Ok(admitted) => admitted,
-                Err(error) => return body_admission_response(error),
-            };
+        let admitted = match http_request(
+            request,
+            transport,
+            body_read_timeout,
+            &self.shared.config.body_budget,
+        )
+        .await
+        {
+            Ok(admitted) => admitted,
+            Err(error) => return body_admission_response(error),
+        };
 
         match self.execute(admitted).await {
             Ok(response) => match http_response(response) {
@@ -1274,11 +1282,12 @@ impl PhpWorkerPool {
     #[cfg(test)]
     pub(crate) async fn test_body_echo(
         request: Request<Incoming>,
+        transport: TransportInfo,
         body_read_timeout: Duration,
         budget: &Arc<BodyBudget>,
         hold: Option<Duration>,
     ) -> HandlerResponse {
-        match http_request(request, body_read_timeout, budget).await {
+        match http_request(request, transport, body_read_timeout, budget).await {
             Ok(admitted) => {
                 let response =
                     Response::new(ResponseBody::buffered(Bytes::from(admitted.request.body)));
@@ -2568,6 +2577,7 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr, label: Arc<str>) 
 }
 
 enum HttpRequestError {
+    UnsupportedVersion,
     TooLarge,
     TooManyHeaders,
     Timeout,
@@ -2577,6 +2587,10 @@ enum HttpRequestError {
 
 fn body_admission_response(error: HttpRequestError) -> HandlerResponse {
     match error {
+        HttpRequestError::UnsupportedVersion => simple_response(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "Unsupported HTTP Version",
+        ),
         HttpRequestError::TooLarge => {
             simple_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
         }
@@ -2617,10 +2631,16 @@ const BODY_GROWTH_FLOOR: usize = 8 * 1_024;
 
 async fn http_request(
     request: Request<Incoming>,
+    transport: TransportInfo,
     body_read_timeout: Duration,
     budget: &Arc<BodyBudget>,
 ) -> Result<AdmittedRequest, HttpRequestError> {
     let (parts, mut body) = request.into_parts();
+    let http_version = match parts.version {
+        Version::HTTP_10 => WorkerHttpVersion::Http10,
+        Version::HTTP_11 => WorkerHttpVersion::Http11,
+        _ => return Err(HttpRequestError::UnsupportedVersion),
+    };
     if parts.headers.len() > MAX_HEADERS {
         return Err(HttpRequestError::TooManyHeaders);
     }
@@ -2632,7 +2652,7 @@ async fn http_request(
     // This is the whole static/GET path, and it must stay free.
     if body.is_end_stream() {
         return Ok(AdmittedRequest {
-            request: build_worker_request(parts, Vec::new()),
+            request: build_worker_request(parts, http_version, transport, Vec::new()),
             body: BodyReservation::none(),
         });
     }
@@ -2661,7 +2681,7 @@ async fn http_request(
         reservation.held()
     );
     Ok(AdmittedRequest {
-        request: build_worker_request(parts, bytes),
+        request: build_worker_request(parts, http_version, transport, bytes),
         body: reservation,
     })
 }
@@ -2704,7 +2724,12 @@ async fn read_http_body(
     Ok(bytes)
 }
 
-fn build_worker_request(parts: hyper::http::request::Parts, bytes: Vec<u8>) -> WorkerRequest {
+fn build_worker_request(
+    parts: hyper::http::request::Parts,
+    http_version: WorkerHttpVersion,
+    transport: TransportInfo,
+    bytes: Vec<u8>,
+) -> WorkerRequest {
     let uri = parts.uri.to_string();
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or_default();
@@ -2714,6 +2739,9 @@ fn build_worker_request(parts: hyper::http::request::Parts, bytes: Vec<u8>) -> W
         .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
         .collect();
     WorkerRequest {
+        http_version,
+        peer_addr: transport.peer_addr(),
+        local_addr: transport.local_addr(),
         method: parts.method.as_str().as_bytes().to_vec(),
         uri: uri.into_bytes(),
         path: path.as_bytes().to_vec(),
@@ -2808,6 +2836,9 @@ mod tests {
             format!("{path}?{query}")
         };
         WorkerRequest {
+            http_version: WorkerHttpVersion::Http11,
+            peer_addr: "127.0.0.2:43210".parse().unwrap(),
+            local_addr: "127.0.0.1:8080".parse().unwrap(),
             method: method.as_bytes().to_vec(),
             uri: uri.into_bytes(),
             path: path.as_bytes().to_vec(),
