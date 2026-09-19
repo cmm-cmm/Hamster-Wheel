@@ -15,6 +15,8 @@ use crate::{
 #[derive(Debug)]
 pub enum ServerError {
     Io(io::Error),
+    #[cfg(windows)]
+    ChildContainment(Arc<crate::windows_child_containment::ContainmentError>),
     Worker(PhpPoolsError),
     IoWithWorkerCleanup {
         source: io::Error,
@@ -26,6 +28,10 @@ impl fmt::Display for ServerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "server I/O: {error}"),
+            #[cfg(windows)]
+            Self::ChildContainment(error) => {
+                write!(formatter, "Windows PHP child containment: {error}")
+            }
             Self::Worker(error) => write!(formatter, "{error}"),
             Self::IoWithWorkerCleanup { source, cleanup } => write!(
                 formatter,
@@ -39,6 +45,8 @@ impl std::error::Error for ServerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            #[cfg(windows)]
+            Self::ChildContainment(error) => Some(error.as_ref()),
             Self::Worker(error) => Some(error),
             Self::IoWithWorkerCleanup { source, .. } => Some(source),
         }
@@ -58,6 +66,11 @@ impl From<PhpPoolsError> for ServerError {
 }
 
 pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
+    #[cfg(windows)]
+    if !config.php_workers().is_empty() {
+        crate::windows_child_containment::establish().map_err(ServerError::ChildContainment)?;
+    }
+
     let workers = match config.start_workers().await {
         Ok(workers) => workers,
         Err(mut startup_error) => {
@@ -288,7 +301,7 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+    use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -299,6 +312,21 @@ mod tests {
     use super::*;
     use crate::body_budget::BodyBudget;
     use crate::router::{Handler, HostRouter, LocationRouter, VirtualHost};
+
+    #[cfg(windows)]
+    struct ContainmentFailureReset;
+
+    #[cfg(windows)]
+    impl Drop for ContainmentFailureReset {
+        fn drop(&mut self) {
+            crate::windows_child_containment::force_setup_failure(false);
+        }
+    }
+
+    #[cfg(windows)]
+    fn toml_literal(path: &Path) -> String {
+        format!("'{}'", path.display())
+    }
 
     fn transport_router() -> HostRouter {
         let locations = Arc::new(
@@ -367,6 +395,45 @@ mod tests {
             },
         ));
         (listen_addr, shutdown_tx, server)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn php_containment_failure_precedes_worker_spawn_and_listener_bind() {
+        let reserved =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve test address");
+        let address = reserved.local_addr().expect("reserved address");
+        drop(reserved);
+        let executable = std::env::current_exe().expect("test executable path");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+        let source = format!(
+            "[server]\nlisten = \"{address}\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 1\n",
+            toml_literal(&executable),
+            toml_literal(&script),
+        );
+        let runtime = Arc::new(
+            crate::config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+                .expect("test PHP config should compile"),
+        );
+
+        crate::windows_child_containment::force_setup_failure(true);
+        let _reset = ContainmentFailureReset;
+        let error = run(Arc::clone(&runtime))
+            .await
+            .expect_err("containment failure must fail server startup");
+
+        assert!(matches!(error, ServerError::ChildContainment(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("injected containment setup failure"),
+            "{error}"
+        );
+        assert!(runtime.php_workers()[0].pids().is_empty());
+        assert!(
+            TcpStream::connect(address).await.is_err(),
+            "listener became available after containment setup failed"
+        );
     }
 
     async fn start_body_server(

@@ -374,7 +374,28 @@ worker mutex, sends `SHUTDOWN`, requires `SHUTDOWN_ACK`, closes stdin, and waits
 up to two seconds for process exit. Timeout or protocol failure invokes direct
 child kill and wait. On Windows, a console Ctrl+C can also terminate the child
 before Rust sends `SHUTDOWN`; an already-exited child is treated as successfully
-cleaned up. `kill_on_drop` is a final orphan-prevention fallback.
+cleaned up. `kill_on_drop` remains a local fallback while Rust is alive; it is
+not an abnormal-parent containment mechanism because process termination does
+not run Rust destructors.
+
+On Windows, a configuration containing PHP pools establishes an unnamed Job
+Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before the first pool can
+start. Hamster configures the complete policy and then assigns itself to the
+job. Initial workers, replacement generations, and ordinary direct descendants
+inherit membership. If job creation, configuration, or self-assignment fails,
+server startup fails before any PHP process is spawned or listener is bound;
+there is no uncontained fallback.
+
+The sole Hamster-created job handle has process lifetime. Graceful shutdown
+still drains transactions, exchanges `SHUTDOWN`/`SHUTDOWN_ACK`, and reaps every
+child normally; the job handle is not closed to implement routine shutdown. If
+Hamster is terminated abnormally, Windows closes the final handle and reclaims
+the inherited application process tree. Compatible outer jobs are supported by
+Windows nested-job semantics. An outer job whose limits prevent nesting causes
+fail-closed startup. Breakaway is not enabled. Processes created through an
+external broker, including WMI `Win32_Process.Create`, are not ordinary inherited
+descendants and are outside this containment contract. No equivalent Linux
+containment is implemented or verified.
 
 ## Fixture and Persistent-State Proof
 

@@ -16,6 +16,8 @@ pub mod routing_profile;
 pub mod server;
 mod static_files;
 mod transport;
+#[cfg(windows)]
+mod windows_child_containment;
 #[cfg(feature = "profiling")]
 pub mod windows_fs_profile;
 mod write_progress;

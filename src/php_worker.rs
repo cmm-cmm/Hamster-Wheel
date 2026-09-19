@@ -478,6 +478,18 @@ impl PhpWorker {
             ));
         }
 
+        // `server::run` and `RuntimeConfig::start_workers` establish this at
+        // their ownership boundaries. Keep the final spawn primitive fail
+        // closed as well so a direct pool/worker caller cannot create an
+        // uncontained PHP process. After the first call this is a OnceLock
+        // read; replacement lifecycle logic remains unaware of Job Objects.
+        #[cfg(windows)]
+        crate::windows_child_containment::establish().map_err(|error| {
+            PhpWorkerError::Startup(format!(
+                "Windows PHP child containment could not be established: {error}"
+            ))
+        })?;
+
         let started = Instant::now();
         let mut command = Command::new(&self.config.executable);
         command

@@ -325,6 +325,21 @@ impl RuntimeConfig {
     }
 
     pub async fn start_workers(&self) -> Result<Vec<WorkerStart>, PhpPoolsError> {
+        #[cfg(windows)]
+        if let Some(first_pool) = self.php_pools.first()
+            && let Err(error) = crate::windows_child_containment::establish()
+        {
+            return Err(PhpPoolsError::new(
+                PhpPoolFailure::new(
+                    first_pool,
+                    PhpWorkerError::Startup(format!(
+                        "Windows PHP child containment could not be established: {error}"
+                    )),
+                ),
+                Vec::new(),
+            ));
+        }
+
         let mut starts = Vec::new();
         for (index, pool) in self.php_pools.iter().enumerate() {
             match pool.start().await {

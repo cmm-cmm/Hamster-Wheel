@@ -1312,7 +1312,7 @@ Mixed static/PHP/proxy virtual hosts
 Transactional config publication and old-generation drain
 Structured access/error/lifecycle logging
 Metrics, health and readiness
-Windows Service operation and child containment
+Windows Service operation (abnormal-parent PHP child containment is already implemented)
 Linux systemd operation
 Operational CLI
 ```

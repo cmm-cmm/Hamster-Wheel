@@ -1,5 +1,43 @@
 # AI Handoff
 
+## Current Working Scope — Windows Abnormal-Parent Child Containment
+
+Candidate A from the completed investigation is implemented in the uncommitted
+working tree. On Windows, `server::run` establishes an unnamed Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before `RuntimeConfig::start_workers`; the
+latter repeats the idempotent guard before its first pool so its direct public
+path also fails closed. The final `PhpWorker` spawn primitive repeats the same
+guard so lower-level direct callers cannot bypass containment; replacement
+lifecycle policy itself remains unchanged. The job is fully configured before
+Hamster assigns itself. A static `OnceLock` owns the sole Hamster-created handle
+for process lifetime, so ordinary PHP children, replacement generations, and
+direct descendants inherit containment without per-generation assignment.
+
+The production path has no post-spawn assignment, suspended-assignment, or
+uncontained fallback. Normal shutdown still uses transaction drain,
+`SHUTDOWN`/`SHUTDOWN_ACK`, kill fallback, and reap; the Job Object is only the
+abnormal-parent safety net. Permanent Windows tests retain exact process
+handles and creation timestamps for busy PHP plus a PHP-created descendant,
+bootstrap-before-READY, replacement plus multi-pool, and a compatible outer
+Job Object. Setup-failure injection exists only under `cfg(test)` and proves
+failure precedes worker spawn and listener bind.
+
+The boundary covers ordinary inherited process trees, not WMI/brokered process
+creation. Breakaway is not enabled. Incompatible outer-job policy fails startup.
+No Linux containment exists or has been natively verified. Continue with the
+quality-gate and independent diff-review evidence from the implementing turn;
+do not infer commit, push, tag, merge, or release from this section.
+
+FACT: the four-test abnormal-parent suite passed with exact process handles and
+creation timestamps. It reclaimed bootstrap PHP, busy PHP, a PHP-created direct
+descendant, a replacement generation, both independent pools, and a worker
+under a compatible outer job; observed waits were 0-5 ms against a 5-second
+bound. Default tests, the nine multi-pool tests, targeted cancellation,
+at-most-once, execution-timeout and graceful-shutdown regressions, strict
+clippy, release build, bench linking, PHP fixture lint, and Linux cross-target
+compile-check passed. One unrelated body-budget socket test first hit Windows
+error 10053, then passed three isolated reruns and the repeated full suite.
+
 ## Closed Scope — Multiple Persistent Application Pools
 
 The owner closed the implementation scope on 2026-09-18. Multiple

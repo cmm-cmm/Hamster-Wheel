@@ -58,6 +58,20 @@ max_worker_age = 3600
 HAMSTER_LARAVEL_PATH = "www/pms"
 ```
 
+On Windows, the presence of any `php_worker` location also requires process
+containment to be established before worker startup. Hamster creates and fully
+configures a private kill-on-close Job Object, assigns itself, and only then
+starts the configured pools. Failure to create, configure, or join that job is
+a startup error: no PHP worker is spawned and the listener is not bound. There
+is deliberately no uncontained fallback. This does not add a configuration
+switch; it is a correctness property of Windows PHP execution.
+
+Ordinary worker descendants inherit containment, including replacement
+generations and direct children created by the application. Breakaway is not
+enabled. Brokered process creation such as WMI `Win32_Process.Create` is outside
+the inherited process-tree contract. On non-Windows platforms these settings do
+not imply an equivalent OS containment mechanism.
+
 `server.listen` must be a numeric IP socket address. `max_connections` bounds
 accepted connections owned by the process and defaults to 1024 (valid range
 1-65536). At the bound, Hamster stops accepting until a connection task exits;
