@@ -35,6 +35,11 @@ read from that handle. This removes the old second path-based metadata/read
 pair, but it does not solve the existing canonicalize-to-open containment race;
 opened-handle containment remains a separate static security design.
 
+Later work, recorded in `doc/STATIC_CONTAINMENT.md`, replaces that race on
+Windows: containment is now decided from the opened handle's final location,
+and the same handle is streamed. Non-Windows targets still use the pathname
+model described above.
+
 ## Failure semantics
 
 If a read fails after response headers are committed, or the open file reaches
