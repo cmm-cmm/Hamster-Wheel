@@ -22,8 +22,8 @@ request. Laravel/Symfony receives:
 | `SERVER_PROTOCOL` | actual request version (`HTTP/1.0` or `HTTP/1.1`) |
 | `HTTP_HOST` | effective authority already rewritten at the HTTP boundary |
 | `SERVER_NAME` | hostname component of the same effective authority |
-| `REQUEST_SCHEME` | `http` for the current cleartext transport |
-| `HTTPS` | `off` for the current cleartext transport |
+| `REQUEST_SCHEME` | trusted connection scheme: `https` when Hamster's TLS listener accepted the connection, otherwise `http` (protocol v3) |
+| `HTTPS` | `on` for `https`, `off` for `http` (protocol v3) |
 
 `SERVER_NAME` deliberately does not use the configured virtual-host spelling:
 that would create a second application-visible host identity. An explicit port
@@ -37,6 +37,15 @@ proxy policy can now evaluate them against the real immediate peer.
 The adapter populates the Symfony `Request` server bag. It does not hydrate the
 process-global PHP `$_SERVER`; SAPI emulation remains a separate compatibility
 concern.
+
+## Protocol v3 (TLS v1)
+
+Protocol v3 adds one byte after `http_version`: `scheme u8`, `1 = http`,
+`2 = https`. It is the connection's trusted scheme, set by the listener that
+accepted the connection; no request header can produce it. `READY` must
+advertise version 3; v1, v2 and unknown versions fail startup before the
+listener binds, and the PHP decoder rejects any other scheme value. Everything
+else below is unchanged from v2. See `doc/TLS_V1.md`.
 
 ## Protocol v2
 

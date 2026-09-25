@@ -10,6 +10,71 @@ use tokio::{
     time::{Instant, Sleep, sleep_until},
 };
 
+/// An inactivity deadline that runs only while an I/O direction is stalled.
+///
+/// This is the one definition of "no progress" in the server. The first
+/// stalled poll arms the deadline, repeated stalled polls keep the original
+/// deadline, and any progress disarms it so a later stall receives a fresh
+/// interval. The timer is allocated lazily and then reused, so an I/O path that
+/// never stalls owns no Tokio timer and one that stalls owns at most one.
+///
+/// Callers poll their inner I/O first and consult this only on `Pending`, so
+/// if progress and the deadline become ready together, progress wins.
+pub(crate) struct ProgressDeadline {
+    timeout: Duration,
+    timer: Option<Pin<Box<Sleep>>>,
+    stalled: bool,
+}
+
+impl ProgressDeadline {
+    pub(crate) const fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            timer: None,
+            stalled: false,
+        }
+    }
+
+    pub(crate) const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Records progress: the current stall, if any, is over.
+    pub(crate) fn progress(&mut self) {
+        self.stalled = false;
+    }
+
+    /// Records that the inner I/O returned `Pending`.
+    ///
+    /// Returns `Ready` once the stall has lasted the whole interval. The waker
+    /// is registered with the timer, so the caller is polled again when the
+    /// deadline passes even if the inner I/O never wakes it.
+    pub(crate) fn poll_stalled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.stalled {
+            let deadline = Instant::now() + self.timeout;
+            match self.timer.as_mut() {
+                Some(timer) => timer.as_mut().reset(deadline),
+                None => self.timer = Some(Box::pin(sleep_until(deadline))),
+            }
+            self.stalled = true;
+        }
+
+        match self
+            .timer
+            .as_mut()
+            .expect("a stalled direction always has a timer")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Ready(()) => {
+                self.stalled = false;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Applies an inactivity deadline only while a socket write is backpressured.
 ///
 /// A successful write of at least one byte is progress. `Pending` starts the
@@ -17,18 +82,14 @@ use tokio::{
 /// keep-alive idle time, and application execution do not arm this timer.
 pub(crate) struct WriteProgressTimeout<T> {
     inner: T,
-    timeout: Duration,
-    timer: Option<Pin<Box<Sleep>>>,
-    stalled: bool,
+    deadline: ProgressDeadline,
 }
 
 impl<T> WriteProgressTimeout<T> {
-    pub(crate) fn new(inner: T, timeout: Duration) -> Self {
+    pub(crate) const fn new(inner: T, timeout: Duration) -> Self {
         Self {
             inner,
-            timeout,
-            timer: None,
-            stalled: false,
+            deadline: ProgressDeadline::new(timeout),
         }
     }
 
@@ -40,41 +101,21 @@ impl<T> WriteProgressTimeout<T> {
         match result {
             Poll::Ready(Ok(written)) => {
                 if written > 0 {
-                    self.stalled = false;
+                    self.deadline.progress();
                 }
                 Poll::Ready(Ok(written))
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => {
-                if !self.stalled {
-                    let deadline = Instant::now() + self.timeout;
-                    match self.timer.as_mut() {
-                        Some(timer) => timer.as_mut().reset(deadline),
-                        None => self.timer = Some(Box::pin(sleep_until(deadline))),
-                    }
-                    self.stalled = true;
-                }
-
-                match self
-                    .timer
-                    .as_mut()
-                    .expect("a stalled write always has a timer")
-                    .as_mut()
-                    .poll(cx)
-                {
-                    Poll::Ready(()) => {
-                        self.stalled = false;
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "socket write made no progress for {:.3} seconds",
-                                self.timeout.as_secs_f64()
-                            ),
-                        )))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            Poll::Pending => match self.deadline.poll_stalled(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "socket write made no progress for {:.3} seconds",
+                        self.deadline.timeout().as_secs_f64()
+                    ),
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 }

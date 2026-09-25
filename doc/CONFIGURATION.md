@@ -58,6 +58,89 @@ max_worker_age = 3600
 HAMSTER_LARAVEL_PATH = "www/pms"
 ```
 
+A reverse-proxy location forwards to one HTTP/1.1 upstream. Only `upstream`
+is required; the other fields show their defaults:
+
+```toml
+[[hosts.locations]]
+path = "/api"
+handler = "proxy"
+
+[hosts.locations.proxy]
+upstream = "http://127.0.0.1:3000"
+connect_timeout = 5           # seconds, 1-3600
+response_header_timeout = 30  # seconds, 1-3600, counted from the end of the upload
+progress_timeout = 30         # seconds, 1-3600, inactivity on any body direction
+idle_timeout = 4              # seconds, 1-3600
+max_idle = 64                 # 0-4096; 0 disables connection reuse
+preserve_host = true
+```
+
+`upstream` must be `http://host[:port]` (a bare trailing `/` is accepted):
+`https`, any other path, a query, user information, port 0, and an explicit
+empty, nonnumeric or out-of-range port are rejected,
+because v1 has no upstream TLS and forwards the request path unchanged. A hostname is resolved once during compilation, before
+the listener binds; an unresolvable name is a `Compile` error, the first
+resolved address is used, and it is printed at startup. `progress_timeout` is an
+inactivity interval, never a total deadline, so a long upload or download that
+keeps moving is not cut. `server.http1_max_buffer_size` also bounds each upstream
+connection's HTTP/1 buffers, and with them the largest upstream response head
+Hamster accepts (a larger head is a 502). On Windows loopback, values of
+128 KiB and above collapsed proxied large transfers at low concurrency, and
+memory per stalled exchange grows with the value; 64 KiB is the measured
+conservative default for proxy deployments, not a proven optimum. The proxy does not use `server.max_body_memory`,
+because it buffers no request body. `idle_timeout` defaults below the 5-second
+keep-alive timeout common to several upstream servers so Hamster normally
+retires an idle connection first; it is a policy default, not a measured
+optimum. See `doc/REVERSE_PROXY_V1.md` for the full semantics.
+
+An optional HTTPS listener terminates TLS in front of the same hosts. Only
+`listen` and at least one certificate are required; the example shows the
+default handshake timeout:
+
+```toml
+[server]
+listen = "0.0.0.0:80"         # optional once [server.tls] exists
+
+[server.tls]
+listen = "0.0.0.0:443"
+handshake_timeout = 10        # seconds, 1-60, total from accept
+
+[[server.tls.certificates]]
+cert = "certs/site-chain.pem" # leaf first, then intermediates
+key = "certs/site-key.pem"    # unencrypted PKCS#8, PKCS#1 or SEC1
+names = ["example.com", "*.example.net"]
+default = true                # at most one; used for no or unknown SNI
+```
+
+`server.listen` becomes optional when `[server.tls]` is present, so a server
+can be HTTPS-only; with neither, validation fails. Both listeners serve every
+host and share `max_connections`, the HTTP limits and the router. A TLS
+connection that has not finished its handshake occupies a connection slot, and
+`handshake_timeout` is a total deadline from accept, not an inactivity timer.
+The two listen addresses must not overlap.
+
+`names` are the SNI names that select a certificate: exact DNS names or `*.`
+plus a parent domain, matching exactly one extra label. Exact names win over
+wildcards; a name may appear only once across all certificates; IP addresses
+are rejected because clients never send them as SNI. Every configured name is
+checked against the leaf's subject alternative names while the configuration
+compiles, so a certificate that does not cover a name it claims fails startup
+instead of every handshake. A handshake with no SNI, or an SNI nothing matches,
+uses the `default = true` certificate, and fails when there is none. SNI only
+selects the certificate: the request's effective HTTP authority still selects
+the virtual host, exactly as on the cleartext listener.
+
+Certificate and key paths resolve against the configuration file's directory.
+Files are read and checked once, before any worker starts or socket binds:
+unreadable files, PEM without a certificate, an unreadable, unsupported or
+encrypted key, and a key that does not match the leaf are `Compile` errors
+naming the field and path. Key contents never appear in a diagnostic.
+Certificate validity dates and the completeness of the chain are **not**
+checked; see `doc/TLS_V1.md`. TLS 1.2 and 1.3 use rustls's defaults with the
+aws-lc-rs provider, and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md`
+for the full semantics.
+
 On Windows, the presence of any `php_worker` location also requires process
 containment to be established before worker startup. Hamster creates and fully
 configures a private kill-on-close Job Object, assigns itself, and only then
@@ -72,9 +155,10 @@ enabled. Brokered process creation such as WMI `Win32_Process.Create` is outside
 the inherited process-tree contract. On non-Windows platforms these settings do
 not imply an equivalent OS containment mechanism.
 
-`server.listen` must be a numeric IP socket address. `max_connections` bounds
-accepted connections owned by the process and defaults to 1024 (valid range
-1-65536). At the bound, Hamster stops accepting until a connection task exits;
+`server.listen` and `server.tls.listen` must be numeric IP socket addresses.
+`max_connections` bounds accepted connections owned by the process, across both
+listeners and including TLS handshakes in progress, and defaults to 1024 (valid
+range 1-65536). At the bound, Hamster stops accepting until a connection task exits;
 it does not create an application queue or reject an already accepted request.
 `header_read_timeout` is the maximum number of seconds to receive each complete
 HTTP/1 request head, including the wait for a next keep-alive request. It
@@ -205,7 +289,7 @@ Tokio, Hyper/socket and allocator overhead were included. `max_connections`
 bounds how many such streams the process owns. `max_body_memory` continues to
 count request bodies only.
 
-PHP responses remain buffered protocol-v2 frames; the response frame shape is
+PHP responses remain buffered protocol frames; the response frame shape is
 unchanged. Their frame
 limit, rather than the static file size, bounds one response.
 
@@ -318,8 +402,8 @@ An absolute static root is used as written. A relative root is resolved against
 the directory containing the selected `hamster.toml`, not the process working
 directory. For example, `D:\project\hamster.toml` with `root = "public"`
 resolves to `D:\project\public`. PHP executable and script paths use the same
-base-directory rule. The static root must be a directory; PHP paths must be
-files. All are canonicalized once while compiling the runtime configuration.
+base-directory rule, as do TLS certificate and key paths. The static root must
+be a directory; PHP paths must be files. All are canonicalized once while compiling the runtime configuration.
 
 The explicit built-in development configuration is used only when no CLI
 arguments are supplied. It listens on `127.0.0.1:8080`, maps `localhost` and
@@ -329,12 +413,16 @@ invalid explicit files never fall back to the built-in configuration.
 
 ## Validation Rules
 
-Configuration fails fast for an invalid listen address or HTTP bound; empty or invalid host
+Configuration fails fast for an invalid or overlapping listen address, no
+listener at all, or an HTTP bound out of range; invalid TLS names, duplicate
+names, more than one default certificate, TLS files that cannot be read or used
+together, and names the certificate does not cover; empty or invalid host
 names; case-insensitive primary/alias collisions; absent hosts or locations;
 invalid or duplicate normalized location paths; unknown handlers; missing or
 unexpected handler fields; invalid pool bounds; static roots that cannot be
-canonicalized or are not directories; and PHP executable/script paths that are
-missing or not files. Errors identify the field plus the host/location index or
+canonicalized or are not directories; PHP executable/script paths that are
+missing or not files; and proxy upstreams that are not `http://host[:port]`,
+cannot be resolved, or carry out-of-range timeouts or `max_idle`. Errors identify the field plus the host/location index or
 name where applicable. No dangerous input is silently repaired, and PHP is not
 searched from `PATH`.
 
@@ -343,8 +431,8 @@ searched from `PATH`.
 `RawConfig` mirrors TOML using strings and paths. Validation parses the listen
 address, checks global host uniqueness, normalizes location definitions, and
 resolves roots against a stable base directory. Compilation canonicalizes static
-roots and executable/script paths and constructs the existing vector-based
-routers and handler enum. Every compiled `PhpWorkerPool` starts and completes
+roots and executable/script paths, loads and checks TLS certificates and keys,
+and constructs the existing vector-based routers and handler enum. Every compiled `PhpWorkerPool` starts and completes
 all READY handshakes before the listener binds. Partial startup is rolled back;
 only the completely started `RuntimeConfig` reaches the server.
 

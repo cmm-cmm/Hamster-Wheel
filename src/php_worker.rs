@@ -37,7 +37,7 @@ use crate::{
         write_frame, write_frame_tracked,
     },
     response_body::ResponseBody,
-    transport::TransportInfo,
+    transport::ConnectionInfo,
 };
 
 pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
@@ -1238,12 +1238,12 @@ impl PhpWorkerPool {
     pub(crate) async fn serve_http(
         &self,
         request: Request<Incoming>,
-        transport: TransportInfo,
+        connection: ConnectionInfo,
         body_read_timeout: Duration,
     ) -> HandlerResponse {
         let admitted = match http_request(
             request,
-            transport,
+            connection,
             body_read_timeout,
             &self.shared.config.body_budget,
         )
@@ -1294,12 +1294,12 @@ impl PhpWorkerPool {
     #[cfg(test)]
     pub(crate) async fn test_body_echo(
         request: Request<Incoming>,
-        transport: TransportInfo,
+        connection: ConnectionInfo,
         body_read_timeout: Duration,
         budget: &Arc<BodyBudget>,
         hold: Option<Duration>,
     ) -> HandlerResponse {
-        match http_request(request, transport, body_read_timeout, budget).await {
+        match http_request(request, connection, body_read_timeout, budget).await {
             Ok(admitted) => {
                 let response =
                     Response::new(ResponseBody::buffered(Bytes::from(admitted.request.body)));
@@ -2643,7 +2643,7 @@ const BODY_GROWTH_FLOOR: usize = 8 * 1_024;
 
 async fn http_request(
     request: Request<Incoming>,
-    transport: TransportInfo,
+    connection: ConnectionInfo,
     body_read_timeout: Duration,
     budget: &Arc<BodyBudget>,
 ) -> Result<AdmittedRequest, HttpRequestError> {
@@ -2664,7 +2664,7 @@ async fn http_request(
     // This is the whole static/GET path, and it must stay free.
     if body.is_end_stream() {
         return Ok(AdmittedRequest {
-            request: build_worker_request(parts, http_version, transport, Vec::new()),
+            request: build_worker_request(parts, http_version, connection, Vec::new()),
             body: BodyReservation::none(),
         });
     }
@@ -2693,7 +2693,7 @@ async fn http_request(
         reservation.held()
     );
     Ok(AdmittedRequest {
-        request: build_worker_request(parts, http_version, transport, bytes),
+        request: build_worker_request(parts, http_version, connection, bytes),
         body: reservation,
     })
 }
@@ -2739,9 +2739,10 @@ async fn read_http_body(
 fn build_worker_request(
     parts: hyper::http::request::Parts,
     http_version: WorkerHttpVersion,
-    transport: TransportInfo,
+    connection: ConnectionInfo,
     bytes: Vec<u8>,
 ) -> WorkerRequest {
+    let transport = connection.transport();
     let uri = parts.uri.to_string();
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or_default();
@@ -2752,6 +2753,7 @@ fn build_worker_request(
         .collect();
     WorkerRequest {
         http_version,
+        scheme: connection.scheme(),
         peer_addr: transport.peer_addr(),
         local_addr: transport.local_addr(),
         method: parts.method.as_str().as_bytes().to_vec(),
@@ -2849,6 +2851,7 @@ mod tests {
         };
         WorkerRequest {
             http_version: WorkerHttpVersion::Http11,
+            scheme: crate::transport::Scheme::Http,
             peer_addr: "127.0.0.2:43210".parse().unwrap(),
             local_addr: "127.0.0.1:8080".parse().unwrap(),
             method: method.as_bytes().to_vec(),

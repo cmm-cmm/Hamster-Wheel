@@ -312,13 +312,15 @@ all integers are unsigned big-endian and every variable byte string carries an
 explicit length. Readers reject oversized, truncated, trailing, or structurally
 invalid frames.
 
-The current version is 2. Startup is strict: a worker advertising any other
-READY version is terminated before the server listener is bound.
+The current version is 3 (TLS v1 added the scheme byte). Startup is strict: a
+worker advertising any other READY version is terminated before the server
+listener is bound.
 
 Message kinds are:
 
 - `READY (1)`: protocol version `u16`, PHP PID `u32`.
-- `REQUEST (2)`: request ID `u64`; HTTP version `u8`; typed peer and local
+- `REQUEST (2)`: request ID `u64`; HTTP version `u8`; scheme `u8` (`1` http,
+  `2` https: the connection's trusted scheme); typed peer and local
   endpoints (address family, 4/16 address bytes, port `u16`); method
   (`u16 + bytes`); URI, path, and query (`u32 + bytes` each); header count `u16`
   followed by name (`u16 + bytes`) and value (`u32 + bytes`) pairs; body
@@ -335,7 +337,8 @@ chunking, multiplexing, or compression.
 
 ## HTTP Mapping and Validation
 
-Rust serializes the actual HTTP version, immediate peer/local socket endpoints,
+Rust serializes the actual HTTP version, the listener-established scheme,
+immediate peer/local socket endpoints,
 HTTP method, complete URI, path, query without `?`, every header occurrence,
 and the buffered body. Body-limit violations return `413`
 without touching the worker. The PHP response status must be a valid HTTP status;
@@ -438,7 +441,7 @@ or adaptive sizing. FastCGI remains separate later work.
 
 ### Laravel worker limitations (0.4)
 
-`fixtures/php-worker/laravel_worker.php` adapts protocol v2 to Laravel Octane's
+`fixtures/php-worker/laravel_worker.php` adapts the protocol to Laravel Octane's
 application sandbox. `laravel_request.php` rebuilds the request, including
 cookies, urlencoded bodies and `multipart/form-data` uploads, because the SAPI
 layer that normally does that is not in the path. `laravel_lifecycle.php` owns
@@ -469,8 +472,9 @@ What the worker does not do:
   singleton that must be rebuilt belongs in `octane.flush`.
 - Streamed/file responses are captured into one frame; this is response-semantic
   support, not transport streaming.
-- The adapter maps typed protocol-v2 endpoint/version fields into Symfony's
-  request server bag. It deliberately does not populate process-global
+- The adapter maps typed protocol endpoint/version/scheme fields into Symfony's
+  request server bag (`HTTPS=on` and `REQUEST_SCHEME=https` for a TLS
+  connection). It deliberately does not populate process-global
   `$_SERVER`. See `doc/APPLICATION_REQUEST_METADATA.md`.
 
 The lifecycle, falsification evidence and current blockers are in

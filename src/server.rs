@@ -1,14 +1,27 @@
-use std::{fmt, future::Future, io, sync::Arc};
+use std::{
+    fmt,
+    future::{Future, poll_fn},
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    task::Poll,
+};
 
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::time::timeout;
-use tokio::{net::TcpListener, sync::watch, task::JoinSet};
+use tokio::time::{Instant, timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream},
+    sync::watch,
+    task::JoinSet,
+};
 
 use crate::{
     config::{HttpLimits, PhpPoolsError, RuntimeConfig},
     router::HostRouter,
-    transport::TransportInfo,
+    tls::TlsListener,
+    transport::{ConnectionInfo, Scheme, TransportInfo},
     write_progress::WriteProgressTimeout,
 };
 
@@ -92,30 +105,33 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             worker.elapsed.as_secs_f64() * 1_000.0
         );
     }
-    let address = config.listen_address();
-    let listener = match TcpListener::bind(address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            return match config.shutdown_workers().await {
-                Ok(()) => Err(ServerError::Io(error)),
-                Err(cleanup) => Err(ServerError::IoWithWorkerCleanup {
-                    source: error,
-                    cleanup,
-                }),
-            };
+    for upstream in config.upstreams() {
+        // The address was resolved once during configuration and is never
+        // re-resolved, so it is printed where the operator will look for it.
+        println!(
+            "Proxy upstream {} -> http://{}",
+            upstream.label(),
+            upstream.address()
+        );
+    }
+    // Every listener is bound before any is served, so a failure to bind the
+    // second one never leaves the first serving on its own.
+    let mut listeners = Vec::with_capacity(2);
+    if let Some(address) = config.listen_address() {
+        match TcpListener::bind(address).await {
+            Ok(socket) => listeners.push(Listener::cleartext(socket)),
+            Err(error) => return Err(stop_workers_after(&config, error).await),
         }
-    };
+    }
+    if let Some(tls) = config.tls() {
+        match TcpListener::bind(tls.address()).await {
+            Ok(socket) => listeners.push(Listener::tls(socket, Arc::clone(tls))),
+            Err(error) => return Err(stop_workers_after(&config, error).await),
+        }
+    }
     let shutdown = match shutdown_signal() {
         Ok(shutdown) => shutdown,
-        Err(error) => {
-            return match config.shutdown_workers().await {
-                Ok(()) => Err(ServerError::Io(error)),
-                Err(cleanup) => Err(ServerError::IoWithWorkerCleanup {
-                    source: error,
-                    cleanup,
-                }),
-            };
-        }
+        Err(error) => return Err(stop_workers_after(&config, error).await),
     };
     // Printed once at startup, beside the other readiness lines. A refused
     // request is only explainable if the operator can see what the ceiling was
@@ -125,10 +141,25 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         0 => println!("Request body memory budget disabled (server.max_body_memory = 0)"),
         limit => println!("Request body memory budget {limit} bytes"),
     }
-    println!("Hamster Wheel listening on http://{address}");
+    for listener in &listeners {
+        let address = listener.address();
+        match &listener.tls {
+            None => println!("Hamster Wheel listening on http://{address}"),
+            Some(tls) => println!(
+                "Hamster Wheel listening on https://{address} ({} certificate(s), TLS 1.2/1.3, ALPN http/1.1, handshake timeout {} s)",
+                tls.certificates(),
+                tls.handshake_timeout().as_secs()
+            ),
+        }
+    }
 
     let router = config.router_arc();
-    let serve_result = serve_with_router(listener, router, config.http_limits(), shutdown).await;
+    let serve_result = serve_listeners(listeners, router, config.http_limits(), shutdown).await;
+    // Every downstream connection, and therefore every active proxy exchange,
+    // has ended. Close what remains idle instead of leaving it to process exit.
+    for upstream in config.upstreams() {
+        upstream.close_idle();
+    }
     let shutdown_result = config.shutdown_workers().await;
     match (serve_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -138,8 +169,71 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     }
 }
 
+async fn stop_workers_after(config: &RuntimeConfig, error: io::Error) -> ServerError {
+    match config.shutdown_workers().await {
+        Ok(()) => ServerError::Io(error),
+        Err(cleanup) => ServerError::IoWithWorkerCleanup {
+            source: error,
+            cleanup,
+        },
+    }
+}
+
+/// A bound socket and what the server does with a connection it accepts:
+/// serve HTTP on it directly, or first complete a TLS handshake.
+pub struct Listener {
+    socket: TcpListener,
+    tls: Option<Arc<TlsListener>>,
+}
+
+impl Listener {
+    pub const fn cleartext(socket: TcpListener) -> Self {
+        Self { socket, tls: None }
+    }
+
+    pub const fn tls(socket: TcpListener, tls: Arc<TlsListener>) -> Self {
+        Self {
+            socket,
+            tls: Some(tls),
+        }
+    }
+
+    fn address(&self) -> String {
+        self.socket.local_addr().map_or_else(
+            |error| format!("<unknown: {error}>"),
+            |address| address.to_string(),
+        )
+    }
+}
+
+/// Serves one cleartext listener. Kept as the entry point every existing
+/// integration test and probe uses.
 pub async fn serve_with_router<F>(
     listener: TcpListener,
+    router: Arc<HostRouter>,
+    http_limits: HttpLimits,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    serve_listeners(
+        vec![Listener::cleartext(listener)],
+        router,
+        http_limits,
+        shutdown,
+    )
+    .await
+}
+
+/// Serves every listener from one accept loop.
+///
+/// All listeners share one `max_connections` admission bound and one
+/// `JoinSet`: a connection still in its TLS handshake holds a slot exactly as
+/// an HTTP connection does, which is what makes the handshake deadline the
+/// bound on how long a silent peer can occupy one.
+pub async fn serve_listeners<F>(
+    listeners: Vec<Listener>,
     router: Arc<HostRouter>,
     http_limits: HttpLimits,
     shutdown: F,
@@ -151,11 +245,13 @@ where
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let mut next_listener = 0;
 
     loop {
         tokio::select! {
-            accept_result = listener.accept(), if connections.len() < http_limits.max_connections() => {
-                let (stream, peer_addr) = accept_result?;
+            accept_result = accept_any(&listeners, &mut next_listener), if connections.len() < http_limits.max_connections() => {
+                let (index, stream, peer_addr) = accept_result?;
+                let accepted_at = Instant::now();
                 let local_addr = match stream.local_addr() {
                     Ok(local_addr) => local_addr,
                     Err(error) => {
@@ -164,11 +260,21 @@ where
                     }
                 };
                 let transport = TransportInfo::new(peer_addr, local_addr);
+                let tls = listeners[index].tls.clone();
                 let shutdown_rx = shutdown_rx.clone();
                 let router = Arc::clone(&router);
 
                 connections.spawn(async move {
-                    serve_connection(stream, transport, router, http_limits, shutdown_rx).await;
+                    serve_connection(
+                        stream,
+                        transport,
+                        tls,
+                        accepted_at,
+                        router,
+                        http_limits,
+                        shutdown_rx,
+                    )
+                    .await;
                 });
             }
             join_result = connections.join_next(), if !connections.is_empty() => {
@@ -180,7 +286,7 @@ where
         }
     }
 
-    drop(listener);
+    drop(listeners);
     let _ = shutdown_tx.send(true);
 
     while let Some(join_result) = connections.join_next().await {
@@ -193,18 +299,100 @@ where
     Ok(())
 }
 
+/// Accepts from whichever listener is ready. The first listener polled
+/// rotates, so a flood on one cannot starve the other.
+async fn accept_any(
+    listeners: &[Listener],
+    next: &mut usize,
+) -> io::Result<(usize, TcpStream, SocketAddr)> {
+    poll_fn(|cx| {
+        let count = listeners.len();
+        for offset in 0..count {
+            let index = (*next + offset) % count;
+            if let Poll::Ready(result) = listeners[index].socket.poll_accept(cx) {
+                *next = (index + 1) % count;
+                return Poll::Ready(result.map(|(stream, peer)| (index, stream, peer)));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 async fn serve_connection(
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     transport: TransportInfo,
+    tls: Option<Arc<TlsListener>>,
+    accepted_at: Instant,
+    router: Arc<HostRouter>,
+    http_limits: HttpLimits,
+    shutdown: watch::Receiver<bool>,
+) {
+    // The write deadline wraps the socket, beneath TLS. It must observe bytes
+    // the kernel accepted, not plaintext rustls buffered: above TLS it would
+    // count buffering as progress, and a flush or close_notify stalled on a
+    // peer that stopped reading would never time out.
+    let stream = WriteProgressTimeout::new(stream, http_limits.write_progress_timeout());
+    let Some(tls) = tls else {
+        let connection = ConnectionInfo::new(transport, Scheme::Http);
+        serve_http(stream, connection, router, http_limits, shutdown).await;
+        return;
+    };
+    // Boxed so that a cleartext connection's task is not sized for the TLS
+    // handshake and stream state it never uses: inline, that state machine
+    // measured about 4 KiB more per idle cleartext connection.
+    Box::pin(serve_tls(
+        stream,
+        transport,
+        tls,
+        accepted_at,
+        router,
+        http_limits,
+        shutdown,
+    ))
+    .await;
+}
+
+async fn serve_tls(
+    stream: WriteProgressTimeout<TcpStream>,
+    transport: TransportInfo,
+    tls: Arc<TlsListener>,
+    accepted_at: Instant,
     router: Arc<HostRouter>,
     http_limits: HttpLimits,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Total, from accept: no HTTP deadline applies before HTTP exists, and a
+    // shutdown cancels the handshake at once because there is no request to
+    // drain. Either way the socket and rustls state drop with this future.
+    let deadline = accepted_at + tls.handshake_timeout();
+    let stream = tokio::select! {
+        stream = tls.handshake(stream, deadline) => stream,
+        _ = shutdown.wait_for(|stop| *stop) => None,
+    };
+    if let Some(stream) = stream {
+        let connection = ConnectionInfo::new(transport, Scheme::Https);
+        serve_http(stream, connection, router, http_limits, shutdown).await;
+    }
+}
+
+/// The one HTTP serving path. Cleartext and TLS converge here; nothing below
+/// this point knows which it is except through the trusted scheme.
+async fn serve_http<I>(
+    io: I,
+    connection_info: ConnectionInfo,
+    router: Arc<HostRouter>,
+    http_limits: HttpLimits,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let transport = connection_info.transport();
     let service = hyper::service::service_fn(move |request| {
         let router = Arc::clone(&router);
         async move {
             router
-                .serve(request, transport, http_limits.body_read_timeout())
+                .serve(request, connection_info, http_limits.body_read_timeout())
                 .await
         }
     });
@@ -213,8 +401,7 @@ async fn serve_connection(
         .timer(TokioTimer::new())
         .header_read_timeout(http_limits.header_read_timeout())
         .max_buf_size(http_limits.http1_max_buffer_size());
-    let stream = WriteProgressTimeout::new(stream, http_limits.write_progress_timeout());
-    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    let connection = builder.serve_connection(TokioIo::new(io), service);
     tokio::pin!(connection);
 
     tokio::select! {
@@ -227,8 +414,10 @@ async fn serve_connection(
                 );
             }
         }
-        changed = shutdown.changed() => {
-            if changed.is_ok() && *shutdown.borrow() {
+        // `wait_for` also sees a stop signalled before this connection began
+        // serving, for example while its TLS handshake was completing.
+        stopped = async { shutdown.wait_for(|stop| *stop).await.is_ok() } => {
+            if stopped {
                 connection.as_mut().graceful_shutdown();
                 // Graceful shutdown stops accepting another request but a peer
                 // that no longer reads a streaming response can otherwise hold
@@ -266,10 +455,33 @@ fn should_report_connection_error(error: &hyper::Error) -> bool {
         || error_chain_has_io_kind(error, io::ErrorKind::TimedOut)
         || error.is_incomplete_message()
         || error.is_closed()
-        || error.is_canceled())
+        || error.is_canceled()
+        // TLS only: a peer that closes without close_notify, which browsers
+        // routinely do on idle keep-alive connections, and a malformed or
+        // undecryptable record. Both are peer-controlled.
+        || error_chain_has_io_kind(error, io::ErrorKind::UnexpectedEof)
+        || error_chain_has_io_kind(error, io::ErrorKind::InvalidData)
+        // Ending a connection whose peer is already gone. Over TLS, Hyper's
+        // shutdown writes close_notify, so a client that resets an idle
+        // keep-alive connection surfaces here; cleartext has no such write.
+        || (error.is_shutdown() && peer_is_gone(error)))
 }
 
-fn error_chain_has_io_kind(error: &(dyn std::error::Error + 'static), kind: io::ErrorKind) -> bool {
+fn peer_is_gone(error: &hyper::Error) -> bool {
+    [
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::NotConnected,
+    ]
+    .into_iter()
+    .any(|kind| error_chain_has_io_kind(error, kind))
+}
+
+pub(crate) fn error_chain_has_io_kind(
+    error: &(dyn std::error::Error + 'static),
+    kind: io::ErrorKind,
+) -> bool {
     let mut current = Some(error);
     while let Some(error) = current {
         if error
@@ -298,6 +510,9 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
         let _ = signal.recv().await;
     })
 }
+
+#[cfg(test)]
+mod tls_tests;
 
 #[cfg(test)]
 mod tests {
@@ -436,6 +651,44 @@ mod tests {
         );
     }
 
+    /// Both listeners are bound before either serves: when the HTTPS address
+    /// is taken, the cleartext socket that did bind is released again and
+    /// `run` fails instead of serving on one listener.
+    #[tokio::test]
+    async fn a_tls_bind_failure_leaves_no_listener_serving() {
+        let pki = crate::tls::test_support::Pki::new("bind-failure");
+        let leaf = pki.leaf("localhost", &["localhost"]);
+        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy");
+        let taken = occupied.local_addr().expect("occupied address");
+        let free = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve");
+        let cleartext = free.local_addr().expect("free address");
+        drop(free);
+        let literal = |path: &Path| format!("'{}'", path.display());
+        let source = format!(
+            "[server]\nlisten = \"{cleartext}\"\n\n[server.tls]\nlisten = \"{taken}\"\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\n\n[[hosts]]\nname = \"localhost\"\nlocations = [{{ path = \"/\", handler = \"not_found\" }}]\n",
+            literal(&leaf.cert),
+            literal(&leaf.key),
+        );
+        let runtime = Arc::new(
+            crate::config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+                .expect("the configuration itself is valid"),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(5), run(runtime))
+            .await
+            .expect("run returns instead of serving")
+            .expect_err("an HTTPS address in use must fail startup");
+        assert!(
+            matches!(&error, ServerError::Io(io) if io.kind() == io::ErrorKind::AddrInUse),
+            "{error}"
+        );
+        assert!(
+            TcpStream::connect(cleartext).await.is_err(),
+            "the cleartext listener must not be left serving"
+        );
+        drop(occupied);
+    }
+
     async fn start_body_server(
         http_limits: HttpLimits,
     ) -> (
@@ -563,7 +816,7 @@ mod tests {
         let peer_addr = client.local_addr().expect("client address");
         let local_addr = client.peer_addr().expect("server address");
         assert!(!local_addr.ip().is_unspecified());
-        let expected = format!("peer={peer_addr};local={local_addr}");
+        let expected = format!("peer={peer_addr};local={local_addr};scheme=http");
 
         client
             .write_all(
@@ -605,7 +858,7 @@ mod tests {
                     .expect("write concurrent request");
                 assert_eq!(
                     read_response_body(&mut client).await,
-                    format!("peer={peer_addr};local={local_addr}")
+                    format!("peer={peer_addr};local={local_addr};scheme=http")
                 );
             });
         }

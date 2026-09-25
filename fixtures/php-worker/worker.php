@@ -100,6 +100,7 @@ while (($frame = hamster_read_frame($stdin)) !== null) {
             $response['body'] = json_encode([
                 'pid' => getmypid(),
                 'http_version' => $request['http_version'],
+                'scheme' => $request['scheme'],
                 'peer_addr' => $request['peer_addr'],
                 'peer_port' => $request['peer_port'],
                 'local_addr' => $request['local_addr'],

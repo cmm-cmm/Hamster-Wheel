@@ -12,6 +12,8 @@ use tokio::{
     io::{AsyncRead, ReadBuf},
 };
 
+use crate::proxy::ProxyBody;
+
 /// Maximum application buffer produced for one static-file body frame.
 ///
 /// Tokio's file implementation also has an internal buffer. The same limit is
@@ -25,15 +27,23 @@ pub(crate) const STATIC_FILE_CHUNK_SIZE: usize = 128 * 1_024;
 /// path explicit while allowing static files to stream. This is not a backend
 /// extension point; new variants require the same ownership and resource
 /// review as this file variant.
+///
+/// `Proxy` is boxed so the reverse proxy's lease and deadline do not widen the
+/// enum that every static and PHP response is moved through.
 #[derive(Debug)]
 pub(crate) enum ResponseBody {
     Buffered(Full<Bytes>),
     File(FileBody),
+    Proxy(Box<ProxyBody>),
 }
 
 impl ResponseBody {
     pub(crate) fn buffered(bytes: Bytes) -> Self {
         Self::Buffered(Full::new(bytes))
+    }
+
+    pub(crate) fn proxy(body: ProxyBody) -> Self {
+        Self::Proxy(Box::new(body))
     }
 
     pub(crate) fn file(mut file: File, length: u64) -> Self {
@@ -63,6 +73,7 @@ impl Body for ResponseBody {
                 Poll::Ready(None) => Poll::Ready(None),
             },
             Self::File(body) => Pin::new(body).poll_frame(cx),
+            Self::Proxy(body) => Pin::new(body.as_mut()).poll_frame(cx),
         }
     }
 
@@ -70,6 +81,7 @@ impl Body for ResponseBody {
         match self {
             Self::Buffered(body) => body.is_end_stream(),
             Self::File(body) => body.is_end_stream(),
+            Self::Proxy(body) => body.is_end_stream(),
         }
     }
 
@@ -77,6 +89,7 @@ impl Body for ResponseBody {
         match self {
             Self::Buffered(body) => body.size_hint(),
             Self::File(body) => body.size_hint(),
+            Self::Proxy(body) => body.size_hint(),
         }
     }
 }

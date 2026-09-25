@@ -1,6 +1,122 @@
 # AI Handoff
 
-## Current Working Scope — Windows Abnormal-Parent Child Containment
+## Current Working Scope — TLS v1 (implemented, in review)
+
+The Owner recorded the Reverse Proxy v1 checkpoint and, after the TLS
+architecture investigation (`doc/research/TLS_ARCHITECTURE_INVESTIGATION.md`),
+moved TLS v1 to implementation on 2026-09-25. It is implemented in the
+uncommitted working tree on top of the Reverse Proxy v1 working tree. Not
+committed, tagged, released or accepted; the Owner decides. Authoritative
+record: `doc/TLS_V1.md`; measurements:
+`benchmarks/results/tls_v1_20260925.md`.
+
+FACT: `[server.tls]` adds an HTTPS listener beside or instead of
+`server.listen` (rustls 0.23.45 / tokio-rustls 0.26.5, aws-lc-rs provider,
+TLS 1.2/1.3 defaults, ALPN `http/1.1` only). PEM chains and keys are loaded and
+checked while the config compiles, before workers start or sockets bind;
+configured SNI names must be covered by the leaf. SNI selects the certificate
+(exact, one-label wildcard, optional default); the effective HTTP authority
+still selects the virtual host. One accept loop serves both listeners under one
+`max_connections`. A TLS connection wraps the socket in `WriteProgressTimeout`
+beneath TLS, completes its handshake under a total deadline from accept
+(default 10 s, 1-60) that shutdown cancels, then enters the same generic
+`serve_http` as cleartext. Handlers receive `ConnectionInfo` =
+`TransportInfo` + trusted `Scheme`; proxy `X-Forwarded-Proto` and PHP protocol
+v3's new scheme byte come only from it. PHP protocol is now v3 (v1/v2 workers
+fail startup). The Laravel adapter sets `REQUEST_SCHEME`/`HTTPS` from it.
+
+Known limits kept out of v1: no ACME, reload, OCSP, mTLS, upstream TLS,
+HTTP/2/3, redirect/HSTS, per-host listener binding, SNI/Host authorization
+policy, certificate validity-date or chain checks. Native Linux: NOT VERIFIED.
+Older sections titled `Current Status` and `Next Action` below are historical
+records for their named slices; this top section is the active scope.
+
+## Recorded Checkpoint — TLS architecture investigation (2026-09-24)
+
+Investigation only, superseded by the implementation above; its candidate
+comparison, library evidence and Owner review points remain in
+`doc/research/TLS_ARCHITECTURE_INVESTIGATION.md`.
+
+## Recorded Checkpoint — Reverse Proxy v1 (0.7 candidate)
+
+Implemented in the uncommitted working tree for owner review on top of
+`a7a31b4`. Not committed, tagged, released, or accepted; the owner decides
+architecture approval and closure. The current Reverse Proxy diff uses
+`a7a31b4` as its baseline.
+
+FACT: a `proxy` location compiles to its own `Arc<Upstream>` (`src/proxy.rs`)
+holding the startup-resolved address, timeouts, an idle `VecDeque` behind a
+std mutex with single push/pop critical sections, and counters. Connections are
+Hyper `client::conn::http1` (the `client` feature was enabled; it adds the
+transitive crates `want` and `try-lock`). Request and response bodies stream as
+Hyper `Incoming` with no collection and no channel of Hamster's. A `Lease` owns
+each exchange and moves into `ResponseBody::Proxy`; a connection is pooled only
+after a clean response end and a fully sent request, and every other ending
+aborts its driver. The only retry is `TrySendError::take_message() == Some`,
+once, on a fresh connection. Forwarding metadata is replaced from
+`TransportInfo`. `ProgressDeadline` was extracted from `WriteProgressTimeout`
+so both proxy body directions use the exact existing semantics.
+
+FACT: 41 permanent proxy unit tests over raw sockets (`src/proxy/tests.rs`)
+plus 7 configuration tests pass. The earlier report says the 37 that existed
+before its final review were stable over 10 consecutive runs (an earlier count
+of 38 was corrected to 37), and the next 38 over 5 consecutive runs. Three more focused
+regressions were added in this readiness review. They include the
+B' regression (upstream stops reading + client disconnects: reclaimed 814 ms
+after disconnect at a 1 s progress timeout), early 413 during upload (280 us),
+deterministic stale keep-alive retry through a `#[cfg(test)]` read-EOF fault,
+and no-duplicate execution checks. The earlier investigation reports 29
+deliberate mutations of the invariants, each detected by at least one test
+(M29 and its test, response-side
+"both lengths, never reused", were added in the final review).
+
+FACT: Windows reports a refused loopback connect only after ~2.04 s of SYN
+retries; with `connect_timeout` below that, a refused loopback upstream is 504.
+
+FACT (release, loopback, `benches/proxy.rs`): C1 23 B costs Hamster 58.6 us CPU
+and +44 us median; 64 MiB C1 runs at 94% of direct with 1.84 MiB private
+commit; a stalled exchange costs 185-252 KiB at the 64 KiB buffer bound,
+linear in count, independent of payload, and scaling with the bound (about
+120-140 KiB at 32 KiB, 1.08-1.56 MiB at 417,792). `http1_max_buffer_size` of
+128 KiB or more collapses proxied large transfers at C1 on Windows loopback
+(largely absent at C32), so 64 KiB is kept for upstreams too, as a measured
+conservative Windows default, not an invariant. Static A/B against `a7a31b4`:
+no regression detected at ~8% resolution.
+
+FACT (investigation, no production change): the collapse and the ~15 ms tail
+on 1 MiB C1 (about 12% of proxied requests at or above 5 ms, 1.6-6.3% direct)
+are one Windows loopback TCP send stall. It reproduces with a Hyper-only
+proxy, a raw Tokio relay and two plain std threads
+(`benches/windows_tcp_stall.rs`); during a stall the receiver has advertised
+an open window, the sender has data and gets `WSAEWOULDBLOCK`, and ETW shows
+sending resume when a TCP timer fires 10-17 ms later. Not a Hamster, Hyper or
+Tokio defect. An upstream `SO_RCVBUF` of 1 MiB removed most of it in a
+reverted experiment, 4 MiB halved 64 MiB throughput; not productionized.
+Exact kernel rule, real NIC and Linux: not verified.
+
+Readiness review found and fixed two production defects: transfer codings
+before `chunked` were stripped without decoding their payload (400 for such
+requests and 502 for such upstream responses now), and explicit invalid
+upstream ports were silently treated as port 80 (now rejected at validation).
+The raw-socket target probe confirms `CONNECT` authority-form and `OPTIONS *`
+return 400 before an upstream connection; documentation was corrected.
+
+Readiness review gates: fmt, strict Windows clippy, default suite (128 lib,
+24 configuration, and remaining integration tests), MSVC release build and
+bench link passed. The ignored suite had 9 lib and 9 multipool passes;
+`php_worker` had 56 passes and 6 environmental failures that require
+`HAMSTER_LARAVEL_TEST_PATH`. Visibility (1), Windows containment (4), and
+timeout probes (10) passed. The Linux cross-target
+check cannot run: only `x86_64-pc-windows-msvc` is installed.
+
+Known limitations, deliberately out of v1: TLS upstreams, multiple endpoints,
+load balancing, health checks, WebSocket/Upgrade/CONNECT, HTTP/2, caching,
+trusted-proxy chains, DNS re-resolution, path rewriting, 1xx relay, reload.
+Close-delimited upstream responses cannot be told apart from truncation. Native
+Linux: NOT VERIFIED (and the Linux cross-target check could not run). Authoritative record: `doc/REVERSE_PROXY_V1.md`;
+measurements: `benchmarks/results/reverse_proxy_v1_20260924.md`.
+
+## Previous Scope — Windows Abnormal-Parent Child Containment (committed at `4b9c564`)
 
 Candidate A from the completed investigation is implemented in the uncommitted
 working tree. On Windows, `server::run` establishes an unnamed Job Object with

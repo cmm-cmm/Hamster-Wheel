@@ -490,7 +490,7 @@ fn assert_json_string(body: &[u8], field: &str, expected: &str) {
 
 #[tokio::test]
 #[ignore = "requires repository php/8.5/php.exe"]
-async fn protocol_v2_php_decoder_passes_adversarial_checks() {
+async fn protocol_php_decoder_passes_adversarial_checks() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let executable = root.join("php/8.5/php.exe");
     assert!(executable.is_file());
@@ -505,7 +505,7 @@ async fn protocol_v2_php_decoder_passes_adversarial_checks() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"14 checks passed\n");
+    assert_eq!(output.stdout, b"18 checks passed\n");
 }
 
 #[tokio::test]
@@ -623,7 +623,7 @@ async fn one_worker_enforces_laravel_octane_ownership_contract() {
 
 #[tokio::test]
 #[ignore = "requires HAMSTER_LARAVEL_TEST_PATH pointing to an Octane-enabled Laravel app with /up"]
-async fn laravel_worker_serves_repeated_requests_through_protocol_v2() {
+async fn laravel_worker_serves_repeated_requests_through_the_protocol() {
     let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let script = root.join("fixtures/php-worker/laravel_worker.php");
@@ -1093,7 +1093,7 @@ async fn protocol_v1_worker_is_rejected_before_the_server_binds() {
 
 #[tokio::test]
 #[ignore = "requires repository php/8.5/php.exe"]
-async fn protocol_v2_delivers_socket_http_and_effective_authority_metadata() {
+async fn protocol_v3_delivers_socket_http_and_effective_authority_metadata() {
     let server = TestServer::start().await;
     let absolute_authority = format!("localhost:{}", server.address.port());
     let request = format!(
@@ -3218,4 +3218,292 @@ async fn live_workers_returns_to_target_after_a_worker_is_killed() {
     );
     assert!(!pool.pids().contains(&victim), "the dead PID is gone");
     server.stop().await;
+}
+
+/// Writes a self-signed certificate for `localhost` and returns its PEM
+/// paths, DER, and the directory to remove.
+fn localhost_certificate(tag: &str) -> (PathBuf, PathBuf, Vec<u8>, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "hamster-wheel-php-tls-{tag}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create certificate directory");
+    let generated =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("certificate");
+    let cert = dir.join("localhost.crt");
+    let key = dir.join("localhost.key");
+    std::fs::write(&cert, generated.cert.pem()).expect("write certificate");
+    std::fs::write(&key, generated.signing_key.serialize_pem()).expect("write key");
+    (cert, key, generated.cert.der().to_vec(), dir)
+}
+
+async fn https_request(
+    address: SocketAddr,
+    trusted: &[u8],
+    request: &[u8],
+) -> (Vec<u8>, SocketAddr) {
+    use tokio_rustls::{
+        TlsConnector,
+        rustls::{
+            ClientConfig, RootCertStore,
+            pki_types::{CertificateDer, ServerName},
+        },
+    };
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(trusted.to_vec()))
+        .expect("trust the test certificate");
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("client versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let stream = TcpStream::connect(address)
+        .await
+        .expect("client should connect");
+    let client = stream.local_addr().expect("client address");
+    let mut stream = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .expect("a verifying client completes the handshake");
+    stream
+        .write_all(request)
+        .await
+        .expect("request should be written");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("response should end with close_notify");
+    (response, client)
+}
+
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn protocol_v3_carries_the_listener_scheme_not_a_forwarding_header() {
+    let (cert, key, der, dir) = localhost_certificate("scheme");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+    // Configuration is the path under test: the certificate is loaded and
+    // checked while the config compiles, before any worker or socket exists.
+    let source = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[server.tls]\nlisten = \"127.0.0.1:8443\"\nhandshake_timeout = 5\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\ndefault = true\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\n",
+        toml_literal(&cert),
+        toml_literal(&key),
+        toml_literal(&executable),
+        toml_literal(&script),
+    );
+    let runtime = Arc::new(
+        config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("TLS PHP config should compile"),
+    );
+    let tls = Arc::clone(runtime.tls().expect("the TLS listener was compiled"));
+    runtime
+        .start_workers()
+        .await
+        .expect("PHP worker should reach READY");
+    let clear_socket = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .expect("bind cleartext");
+    let tls_socket = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .expect("bind TLS");
+    let clear_address = clear_socket.local_addr().unwrap();
+    let tls_address = tls_socket.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server::serve_listeners(
+        vec![
+            server::Listener::cleartext(clear_socket),
+            server::Listener::tls(tls_socket, tls),
+        ],
+        runtime.router_arc(),
+        runtime.http_limits(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let (secure, client) = https_request(
+        tls_address,
+        &der,
+        b"GET /metadata HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: http\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_response(&secure);
+    assert!(
+        head.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "{}",
+        String::from_utf8_lossy(&secure)
+    );
+    assert_json_string(body, "scheme", "https");
+    assert_json_string(body, "peer_addr", "127.0.0.1");
+    assert_eq!(json_number(body, "peer_port"), client.port() as u64);
+    assert_eq!(json_number(body, "local_port"), tls_address.port() as u64);
+    let pid = json_number(body, "pid");
+
+    // Same W1 process, cleartext listener: the scheme is replaced, not kept.
+    let clear = request_at(
+        clear_address,
+        b"GET /metadata HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (_, clear_body) = split_response(&clear);
+    assert_json_string(clear_body, "scheme", "http");
+    assert_eq!(
+        json_number(clear_body, "local_port"),
+        clear_address.port() as u64
+    );
+    assert_eq!(json_number(clear_body, "pid"), pid);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    task.await
+        .expect("server task should finish")
+        .expect("server should stop cleanly");
+    runtime
+        .shutdown_workers()
+        .await
+        .expect("PHP worker should stop cleanly");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+#[ignore = "requires a freshly prepared Octane-enabled scratch PMS with HamsterPmsProbeServiceProvider"]
+async fn laravel_sees_https_from_the_tls_listener_and_not_from_a_forged_header() {
+    use tokio_rustls::{
+        TlsConnector,
+        rustls::{
+            ClientConfig, RootCertStore,
+            pki_types::{CertificateDer, ServerName},
+        },
+    };
+
+    let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("fixtures/php-worker/laravel_worker.php");
+    let app_path = PathBuf::from(
+        std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
+            .expect("HAMSTER_LARAVEL_TEST_PATH must identify the prepared scratch PMS"),
+    );
+    let app = app_path.to_string_lossy().replace('\\', "/");
+    let php_ini = std::env::var("HAMSTER_LARAVEL_TEST_PHP_INI")
+        .unwrap_or_else(|_| format!("{app}/php.ini"))
+        .replace('\\', "/");
+    let (cert, key, der, dir) = localhost_certificate("laravel");
+    let executable = root.join("php/8.5/php.exe");
+    let mut source = format!(
+        "[server]\n\n[server.tls]\nlisten = \"127.0.0.1:8443\"\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\n\n[hosts.locations.php.env]\n",
+        toml_literal(&cert),
+        toml_literal(&key),
+        toml_literal(&executable),
+        toml_literal(&script),
+    );
+    for (name, value) in [
+        ("HAMSTER_LARAVEL_PATH", app.as_str()),
+        ("PHPRC", php_ini.as_str()),
+        ("APP_ENV", "production"),
+        ("APP_DEBUG", "false"),
+        ("PERF_MONITOR_ENABLED", "false"),
+        ("HAMSTER_PMS_PROBE", "1"),
+    ] {
+        source.push_str(&format!("{name} = {value:?}\n"));
+    }
+    // TLS only: no cleartext listener is configured at all.
+    let runtime = Arc::new(
+        config::compile_str(&source, &root).expect("TLS-only Laravel config should compile"),
+    );
+    assert!(runtime.listen_address().is_none());
+    let tls = Arc::clone(runtime.tls().expect("TLS listener"));
+    runtime
+        .start_workers()
+        .await
+        .expect("Laravel worker should reach READY");
+    let socket = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .expect("bind TLS");
+    let address = socket.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server::serve_listeners(
+        vec![server::Listener::tls(socket, tls)],
+        runtime.router_arc(),
+        runtime.http_limits(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(der))
+        .expect("trust certificate");
+    let connector = TlsConnector::from(Arc::new(
+        ClientConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("client versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    ));
+    // From 127.0.0.2, which the probe's Symfony policy does not trust, so a
+    // forged forwarding scheme must not override the connection's https.
+    let probe = |source_ip: Ipv4Addr, request: &'static [u8]| {
+        let connector = connector.clone();
+        async move {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket
+                .bind(SocketAddr::new(IpAddr::V4(source_ip), 0))
+                .expect("bind source address");
+            let stream = socket.connect(address).await.expect("connect");
+            let client = stream.local_addr().unwrap();
+            let mut stream = connector
+                .connect(ServerName::try_from("localhost").unwrap(), stream)
+                .await
+                .expect("verified handshake");
+            stream.write_all(request).await.expect("request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("response ends with close_notify");
+            (response, client)
+        }
+    };
+    let (response, client) = probe(
+        Ipv4Addr::new(127, 0, 0, 2),
+        b"GET /__hamster/metadata HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: http\r\nX-Forwarded-Port: 80\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_response(&response);
+    assert!(
+        head.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "PMS metadata probe failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_json_string(body, "request_scheme", "https");
+    assert_json_string(body, "https", "on");
+    assert_json_string(body, "scheme", "https");
+    assert_json_string(body, "remote_addr", "127.0.0.2");
+    assert_json_string(body, "remote_port", &client.port().to_string());
+    assert_json_string(body, "server_port", &address.port().to_string());
+    assert_json_string(body, "client_ip", "127.0.0.2");
+    assert_json_string(body, "host", "localhost");
+    // Symfony takes the port from Host; a Host without one means the
+    // scheme's default, so https here must mean 443 (cleartext would be 80).
+    assert_eq!(json_number(body, "port"), 443);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    task.await
+        .expect("server task should finish")
+        .expect("server should stop cleanly");
+    runtime
+        .shutdown_workers()
+        .await
+        .expect("Laravel worker should stop cleanly");
+    let _ = std::fs::remove_dir_all(dir);
 }

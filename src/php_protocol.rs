@@ -5,7 +5,9 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+use crate::transport::Scheme;
+
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 pub(crate) const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_HEADERS: usize = 128;
 
@@ -16,6 +18,8 @@ const SHUTDOWN: u8 = 4;
 const SHUTDOWN_ACK: u8 = 5;
 const HTTP_10: u8 = 1;
 const HTTP_11: u8 = 2;
+const SCHEME_HTTP: u8 = 1;
+const SCHEME_HTTPS: u8 = 2;
 const IPV4: u8 = 4;
 const IPV6: u8 = 6;
 
@@ -62,6 +66,8 @@ pub(crate) struct ReadyFrame {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WorkerRequest {
     pub http_version: WorkerHttpVersion,
+    /// The connection's trusted scheme, never derived from a request header.
+    pub scheme: Scheme,
     pub peer_addr: SocketAddr,
     pub local_addr: SocketAddr,
     pub method: Vec<u8>,
@@ -218,6 +224,10 @@ pub(crate) fn encode_request(
     payload.push(match request.http_version {
         WorkerHttpVersion::Http10 => HTTP_10,
         WorkerHttpVersion::Http11 => HTTP_11,
+    });
+    payload.push(match request.scheme {
+        Scheme::Http => SCHEME_HTTP,
+        Scheme::Https => SCHEME_HTTPS,
     });
     push_endpoint(&mut payload, request.peer_addr);
     push_endpoint(&mut payload, request.local_addr);
@@ -413,6 +423,7 @@ mod tests {
     fn request_encoding_is_binary_safe_and_preserves_repeated_headers() {
         let request = WorkerRequest {
             http_version: WorkerHttpVersion::Http10,
+            scheme: Scheme::Https,
             peer_addr: "127.0.0.2:43210".parse().unwrap(),
             local_addr: "[2001:db8::1]:8080".parse().unwrap(),
             method: b"POST".to_vec(),
@@ -430,6 +441,7 @@ mod tests {
         decoder.expect_kind(REQUEST, "REQUEST").unwrap();
         assert_eq!(decoder.u64().unwrap(), 7);
         assert_eq!(decoder.bytes(1).unwrap(), [HTTP_10]);
+        assert_eq!(decoder.bytes(1).unwrap(), [SCHEME_HTTPS]);
         assert_eq!(decode_endpoint(&mut decoder), request.peer_addr);
         assert_eq!(decode_endpoint(&mut decoder), request.local_addr);
         assert_eq!(decoder.bytes_u16().unwrap(), request.method);
@@ -448,8 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn ready_rejects_every_version_except_v2() {
-        for version in [0_u16, 1, 3, u16::MAX] {
+    fn ready_rejects_every_version_except_v3() {
+        // Version 2 is refused like any other: a v2 worker would read the
+        // scheme byte as an address family and fail mid-request instead.
+        for version in [0_u16, 1, 2, 4, u16::MAX] {
             let mut ready = vec![READY];
             push_u16(&mut ready, version);
             push_u32(&mut ready, 123);

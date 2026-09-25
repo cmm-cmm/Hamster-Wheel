@@ -9,7 +9,7 @@ use hyper::{
 pub use crate::handler::{Handler, HandlerKind};
 use crate::{
     handler::{HandlerResponse, simple_response},
-    transport::TransportInfo,
+    transport::ConnectionInfo,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,14 +182,14 @@ impl HostRouter {
     pub(crate) async fn serve(
         &self,
         mut request: Request<Incoming>,
-        transport: TransportInfo,
+        connection: ConnectionInfo,
         body_read_timeout: Duration,
     ) -> Result<HandlerResponse, std::convert::Infallible> {
         let handler = match self.route_request(&mut request) {
             Ok(handler) => handler,
             Err(error) => return Ok(simple_response(error.status(), error.message())),
         };
-        handler.serve(request, transport, body_read_timeout).await
+        handler.serve(request, connection, body_read_timeout).await
     }
 
     fn route_request<B>(&self, request: &mut Request<B>) -> Result<&Handler, RouteError> {

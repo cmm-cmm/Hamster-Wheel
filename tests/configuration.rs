@@ -158,7 +158,10 @@ fn compiles_minimal_multiple_hosts_aliases_and_locations() {
 fn no_arguments_selects_and_loads_the_development_config() {
     let selection = config::parse_arguments(Vec::<std::ffi::OsString>::new()).unwrap();
     let runtime = config::load(selection).unwrap();
-    assert_eq!(runtime.listen_address(), "127.0.0.1:8080".parse().unwrap());
+    assert_eq!(
+        runtime.listen_address(),
+        Some("127.0.0.1:8080".parse().unwrap())
+    );
     assert_eq!(
         runtime
             .router()
@@ -537,4 +540,446 @@ fn explicitly_selected_file_errors_do_not_fall_back() {
         config::load(config::ConfigSelection::File(invalid)),
         Err(ConfigError::Validation(_))
     ));
+}
+
+fn proxy_config(table: &str) -> String {
+    format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/api\"\nhandler = \"proxy\"\n\n[hosts.locations.proxy]\n{table}\n"
+    )
+}
+
+fn validation_message(source: &str) -> String {
+    match config::compile_str(source, Path::new(".")) {
+        Err(ConfigError::Validation(message)) => message,
+        Err(other) => panic!("expected a validation error, got {other}"),
+        Ok(_) => panic!("expected a validation error, got a compiled config"),
+    }
+}
+
+#[test]
+fn compiles_a_proxy_location_into_its_own_upstream() {
+    let runtime = config::compile_str(
+        &proxy_config(
+            "upstream = \"http://127.0.0.1:3000\"\nconnect_timeout = 2\nresponse_header_timeout = 10\nprogress_timeout = 20\nidle_timeout = 3\nmax_idle = 0\npreserve_host = false",
+        ),
+        Path::new("."),
+    )
+    .unwrap();
+    let upstreams = runtime.upstreams();
+    assert_eq!(upstreams.len(), 1);
+    assert_eq!(upstreams[0].label(), "localhost/api");
+    assert_eq!(
+        upstreams[0].address(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000)
+    );
+    assert_eq!(
+        runtime
+            .router()
+            .route(&headers("localhost"), "/api/users")
+            .map(Handler::kind),
+        Ok(HandlerKind::Proxy)
+    );
+
+    // The defaults compile too, and port 80 is implied.
+    let runtime = config::compile_str(
+        &proxy_config("upstream = \"http://127.0.0.1\""),
+        Path::new("."),
+    )
+    .unwrap();
+    assert_eq!(runtime.upstreams()[0].address().port(), 80);
+}
+
+#[test]
+fn rejects_proxy_upstreams_v1_cannot_honor() {
+    for (upstream, reason) in [
+        ("https://127.0.0.1:3000", "TLS upstreams are not supported"),
+        ("127.0.0.1:3000", "absolute http://"),
+        ("ftp://127.0.0.1:3000", "absolute http://"),
+        ("http://127.0.0.1:3000/v1", "must not have a path"),
+        (
+            "http://127.0.0.1:3000/?a=b",
+            "must not have a path or query",
+        ),
+        ("http://user:pass@127.0.0.1:3000", "user information"),
+        ("http://127.0.0.1:0", "port 0"),
+        ("http://127.0.0.1:bogus", "invalid port"),
+        ("http://127.0.0.1:", "invalid port"),
+        ("http://127.0.0.1:65536", "invalid port"),
+        ("not a url", "is not a valid URL"),
+    ] {
+        let message = validation_message(&proxy_config(&format!("upstream = \"{upstream}\"")));
+        assert!(message.contains(reason), "{upstream}: {message}");
+        assert!(message.contains("locations[0].proxy.upstream"), "{message}");
+    }
+}
+
+#[test]
+fn rejects_out_of_range_proxy_limits() {
+    for (field, value) in [
+        ("connect_timeout", "0"),
+        ("response_header_timeout", "3601"),
+        ("progress_timeout", "0"),
+        ("idle_timeout", "0"),
+        ("max_idle", "4097"),
+    ] {
+        let message = validation_message(&proxy_config(&format!(
+            "upstream = \"http://127.0.0.1:3000\"\n{field} = {value}"
+        )));
+        assert!(message.contains(&format!("proxy.{field}")), "{message}");
+    }
+}
+
+#[test]
+fn a_proxy_table_belongs_only_to_a_proxy_location() {
+    let table = "\n[hosts.locations.proxy]\nupstream = \"http://127.0.0.1:3000\"\n";
+    let static_with_proxy = format!(
+        "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"not_found\"\n{table}"
+    );
+    assert!(validation_message(&static_with_proxy).contains(".proxy is not valid"));
+    let missing = "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"proxy\"\n";
+    assert!(validation_message(missing).contains(".proxy is required"));
+    assert!(matches!(
+        config::compile_str(
+            &proxy_config("upstream = \"http://127.0.0.1:3000\"\npath_prefix = \"/v1\""),
+            Path::new(".")
+        ),
+        Err(ConfigError::Parse { .. })
+    ));
+}
+
+#[test]
+fn an_unresolvable_upstream_fails_compilation() {
+    // `.invalid` is reserved and never resolves, so this fails before any
+    // listener could be bound.
+    match config::compile_str(
+        &proxy_config("upstream = \"http://upstream.invalid:3000\""),
+        Path::new("."),
+    ) {
+        Err(ConfigError::Compile(message)) => {
+            assert!(message.contains("cannot be resolved"), "{message}");
+        }
+        Err(other) => panic!("expected a compile error, got {other}"),
+        Ok(_) => panic!("an unresolvable upstream compiled"),
+    }
+}
+
+#[test]
+fn a_later_invalid_proxy_location_aborts_the_whole_compile() {
+    let config = format!(
+        "{}\n[[hosts.locations]]\npath = \"/broken\"\nhandler = \"proxy\"\n\n[hosts.locations.proxy]\nupstream = \"http://upstream.invalid:3000\"\n",
+        proxy_config("upstream = \"http://127.0.0.1:3000\"")
+    );
+    match config::compile_str(&config, Path::new(".")) {
+        Err(ConfigError::Compile(message)) => {
+            assert!(message.contains("locations[1].proxy.upstream"), "{message}");
+            assert!(message.contains("upstream.invalid"), "{message}");
+        }
+        Err(other) => panic!("expected a compile error, got {other}"),
+        Ok(_) => panic!("partial proxy configuration compiled"),
+    }
+}
+
+#[tokio::test]
+async fn a_compiled_proxy_location_forwards_to_its_upstream() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let origin = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1_024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nupstream")
+            .await
+            .unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let runtime = config::compile_str(
+        &format!(
+            "[server]\nlisten = \"127.0.0.1:0\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/api\"\nhandler = \"proxy\"\n\n[hosts.locations.proxy]\nupstream = \"http://{upstream_address}\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"not_found\"\n"
+        ),
+        Path::new("."),
+    )
+    .unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(server::serve_with_router(
+        listener,
+        runtime.router_arc(),
+        runtime.http_limits(),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            b"GET /api/items?page=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.ends_with("upstream"), "{response}");
+    let request = origin.await.unwrap();
+    assert!(
+        request.starts_with("GET /api/items?page=2 HTTP/1.1\r\n"),
+        "the location prefix must be forwarded unchanged: {request}"
+    );
+
+    let _ = shutdown.send(());
+    server.await.unwrap().unwrap();
+}
+
+/// Writes a self-signed certificate for `names` as `<file>.crt` and
+/// `<file>.key` and returns the key PEM so a test can check it never leaks.
+fn write_certificate(directory: &Path, file: &str, names: &[&str]) -> String {
+    let generated = rcgen::generate_simple_self_signed(
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .expect("generate certificate");
+    let key = generated.signing_key.serialize_pem();
+    std::fs::write(directory.join(format!("{file}.crt")), generated.cert.pem())
+        .expect("write certificate");
+    std::fs::write(directory.join(format!("{file}.key")), &key).expect("write key");
+    key
+}
+
+/// `[server.tls]` with the given certificate tables; certificate paths are
+/// relative, so they resolve against the configuration directory.
+fn tls_config(listen: Option<&str>, tls_extra: &str, certificates: &str) -> String {
+    let listen = listen.map_or_else(String::new, |listen| format!("listen = \"{listen}\"\n"));
+    format!(
+        "[server]\n{listen}\n[server.tls]\nlisten = \"127.0.0.1:8443\"\n{tls_extra}\n{certificates}\n[[hosts]]\nname = \"localhost\"\nlocations = [{{ path = \"/\", handler = \"not_found\" }}]\n"
+    )
+}
+
+fn certificate_table(file: &str, names: &str, extra: &str) -> String {
+    format!(
+        "[[server.tls.certificates]]\ncert = \"{file}.crt\"\nkey = \"{file}.key\"\nnames = {names}\n{extra}\n"
+    )
+}
+
+#[test]
+fn compiles_a_tls_listener_with_or_without_a_cleartext_listener() {
+    let directory = TestDirectory::new();
+    write_certificate(&directory.path, "site", &["localhost", "*.example.test"]);
+    let certificates = certificate_table(
+        "site",
+        "[\"localhost\", \"*.example.test\"]",
+        "default = true",
+    );
+
+    let both = config::compile_str(
+        &tls_config(
+            Some("127.0.0.1:8080"),
+            "handshake_timeout = 7",
+            &certificates,
+        ),
+        &directory.path,
+    )
+    .expect("TLS plus cleartext should compile");
+    assert_eq!(
+        both.listen_address(),
+        Some("127.0.0.1:8080".parse().unwrap())
+    );
+    let tls = both.tls().expect("TLS listener");
+    assert_eq!(tls.address(), "127.0.0.1:8443".parse().unwrap());
+    assert_eq!(tls.handshake_timeout(), std::time::Duration::from_secs(7));
+    assert_eq!(tls.certificates(), 1);
+
+    let only = config::compile_str(&tls_config(None, "", &certificates), &directory.path)
+        .expect("a TLS-only server should compile");
+    assert!(only.listen_address().is_none());
+    assert_eq!(
+        only.tls().unwrap().handshake_timeout(),
+        std::time::Duration::from_secs(10),
+        "the documented default"
+    );
+}
+
+#[test]
+fn rejects_tls_configuration_that_cannot_be_served() {
+    let directory = TestDirectory::new();
+    let base = directory.path.as_path();
+    let key_pem = write_certificate(base, "site", &["localhost"]);
+    write_certificate(base, "other", &["other.test"]);
+    write_certificate(base, "explicit", &["a.example.test"]);
+    std::fs::write(
+        base.join("garbage.crt"),
+        "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("empty.crt"), "no PEM here\n").unwrap();
+    std::fs::write(
+        base.join("encrypted.key"),
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBvTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQI\n-----END ENCRYPTED PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let site = |names: &str, extra: &str| certificate_table("site", names, extra);
+
+    for (why, source, expected) in [
+        (
+            "no listener at all",
+            "[server]\n[[hosts]]\nname = \"localhost\"\nlocations = [{ path = \"/\", handler = \"not_found\" }]\n".to_owned(),
+            "server.listen or server.tls must be configured",
+        ),
+        (
+            "overlapping listeners",
+            tls_config(Some("0.0.0.0:8443"), "", &site("[\"localhost\"]", "")),
+            "overlap",
+        ),
+        (
+            "non-numeric TLS listen",
+            tls_config(None, "", &site("[\"localhost\"]", "")).replace("127.0.0.1:8443", "localhost:8443"),
+            "server.tls.listen",
+        ),
+        (
+            "zero handshake timeout",
+            tls_config(None, "handshake_timeout = 0", &site("[\"localhost\"]", "")),
+            "server.tls.handshake_timeout must be between 1 and 60 seconds",
+        ),
+        (
+            "excessive handshake timeout",
+            tls_config(None, "handshake_timeout = 61", &site("[\"localhost\"]", "")),
+            "server.tls.handshake_timeout",
+        ),
+        (
+            "no certificates",
+            tls_config(None, "certificates = []", ""),
+            "at least one certificate",
+        ),
+        (
+            "no names",
+            tls_config(None, "", &site("[]", "")),
+            "names must contain at least one name",
+        ),
+        (
+            "an IP address name",
+            tls_config(None, "", &site("[\"127.0.0.1\"]", "")),
+            "is an IP address",
+        ),
+        (
+            "a top-level wildcard",
+            tls_config(None, "", &site("[\"*.test\"]", "")),
+            "wildcard over a top-level domain",
+        ),
+        (
+            "a mid-label wildcard",
+            tls_config(None, "", &site("[\"a.*.test\"]", "")),
+            "is not a DNS name",
+        ),
+        (
+            "a name configured twice",
+            tls_config(
+                None,
+                "",
+                &format!(
+                    "{}{}",
+                    site("[\"localhost\"]", ""),
+                    certificate_table("other", "[\"LOCALHOST\"]", "")
+                ),
+            ),
+            "duplicates server.tls.certificates[0].names[0]",
+        ),
+        (
+            "two defaults",
+            tls_config(
+                None,
+                "",
+                &format!(
+                    "{}{}",
+                    site("[\"localhost\"]", "default = true"),
+                    certificate_table("other", "[\"other.test\"]", "default = true")
+                ),
+            ),
+            "at most one certificate is the default",
+        ),
+        (
+            "an unknown field",
+            tls_config(None, "", &site("[\"localhost\"]", "password = \"x\"")),
+            "unknown field",
+        ),
+        (
+            "a missing certificate file",
+            tls_config(None, "", &certificate_table("missing", "[\"localhost\"]", "")),
+            "server.tls.certificates[0].cert",
+        ),
+        (
+            "malformed certificate PEM",
+            tls_config(
+                None,
+                "",
+                "[[server.tls.certificates]]\ncert = \"garbage.crt\"\nkey = \"site.key\"\nnames = [\"localhost\"]\n",
+            ),
+            "is not valid PEM",
+        ),
+        (
+            "a certificate file without a certificate",
+            tls_config(
+                None,
+                "",
+                "[[server.tls.certificates]]\ncert = \"empty.crt\"\nkey = \"site.key\"\nnames = [\"localhost\"]\n",
+            ),
+            "contains no CERTIFICATE block",
+        ),
+        (
+            "a key file without a key",
+            tls_config(
+                None,
+                "",
+                "[[server.tls.certificates]]\ncert = \"site.crt\"\nkey = \"site.crt\"\nnames = [\"localhost\"]\n",
+            ),
+            "contains no readable PKCS#8, PKCS#1 or SEC1 private key",
+        ),
+        (
+            "an encrypted key",
+            tls_config(
+                None,
+                "",
+                "[[server.tls.certificates]]\ncert = \"site.crt\"\nkey = \"encrypted.key\"\nnames = [\"localhost\"]\n",
+            ),
+            "is encrypted",
+        ),
+        (
+            "a key that does not match the certificate",
+            tls_config(
+                None,
+                "",
+                "[[server.tls.certificates]]\ncert = \"site.crt\"\nkey = \"other.key\"\nnames = [\"localhost\"]\n",
+            ),
+            "cannot be used together",
+        ),
+        (
+            "a name the certificate does not cover",
+            tls_config(None, "", &site("[\"localhost\", \"www.localhost\"]", "")),
+            "names www.localhost is not covered",
+        ),
+        (
+            "a wildcard over explicit names only",
+            tls_config(None, "", &certificate_table("explicit", "[\"*.example.test\"]", "")),
+            "names *.example.test is not covered",
+        ),
+    ] {
+        let message = match config::compile_str(&source, base) {
+            Err(ConfigError::Parse { source, .. }) => source.to_string(),
+            Err(ConfigError::Compile(message) | ConfigError::Validation(message)) => message,
+            Err(other) => panic!("{why}: unexpected error {other}"),
+            Ok(_) => panic!("{why}: must not compile"),
+        };
+        assert!(message.contains(expected), "{why}: {message}");
+        // Nothing from a private key belongs in a diagnostic.
+        let key_body = key_pem.lines().nth(1).expect("key body line");
+        assert!(!message.contains(key_body), "{why} leaked key material");
+    }
 }

@@ -17,9 +17,17 @@ use crate::php_worker::{
     MAX_WORKERS, MIN_REQUEST_TIMEOUT, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool,
     PhpWorkerPoolConfig, WorkerStart,
 };
+use crate::proxy::{
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_IDLE, DEFAULT_PROGRESS_TIMEOUT,
+    DEFAULT_RESPONSE_HEADER_TIMEOUT, MAX_IDLE_LIMIT, ProxyConfig, Upstream,
+};
 use crate::router::{
     Handler, HostRouter, LocationRouter, RouterBuildError, VirtualHost, normalize_location,
     valid_hostname,
+};
+use crate::tls::{
+    CertificateSource, DEFAULT_HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_TIMEOUT, TlsListener, TlsName,
+    TlsSource,
 };
 
 pub const SERVER_NAME: &str = concat!("HamsterWheel/", env!("CARGO_PKG_VERSION"));
@@ -46,6 +54,7 @@ const MAX_MAX_BODY_MEMORY: u64 = 64 * 1_024 * 1_024 * 1_024;
 const MIN_HTTP1_MAX_BUFFER_SIZE: usize = 8 * 1_024;
 const DEFAULT_HTTP1_MAX_BUFFER_SIZE: usize = 64 * 1_024;
 const MAX_HTTP1_MAX_BUFFER_SIZE: usize = 1024 * 1_024;
+const MAX_PROXY_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[cfg(feature = "profiling")]
 pub fn profiling_document_root() -> PathBuf {
@@ -62,7 +71,9 @@ pub struct RawConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServer {
-    listen: String,
+    /// The cleartext HTTP listener. Optional only when `tls` is configured.
+    listen: Option<String>,
+    tls: Option<RawTls>,
     #[serde(default = "default_max_connections")]
     max_connections: usize,
     #[serde(default = "default_header_read_timeout")]
@@ -75,6 +86,24 @@ struct RawServer {
     max_body_memory: u64,
     #[serde(default = "default_http1_max_buffer_size")]
     http1_max_buffer_size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    listen: String,
+    handshake_timeout: Option<u64>,
+    certificates: Vec<RawCertificate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCertificate {
+    cert: PathBuf,
+    key: PathBuf,
+    names: Vec<String>,
+    #[serde(default)]
+    default: bool,
 }
 
 const fn default_max_connections() -> usize {
@@ -117,6 +146,19 @@ struct RawLocation {
     handler: String,
     root: Option<PathBuf>,
     php: Option<RawPhpWorker>,
+    proxy: Option<RawProxy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProxy {
+    upstream: String,
+    connect_timeout: Option<u64>,
+    response_header_timeout: Option<u64>,
+    progress_timeout: Option<u64>,
+    idle_timeout: Option<u64>,
+    max_idle: Option<usize>,
+    preserve_host: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,10 +184,12 @@ const fn default_php_workers() -> usize {
 }
 
 pub struct RuntimeConfig {
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
+    tls: Option<Arc<TlsListener>>,
     http_limits: HttpLimits,
     router: Arc<HostRouter>,
     php_pools: Vec<Arc<PhpWorkerPool>>,
+    upstreams: Vec<Arc<Upstream>>,
 }
 
 #[derive(Debug)]
@@ -308,8 +352,14 @@ impl HttpLimits {
 }
 
 impl RuntimeConfig {
-    pub const fn listen_address(&self) -> SocketAddr {
+    /// The cleartext listener, when one is configured.
+    pub const fn listen_address(&self) -> Option<SocketAddr> {
         self.listen
+    }
+
+    /// The HTTPS listener, with its certificates already loaded and checked.
+    pub fn tls(&self) -> Option<&Arc<TlsListener>> {
+        self.tls.as_ref()
     }
 
     pub fn router(&self) -> &HostRouter {
@@ -378,6 +428,11 @@ impl RuntimeConfig {
 
     pub fn php_worker(&self) -> Option<&Arc<PhpWorkerPool>> {
         self.php_pools.first()
+    }
+
+    /// Every reverse-proxy upstream, in configuration order.
+    pub fn upstreams(&self) -> &[Arc<Upstream>] {
+        &self.upstreams
     }
 
     pub fn php_workers(&self) -> &[Arc<PhpWorkerPool>] {
@@ -503,7 +558,8 @@ fn load_builtin() -> Result<RuntimeConfig, ConfigError> {
 fn builtin_raw_config() -> RawConfig {
     RawConfig {
         server: RawServer {
-            listen: DEFAULT_LISTEN.to_owned(),
+            listen: Some(DEFAULT_LISTEN.to_owned()),
+            tls: None,
             max_connections: default_max_connections(),
             header_read_timeout: default_header_read_timeout(),
             body_read_timeout: default_body_read_timeout(),
@@ -520,12 +576,14 @@ fn builtin_raw_config() -> RawConfig {
                     handler: "not_found".to_owned(),
                     root: None,
                     php: None,
+                    proxy: None,
                 },
                 RawLocation {
                     path: "/".to_owned(),
                     handler: "static".to_owned(),
                     root: Some(PathBuf::from(DEFAULT_DOCUMENT_ROOT)),
                     php: None,
+                    proxy: None,
                 },
             ],
         }],
@@ -557,7 +615,8 @@ pub(crate) fn compile_raw(
 }
 
 pub(crate) struct ValidatedConfig {
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
+    tls: Option<TlsSource>,
     http_limits: HttpLimits,
     hosts: Vec<ValidatedHost>,
 }
@@ -588,6 +647,17 @@ enum ValidatedHandler {
         max_worker_age: Option<Duration>,
         env: BTreeMap<String, String>,
     },
+    Proxy {
+        upstream_host: String,
+        upstream_port: u16,
+        authority: String,
+        connect_timeout: Duration,
+        response_header_timeout: Duration,
+        progress_timeout: Duration,
+        idle_timeout: Duration,
+        max_idle: usize,
+        preserve_host: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -600,12 +670,33 @@ pub(crate) fn validate_raw(
     raw: RawConfig,
     base_directory: &Path,
 ) -> Result<ValidatedConfig, ConfigError> {
-    let listen = raw.server.listen.parse::<SocketAddr>().map_err(|error| {
-        ConfigError::Validation(format!(
-            "server.listen {:?} is not a numeric IP socket address: {error}",
-            raw.server.listen
-        ))
-    })?;
+    let listen = raw
+        .server
+        .listen
+        .as_deref()
+        .map(|listen| parse_listen(listen, "server.listen"))
+        .transpose()?;
+    let tls = raw
+        .server
+        .tls
+        .map(|tls| validate_tls(tls, base_directory))
+        .transpose()?;
+    if let (Some(listen), Some(tls)) = (listen, &tls)
+        && listen.port() == tls.listen.port()
+        && (listen.ip() == tls.listen.ip()
+            || listen.ip().is_unspecified()
+            || tls.listen.ip().is_unspecified())
+    {
+        return Err(ConfigError::Validation(format!(
+            "server.listen {listen} and server.tls.listen {} overlap",
+            tls.listen
+        )));
+    }
+    if listen.is_none() && tls.is_none() {
+        return Err(ConfigError::Validation(
+            "server.listen or server.tls must be configured".to_owned(),
+        ));
+    }
     if !(1..=MAX_CONNECTIONS).contains(&raw.server.max_connections) {
         return Err(ConfigError::Validation(format!(
             "server.max_connections must be between 1 and {MAX_CONNECTIONS}"
@@ -710,6 +801,11 @@ pub(crate) fn validate_raw(
                             "{context}.php is not valid for handler \"static\""
                         )));
                     }
+                    if location.proxy.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.proxy is not valid for handler \"static\""
+                        )));
+                    }
                     let root = location.root.ok_or_else(|| {
                         ConfigError::Validation(format!(
                             "{context}.root is required for handler \"static\""
@@ -738,12 +834,22 @@ pub(crate) fn validate_raw(
                             "{context}.php is not valid for handler \"not_found\""
                         )));
                     }
+                    if location.proxy.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.proxy is not valid for handler \"not_found\""
+                        )));
+                    }
                     ValidatedHandler::NotFound
                 }
                 "php_worker" => {
                     if location.root.is_some() {
                         return Err(ConfigError::Validation(format!(
                             "{context}.root is not valid for handler \"php_worker\""
+                        )));
+                    }
+                    if location.proxy.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.proxy is not valid for handler \"php_worker\""
                         )));
                     }
                     let php = location.php.ok_or_else(|| {
@@ -828,9 +934,27 @@ pub(crate) fn validate_raw(
                         env: php.env,
                     }
                 }
+                "proxy" => {
+                    if location.root.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.root is not valid for handler \"proxy\""
+                        )));
+                    }
+                    if location.php.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php is not valid for handler \"proxy\""
+                        )));
+                    }
+                    let proxy = location.proxy.ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "{context}.proxy is required for handler \"proxy\""
+                        ))
+                    })?;
+                    validate_proxy(proxy, &context)?
+                }
                 handler => {
                     return Err(ConfigError::Validation(format!(
-                        "{context}.handler {handler:?} is unknown; expected \"static\", \"not_found\", or \"php_worker\""
+                        "{context}.handler {handler:?} is unknown; expected \"static\", \"not_found\", \"php_worker\", or \"proxy\""
                     )));
                 }
             };
@@ -845,8 +969,198 @@ pub(crate) fn validate_raw(
     }
     Ok(ValidatedConfig {
         listen,
+        tls,
         http_limits,
         hosts,
+    })
+}
+
+fn parse_listen(listen: &str, field: &str) -> Result<SocketAddr, ConfigError> {
+    listen.parse::<SocketAddr>().map_err(|error| {
+        ConfigError::Validation(format!(
+            "{field} {listen:?} is not a numeric IP socket address: {error}"
+        ))
+    })
+}
+
+/// Validates `[server.tls]` without reading any file. Loading and checking
+/// the certificates is compilation, which happens before any socket is bound.
+fn validate_tls(tls: RawTls, base_directory: &Path) -> Result<TlsSource, ConfigError> {
+    let listen = parse_listen(&tls.listen, "server.tls.listen")?;
+    let handshake_timeout = match tls.handshake_timeout {
+        None => DEFAULT_HANDSHAKE_TIMEOUT,
+        Some(seconds) if (1..=MAX_HANDSHAKE_TIMEOUT.as_secs()).contains(&seconds) => {
+            Duration::from_secs(seconds)
+        }
+        Some(_) => {
+            return Err(ConfigError::Validation(format!(
+                "server.tls.handshake_timeout must be between 1 and {} seconds",
+                MAX_HANDSHAKE_TIMEOUT.as_secs()
+            )));
+        }
+    };
+    if tls.certificates.is_empty() {
+        return Err(ConfigError::Validation(
+            "server.tls.certificates must contain at least one certificate".to_owned(),
+        ));
+    }
+    let mut seen = HashMap::<TlsName, String>::new();
+    let mut default = None::<String>;
+    let mut certificates = Vec::with_capacity(tls.certificates.len());
+    for (index, certificate) in tls.certificates.into_iter().enumerate() {
+        let field = format!("server.tls.certificates[{index}]");
+        for (path, name) in [(&certificate.cert, "cert"), (&certificate.key, "key")] {
+            if path.as_os_str().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "{field}.{name} must not be empty"
+                )));
+            }
+        }
+        if certificate.names.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{field}.names must contain at least one name"
+            )));
+        }
+        let mut names = Vec::with_capacity(certificate.names.len());
+        for (name_index, name) in certificate.names.iter().enumerate() {
+            let name_field = format!("{field}.names[{name_index}]");
+            let parsed = TlsName::parse(name).map_err(|reason| {
+                ConfigError::Validation(format!("{name_field} {name:?} {reason}"))
+            })?;
+            if let Some(prior) = seen.insert(parsed.clone(), name_field.clone()) {
+                return Err(ConfigError::Validation(format!(
+                    "{name_field} {name:?} duplicates {prior}"
+                )));
+            }
+            names.push(parsed);
+        }
+        if certificate.default
+            && let Some(prior) = default.replace(field.clone())
+        {
+            return Err(ConfigError::Validation(format!(
+                "{field}.default conflicts with {prior}.default; at most one certificate is the default"
+            )));
+        }
+        certificates.push(CertificateSource {
+            cert: resolve_path(base_directory, certificate.cert),
+            key: resolve_path(base_directory, certificate.key),
+            names,
+            default: certificate.default,
+            field,
+        });
+    }
+    Ok(TlsSource {
+        listen,
+        handshake_timeout,
+        certificates,
+    })
+}
+
+fn validate_proxy(proxy: RawProxy, context: &str) -> Result<ValidatedHandler, ConfigError> {
+    let field = format!("{context}.proxy.upstream");
+    let invalid =
+        |reason: &str| ConfigError::Validation(format!("{field} {:?} {reason}", proxy.upstream));
+    let uri = proxy
+        .upstream
+        .parse::<hyper::Uri>()
+        .map_err(|error| invalid(&format!("is not a valid URL: {error}")))?;
+    match uri.scheme_str() {
+        Some("http") => {}
+        Some("https") => {
+            return Err(invalid(
+                "uses https; TLS upstreams are not supported, only http://host:port",
+            ));
+        }
+        _ => return Err(invalid("must be an absolute http:// URL")),
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| invalid("has no host"))?
+        .clone();
+    if authority.as_str().contains('@') {
+        return Err(invalid("must not contain user information"));
+    }
+    // One endpoint, forwarded verbatim: a path would imply prefix rewriting,
+    // which v1 deliberately does not do.
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return Err(invalid(
+            "must not have a path or query; the request path is forwarded unchanged",
+        ));
+    }
+    let host = authority.host();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        return Err(invalid("has no host"));
+    }
+    // `http::uri::Authority` accepts an explicit non-numeric or out-of-range
+    // port but reports it as `None`. Do not silently connect to port 80 while
+    // retaining that invalid authority in the upstream Host header.
+    let port = match authority.as_str().strip_prefix(authority.host()) {
+        Some("") => 80,
+        Some(suffix) if suffix.starts_with(':') => authority
+            .port_u16()
+            .ok_or_else(|| invalid("has an invalid port"))?,
+        _ => return Err(invalid("has an invalid authority")),
+    };
+    if port == 0 {
+        return Err(invalid("must not use port 0"));
+    }
+    let seconds = |value: Option<u64>, default: Duration, name: &str| match value {
+        None => Ok(default),
+        Some(seconds) if (1..=MAX_PROXY_TIMEOUT_SECONDS).contains(&seconds) => {
+            Ok(Duration::from_secs(seconds))
+        }
+        Some(_) => Err(ConfigError::Validation(format!(
+            "{context}.proxy.{name} must be between 1 and {MAX_PROXY_TIMEOUT_SECONDS} seconds"
+        ))),
+    };
+    let connect_timeout = seconds(
+        proxy.connect_timeout,
+        DEFAULT_CONNECT_TIMEOUT,
+        "connect_timeout",
+    )?;
+    let response_header_timeout = seconds(
+        proxy.response_header_timeout,
+        DEFAULT_RESPONSE_HEADER_TIMEOUT,
+        "response_header_timeout",
+    )?;
+    let progress_timeout = seconds(
+        proxy.progress_timeout,
+        DEFAULT_PROGRESS_TIMEOUT,
+        "progress_timeout",
+    )?;
+    let idle_timeout = seconds(proxy.idle_timeout, DEFAULT_IDLE_TIMEOUT, "idle_timeout")?;
+    let max_idle = proxy.max_idle.unwrap_or(DEFAULT_MAX_IDLE);
+    if max_idle > MAX_IDLE_LIMIT {
+        return Err(ConfigError::Validation(format!(
+            "{context}.proxy.max_idle must be between 0 and {MAX_IDLE_LIMIT}"
+        )));
+    }
+    Ok(ValidatedHandler::Proxy {
+        upstream_host: host.to_owned(),
+        upstream_port: port,
+        authority: authority.as_str().to_owned(),
+        connect_timeout,
+        response_header_timeout,
+        progress_timeout,
+        idle_timeout,
+        max_idle,
+        preserve_host: proxy.preserve_host.unwrap_or(true),
+    })
+}
+
+/// Resolves an upstream once, at startup. The first address wins and is
+/// printed at startup; there is no re-resolution and no fallback address.
+fn resolve_upstream(host: &str, port: u16, field: &str) -> Result<SocketAddr, ConfigError> {
+    use std::net::ToSocketAddrs;
+    let mut addresses = (host, port).to_socket_addrs().map_err(|error| {
+        ConfigError::Compile(format!("{field} host {host:?} cannot be resolved: {error}"))
+    })?;
+    addresses.next().ok_or_else(|| {
+        ConfigError::Compile(format!("{field} host {host:?} resolved to no address"))
     })
 }
 
@@ -894,8 +1208,14 @@ fn register_hostname(
 }
 
 pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeConfig, ConfigError> {
+    let tls = validated
+        .tls
+        .map(|source| TlsListener::compile(source).map(Arc::new))
+        .transpose()
+        .map_err(ConfigError::Compile)?;
     let mut virtual_hosts = Vec::new();
     let mut php_pools = Vec::new();
+    let mut upstreams = Vec::new();
     // One budget for the whole process. Every PHP pool shares it, because the
     // resource it protects is this process's memory, not a pool's queue.
     let body_budget = BodyBudget::new(validated.http_limits.max_body_memory());
@@ -974,6 +1294,41 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     php_pools.push(Arc::clone(&pool));
                     Handler::php_worker(pool)
                 }
+                ValidatedHandler::Proxy {
+                    upstream_host,
+                    upstream_port,
+                    authority,
+                    connect_timeout,
+                    response_header_timeout,
+                    progress_timeout,
+                    idle_timeout,
+                    max_idle,
+                    preserve_host,
+                } => {
+                    let field = format!(
+                        "hosts[{host_index}] ({:?}).locations[{location_index}].proxy.upstream",
+                        host.name
+                    );
+                    let address = resolve_upstream(&upstream_host, upstream_port, &field)?;
+                    let authority =
+                        hyper::header::HeaderValue::from_str(&authority).map_err(|error| {
+                            ConfigError::Compile(format!("{field} authority: {error}"))
+                        })?;
+                    let upstream = Upstream::new(ProxyConfig {
+                        label: Arc::from(format!("{}{}", host.name, location.path).as_str()),
+                        address,
+                        authority,
+                        connect_timeout,
+                        response_header_timeout,
+                        progress_timeout,
+                        idle_timeout,
+                        max_idle,
+                        preserve_host,
+                        max_buf_size: validated.http_limits.http1_max_buffer_size(),
+                    });
+                    upstreams.push(Arc::clone(&upstream));
+                    Handler::proxy(upstream)
+                }
             };
             locations.push((location.path, handler));
         }
@@ -998,9 +1353,11 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         .map_err(|error| ConfigError::Compile(format!("host router: {error}")))?;
     Ok(RuntimeConfig {
         listen: validated.listen,
+        tls,
         http_limits: validated.http_limits,
         router: Arc::new(router),
         php_pools,
+        upstreams,
     })
 }
 
@@ -1129,7 +1486,11 @@ mod tests {
     fn accepts_existing_absolute_static_root() {
         let current = env::current_dir().unwrap();
         let runtime = compile_str(&minimal(&current), Path::new("unused")).unwrap();
-        assert_eq!(runtime.listen_address(), "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(
+            runtime.listen_address(),
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+        assert!(runtime.tls().is_none());
         assert_eq!(runtime.http_limits(), HttpLimits::default());
     }
 

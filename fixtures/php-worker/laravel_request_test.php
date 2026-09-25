@@ -82,6 +82,7 @@ namespace {
 
     $built = hamster_build_request([
         'http_version' => 'HTTP/1.0',
+        'scheme' => 'http',
         'peer_addr' => '127.0.0.2',
         'peer_port' => 43210,
         'local_addr' => '127.0.0.1',
@@ -118,6 +119,48 @@ namespace {
     check('SERVER_NAME is the effective hostname without its port', $built->server['SERVER_NAME'], 'example.test');
     check('cleartext requests use the http scheme', $built->server['REQUEST_SCHEME'], 'http');
     check('cleartext requests do not set HTTPS', $built->server['HTTPS'], 'off');
+
+    // The scheme comes from the connection. A client-supplied forwarding
+    // header stays an ordinary header; trusting it is application policy.
+    $secure = hamster_build_request([
+        'http_version' => 'HTTP/1.1',
+        'scheme' => 'https',
+        'peer_addr' => '127.0.0.2',
+        'peer_port' => 43210,
+        'local_addr' => '127.0.0.1',
+        'local_port' => 8443,
+        'method' => 'GET',
+        'uri' => '/secure',
+        'query' => '',
+        'headers' => [
+            ['host', 'example.test:8443'],
+            ['x-forwarded-proto', 'http'],
+        ],
+        'body' => '',
+    ]);
+    check('TLS requests use the https scheme', $secure->server['REQUEST_SCHEME'], 'https');
+    check('TLS requests set HTTPS on', $secure->server['HTTPS'], 'on');
+    check('TLS requests keep the local TLS port', $secure->server['SERVER_PORT'], '8443');
+    $forged = hamster_build_request([
+        'http_version' => 'HTTP/1.1',
+        'scheme' => 'http',
+        'peer_addr' => '127.0.0.2',
+        'peer_port' => 43210,
+        'local_addr' => '127.0.0.1',
+        'local_port' => 8080,
+        'method' => 'GET',
+        'uri' => '/',
+        'query' => '',
+        'headers' => [
+            ['host', 'example.test'],
+            ['x-forwarded-proto', 'https'],
+            ['forwarded', 'proto=https'],
+        ],
+        'body' => '',
+    ]);
+    check('a forged forwarding scheme does not change REQUEST_SCHEME', $forged->server['REQUEST_SCHEME'], 'http');
+    check('a forged forwarding scheme does not set HTTPS', $forged->server['HTTPS'], 'off');
+    check('a forged forwarding scheme stays an ordinary header', $forged->server['HTTP_X_FORWARDED_PROTO'], 'https');
     check('an IPv6 effective authority yields an unbracketed SERVER_NAME', hamster_authority_hostname('[2001:db8::1]:8080'), '2001:db8::1');
 
     // --- field names -----------------------------------------------------

@@ -1804,3 +1804,61 @@ Paired RPS and CPU signs split two/two. The repository script's upper-middle
 medians are 6,332 versus 6,285 RPS. Within-arm variance is larger than that
 difference. This run shows no material regression but cannot exclude a
 low-single-digit cost; it is not evidence for a zero-cost claim.
+
+## Reverse proxy v1 — working tree
+
+Full tables, method and raw probe data:
+[`../benchmarks/results/reverse_proxy_v1_20260924.md`](../benchmarks/results/reverse_proxy_v1_20260924.md).
+Windows 11, Core i5-12400, 32 GiB, MSVC release, loopback. `benches/proxy.rs`
+runs a Hyper upstream and a Hyper load generator in one process and Hamster as
+a separate release process; three runs per cell, medians; Hamster shares the
+host's 12 hardware threads with the bench process.
+
+| cell | direct RPS / p50 ms | proxy RPS / p50 ms | Hamster CPU us/req | Hamster private MiB (end) |
+|---|---|---|---:|---:|
+| GET 23 B, C1 | 33,254 / 0.025 | 11,844 / 0.069 | 58.6 | 1.75 |
+| GET 23 B, C32 | 70,644 / 0.424 | 62,708 / 0.499 | 64.1 | 6.01 |
+| GET 64 MiB, C1 | 29.4 / 32.4 | 27.6 / 34.2 | 49,676 | 1.84 |
+| POST 64 MiB, C1 | 35.3 / 26.4 | 26.5 / 34.1 | 46,445 | 1.83 |
+
+Stalled exchanges cost 185-252 KiB each at the default 64 KiB HTTP/1 buffer
+bound, independent of payload size. Raising `server.http1_max_buffer_size` to
+128 KiB or more collapsed proxied large transfers on this host (417,792 bytes:
+2.2 RPS, ~400 ms median, lower CPU); the collapse follows whichever reading
+side is backpressured, and neither `TCP_NODELAY` nor a 1 ms timer resolution
+changed it. A p95 of ~13 ms remained for proxied 1 MiB C1 at the default. A
+follow-up investigation (same file, *Windows loopback send stall*) traced both
+effects to one Windows loopback TCP send stall that also appears on direct
+connections at a lower rate and reproduces without Hamster, Hyper or Tokio;
+64 KiB stays as a measured conservative Windows default, not an optimum. A
+four-pass interleaved static A/B against
+`a7a31b4` showed pairwise deltas of -7.8, +0.4, +0.6 and -1.2% while the host
+drifted 27%; no regression is detected, and one below about 8% would not be.
+
+## TLS v1 — working tree
+
+Full tables and method:
+[`../benchmarks/results/tls_v1_20260925.md`](../benchmarks/results/tls_v1_20260925.md).
+Windows 11, Core i5-12400, 32 GiB, MSVC release, loopback, Balanced plan.
+`benches/tls.rs` runs Hamster as a separate release process with a cleartext
+and a TLS listener on one static root, and a Hyper/rustls load generator in the
+bench process; three runs per cell, medians. Session-to-session noise reached
+20%, so TLS is compared with cleartext inside one table only.
+
+| cell (final binary) | cleartext | TLS |
+|---|---:|---:|
+| keep-alive GET 23 B, C1, RPS | 5,705 | 5,816 |
+| keep-alive GET 1 MiB, C1, MiB/s | 1,298 | 658 |
+| keep-alive GET 64 MiB, C1, MiB/s / Hamster CPU per request | 1,580 / 43.2 ms | 1,038 / 64.7 ms |
+| new connection per request, C1, conn/s / Hamster CPU per connection | 1,668 / 344 us | 651 / 786 us |
+| idle keep-alive connection | 25.5 KiB | 38.5 KiB |
+| stalled 1 GiB download, per connection (N=64) | 290 KiB | 243 KiB |
+| 1 GiB to a 7 MiB/s reader, Hamster private max | 1.94 MiB | 2.23 MiB |
+
+A four-round alternating A/B of the pre-TLS release binary against the TLS
+build without a TLS listener detected no cleartext throughput, latency or CPU
+regression at about 10% resolution (new connections at C8 were 0-5% lower in
+every round, inside the noise). It did find about 4 KiB more per idle
+cleartext connection while the TLS branch was inline in the connection task;
+boxing that branch restored 25.3 KiB before versus 25.5 KiB after. The release
+binary grew from 2,945,024 to 5,318,656 bytes.

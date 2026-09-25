@@ -10,10 +10,11 @@ profiling = []
 [dependencies]
 bytes = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws_lc_rs", "tls12"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
 [[bench]]
@@ -45,3 +46,21 @@ required-features = ["profiling"]
 name = "php_ipc"
 harness = false
 required-features = ["profiling"]
+
+[[bench]]
+name = "proxy"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "windows_tcp_stall"
+harness = false
+required-features = ["profiling"]
+
+[[bench]]
+name = "tls"
+harness = false
+required-features = ["profiling"]
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }

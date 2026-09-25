@@ -10,8 +10,8 @@ use hyper::{
 #[cfg(test)]
 use crate::body_budget::BodyBudget;
 use crate::{
-    config::SERVER_NAME, php_worker::PhpWorkerPool, response_body::ResponseBody, static_files,
-    transport::TransportInfo,
+    config::SERVER_NAME, php_worker::PhpWorkerPool, proxy::Upstream, response_body::ResponseBody,
+    static_files, transport::ConnectionInfo,
 };
 
 pub(crate) type HandlerResponse = Response<ResponseBody>;
@@ -21,6 +21,7 @@ pub enum HandlerKind {
     Static,
     Simple,
     PhpWorker,
+    Proxy,
     #[cfg(test)]
     TransportEcho,
     #[cfg(test)]
@@ -40,6 +41,9 @@ pub enum Handler {
     },
     PhpWorker {
         pool: Arc<PhpWorkerPool>,
+    },
+    Proxy {
+        upstream: Arc<Upstream>,
     },
     #[cfg(test)]
     TransportEcho,
@@ -79,6 +83,10 @@ impl Handler {
         Self::PhpWorker { pool }
     }
 
+    pub fn proxy(upstream: Arc<Upstream>) -> Self {
+        Self::Proxy { upstream }
+    }
+
     #[cfg(test)]
     pub(crate) const fn transport_echo() -> Self {
         Self::TransportEcho
@@ -102,6 +110,7 @@ impl Handler {
             Self::Static { .. } => HandlerKind::Static,
             Self::Simple { .. } => HandlerKind::Simple,
             Self::PhpWorker { .. } => HandlerKind::PhpWorker,
+            Self::Proxy { .. } => HandlerKind::Proxy,
             #[cfg(test)]
             Self::TransportEcho => HandlerKind::TransportEcho,
             #[cfg(test)]
@@ -114,7 +123,7 @@ impl Handler {
     pub(crate) async fn serve(
         &self,
         request: Request<Incoming>,
-        transport: TransportInfo,
+        connection: ConnectionInfo,
         body_read_timeout: Duration,
     ) -> Result<HandlerResponse, Infallible> {
         match self {
@@ -122,16 +131,19 @@ impl Handler {
                 static_files::serve(request, Arc::clone(document_root)).await
             }
             Self::Simple { status, body } => Ok(simple_response(*status, body)),
-            Self::PhpWorker { pool } => {
-                Ok(pool.serve_http(request, transport, body_read_timeout).await)
+            Self::PhpWorker { pool } => Ok(pool
+                .serve_http(request, connection, body_read_timeout)
+                .await),
+            Self::Proxy { upstream } => {
+                Ok(crate::proxy::serve(upstream, request, connection).await)
             }
             #[cfg(test)]
-            Self::TransportEcho => Ok(transport_response(transport)),
+            Self::TransportEcho => Ok(transport_response(connection)),
             #[cfg(test)]
             Self::BodyEcho { budget, hold } => {
                 Ok(crate::php_worker::PhpWorkerPool::test_body_echo(
                     request,
-                    transport,
+                    connection,
                     body_read_timeout,
                     budget,
                     *hold,
@@ -161,6 +173,7 @@ impl Handler {
             Self::Simple { status, body } => simple_response(*status, body),
             Self::Static { .. } => simple_response(StatusCode::OK, "Static"),
             Self::PhpWorker { .. } => simple_response(StatusCode::OK, "PHP Worker"),
+            Self::Proxy { .. } => simple_response(StatusCode::OK, "Proxy"),
             #[cfg(test)]
             Self::TransportEcho => simple_response(StatusCode::OK, "Transport Echo"),
             #[cfg(test)]
@@ -172,11 +185,13 @@ impl Handler {
 }
 
 #[cfg(test)]
-fn transport_response(transport: TransportInfo) -> HandlerResponse {
+fn transport_response(connection: ConnectionInfo) -> HandlerResponse {
+    let transport = connection.transport();
     let body = Bytes::from(format!(
-        "peer={};local={}",
+        "peer={};local={};scheme={}",
         transport.peer_addr(),
-        transport.local_addr()
+        transport.local_addr(),
+        connection.scheme().as_str()
     ));
     let mut response = Response::new(ResponseBody::buffered(body));
     response.headers_mut().insert(

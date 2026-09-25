@@ -27,3 +27,47 @@ impl TransportInfo {
         self.local_addr
     }
 }
+
+/// The scheme a client used to reach Hamster, as established by the listener
+/// that accepted the connection.
+///
+/// `Https` means Hamster itself completed a TLS handshake on this connection.
+/// Nothing a client sends, such as `X-Forwarded-Proto` or an absolute-form
+/// `https://` request target, can produce it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+/// What the server knows about a connection, independent of any request on
+/// it: the socket identity and the trusted scheme. Handlers receive this and
+/// nothing transport-specific beyond it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionInfo {
+    transport: TransportInfo,
+    scheme: Scheme,
+}
+
+impl ConnectionInfo {
+    pub(crate) const fn new(transport: TransportInfo, scheme: Scheme) -> Self {
+        Self { transport, scheme }
+    }
+
+    pub(crate) const fn transport(self) -> TransportInfo {
+        self.transport
+    }
+
+    pub(crate) const fn scheme(self) -> Scheme {
+        self.scheme
+    }
+}

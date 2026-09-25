@@ -79,7 +79,7 @@ function hamster_discard_uploads(?callable $remove = null): void
 /**
  * Rebuilds an Illuminate request from a decoded protocol frame.
  *
- * @param  array{http_version:string,peer_addr:string,peer_port:int,local_addr:string,local_port:int,method:string,uri:string,query:string,headers:list<array{0:string,1:string}>,body:string}  $decoded
+ * @param  array{http_version:string,scheme:string,peer_addr:string,peer_port:int,local_addr:string,local_port:int,method:string,uri:string,query:string,headers:list<array{0:string,1:string}>,body:string}  $decoded
  *
  * @throws HamsterBadRequest when the client's body cannot be parsed
  */
@@ -94,8 +94,8 @@ function hamster_build_request(array $decoded): Request
         'REMOTE_PORT' => (string) $decoded['peer_port'],
         'SERVER_ADDR' => $decoded['local_addr'],
         'SERVER_PORT' => (string) $decoded['local_port'],
-        'REQUEST_SCHEME' => 'http',
-        'HTTPS' => 'off',
+        'REQUEST_SCHEME' => $decoded['scheme'],
+        'HTTPS' => $decoded['scheme'] === 'https' ? 'on' : 'off',
     ];
     $cookies = [];
     foreach ($decoded['headers'] as [$name, $value]) {

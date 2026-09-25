@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-const HAMSTER_PROTOCOL_VERSION = 2;
+const HAMSTER_PROTOCOL_VERSION = 3;
 const HAMSTER_MAX_FRAME = 8 * 1024 * 1024;
 const HAMSTER_MAX_HEADERS = 128;
 const HAMSTER_READY = 1;
@@ -159,11 +159,20 @@ function hamster_decode_request(string $payload): array
         2 => 'HTTP/1.1',
         default => throw new RuntimeException("unsupported HTTP version {$httpVersionCode}"),
     };
+    // The scheme of the client's connection, established by the Hamster
+    // listener that accepted it. Never inferred from a forwarding header.
+    $schemeCode = hamster_u8($payload, $offset);
+    $scheme = match ($schemeCode) {
+        1 => 'http',
+        2 => 'https',
+        default => throw new RuntimeException("unsupported scheme {$schemeCode}"),
+    };
     $peer = hamster_decode_endpoint($payload, $offset);
     $local = hamster_decode_endpoint($payload, $offset);
     $request = [
         'id' => $id,
         'http_version' => $httpVersion,
+        'scheme' => $scheme,
         'peer_addr' => $peer['address'],
         'peer_port' => $peer['port'],
         'local_addr' => $local['address'],
