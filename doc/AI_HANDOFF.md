@@ -25,9 +25,24 @@ beneath TLS, completes its handshake under a total deadline from accept
 v3's new scheme byte come only from it. PHP protocol is now v3 (v1/v2 workers
 fail startup). The Laravel adapter sets `REQUEST_SCHEME`/`HTTPS` from it.
 
+Follow-up on top of `868eaff` (working tree, 2026-09-25): a TLS connection is
+now served only for authorities its presented certificate's configured `names`
+cover; anything else is `421 Misdirected Request` (RFC 9110 4.3.3/15.5.20),
+checked in the router via `CertificateScope`, never visible to handlers.
+`names` may include IP addresses (authorization only, never SNI). Startup now
+refuses a leaf or intermediate outside its validity dates and a chain that
+does not link (webpki with the file's last certificate as anchor); a bare leaf
+with no issuer in the file starts with a note; each certificate's expiry is
+printed. The intermittent test failures were identified as pre-existing
+Windows reset/flush races (reproduced on `a7a31b4`), not TLS regressions; the
+two affected tests now assert only guaranteed behavior. Details and evidence
+in `doc/TLS_V1.md`.
+
 Known limits kept out of v1: no ACME, reload, OCSP, mTLS, upstream TLS,
-HTTP/2/3, redirect/HSTS, per-host listener binding, SNI/Host authorization
-policy, certificate validity-date or chain checks. Native Linux: NOT VERIFIED.
+HTTP/2/3, redirect/HSTS, HTTPS-only hosts on a server that also listens in
+cleartext, trust/revocation checks (the client's). Early refusals to clients
+that keep sending can arrive as resets (existing, not TLS). Native Linux: NOT
+VERIFIED.
 Older sections titled `Current Status` and `Next Action` below are historical
 records for their named slices; this top section is the active scope.
 

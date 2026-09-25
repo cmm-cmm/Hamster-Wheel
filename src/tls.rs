@@ -10,7 +10,9 @@
 //!
 //! Certificate selection uses SNI as a certificate identity hint only. The
 //! effective HTTP authority still selects the virtual host, exactly as on the
-//! cleartext listener.
+//! cleartext listener, but a TLS connection is authoritative only for the
+//! names configured on the certificate it presented (`CertificateScope`);
+//! the router answers any other authority with `421 Misdirected Request`.
 
 use std::{
     collections::HashMap,
@@ -21,17 +23,17 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{
     TlsAcceptor,
     rustls::{
-        self, ServerConfig,
-        client::verify_server_name,
+        self, RootCertStore, ServerConfig,
+        client::{verify_server_cert_signed_by_trust_anchor, verify_server_name},
         crypto::CryptoProvider,
-        pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
+        pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
         server::{ClientHello, ParsedCertificate, ResolvesServerCert},
         sign::CertifiedKey,
     },
@@ -42,6 +44,7 @@ use crate::router::valid_hostname;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+mod x509;
 
 pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -60,12 +63,17 @@ const HANDSHAKE_NOTICE_PERIOD_MS: u64 = 60_000;
 /// subdomains does not serve every subdomain, and must not pass as if it did.
 const WILDCARD_PROBE_LABEL: &str = "hamster-wildcard-check";
 
-/// A configured certificate name: an exact DNS name, or `*.` plus a parent
-/// domain matching exactly one extra label.
+/// A configured certificate name: an exact DNS name, `*.` plus a parent
+/// domain matching exactly one extra label, or an IP address.
+///
+/// DNS names select the certificate by SNI and authorize requests for that
+/// host. An IP address only authorizes requests whose Host is that literal:
+/// clients never send an IP address as SNI, so it cannot select anything.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TlsName {
     Exact(Box<str>),
     Wildcard(Box<str>),
+    Address(IpAddr),
 }
 
 impl TlsName {
@@ -75,8 +83,11 @@ impl TlsName {
             Some(parent) => (true, parent),
             None => (false, lowered.as_str()),
         };
-        if host.parse::<IpAddr>().is_ok() {
-            return Err("is an IP address; clients never send one as SNI");
+        if let Ok(address) = host.parse::<IpAddr>() {
+            if wildcard {
+                return Err("is a wildcard over an IP address");
+            }
+            return Ok(Self::Address(address));
         }
         if !valid_hostname(host) || host.contains('*') {
             return Err("is not a DNS name or a single leading \"*.\" wildcard");
@@ -95,6 +106,7 @@ impl TlsName {
         match self {
             Self::Exact(name) => name.to_string(),
             Self::Wildcard(parent) => format!("{WILDCARD_PROBE_LABEL}.{parent}"),
+            Self::Address(address) => address.to_string(),
         }
     }
 }
@@ -104,7 +116,75 @@ impl fmt::Display for TlsName {
         match self {
             Self::Exact(name) => formatter.write_str(name),
             Self::Wildcard(parent) => write!(formatter, "*.{parent}"),
+            Self::Address(address) => write!(formatter, "{address}"),
         }
+    }
+}
+
+/// The hosts one certificate entry is authoritative for: exactly its
+/// configured `names`, each already checked against the leaf's subject
+/// alternative names at startup.
+///
+/// RFC 9110 section 4.3.3: over TLS, an origin is authoritative for a host
+/// only when the certificate it presented is valid for that host. A request
+/// for any other authority on this connection is misdirected (section
+/// 15.5.20), whichever virtual host would have matched it.
+#[derive(Debug, Default)]
+pub(crate) struct CertificateScope {
+    exact: Box<[Box<str>]>,
+    wildcard: Box<[Box<str>]>,
+    addresses: Box<[IpAddr]>,
+}
+
+impl CertificateScope {
+    fn new(names: &[TlsName]) -> Self {
+        let mut exact = Vec::new();
+        let mut wildcard = Vec::new();
+        let mut addresses = Vec::new();
+        for name in names {
+            match name {
+                TlsName::Exact(name) => exact.push(name.clone()),
+                TlsName::Wildcard(parent) => wildcard.push(parent.clone()),
+                TlsName::Address(address) => addresses.push(*address),
+            }
+        }
+        Self {
+            exact: exact.into(),
+            wildcard: wildcard.into(),
+            addresses: addresses.into(),
+        }
+    }
+
+    /// Whether a request for `hostname`, the effective authority without its
+    /// port, may be served on a connection that presented this certificate.
+    /// The router has already validated the hostname's syntax.
+    pub(crate) fn covers(&self, hostname: &str) -> bool {
+        if let Ok(address) = hostname.parse::<IpAddr>() {
+            return self.addresses.contains(&address);
+        }
+        if self
+            .exact
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(hostname))
+        {
+            return true;
+        }
+        hostname.split_once('.').is_some_and(|(_, parent)| {
+            self.wildcard
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(parent))
+        })
+    }
+
+    /// A scope covering the given names, for tests that route without TLS.
+    #[cfg(test)]
+    pub(crate) fn for_names(names: &[&str]) -> Self {
+        Self::new(
+            &names
+                .iter()
+                .map(|name| TlsName::parse(name).expect("valid test name"))
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
@@ -129,9 +209,24 @@ pub(crate) struct TlsSource {
 pub struct TlsListener {
     address: SocketAddr,
     acceptor: TlsAcceptor,
+    /// The same resolver rustls holds, kept to recover which certificate a
+    /// completed handshake presented.
+    resolver: Arc<CertificateResolver>,
     handshake_timeout: Duration,
-    certificates: usize,
+    certificates: Vec<CertificateReport>,
     stats: HandshakeStats,
+}
+
+/// What startup prints about one certificate entry.
+#[derive(Debug)]
+pub struct CertificateReport {
+    pub field: String,
+    pub names: String,
+    pub not_after: String,
+    /// Whole days until `not_after`, at startup.
+    pub days_left: i64,
+    /// A property the server cannot decide, stated rather than guessed.
+    pub note: Option<&'static str>,
 }
 
 impl fmt::Debug for TlsListener {
@@ -140,7 +235,7 @@ impl fmt::Debug for TlsListener {
             .debug_struct("TlsListener")
             .field("address", &self.address)
             .field("handshake_timeout", &self.handshake_timeout)
-            .field("certificates", &self.certificates)
+            .field("certificates", &self.certificates.len())
             .finish_non_exhaustive()
     }
 }
@@ -153,17 +248,24 @@ impl TlsListener {
     /// setup. Errors name the configuration field and path, never key bytes.
     pub(crate) fn compile(source: TlsSource) -> Result<Self, String> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let now = unix_now();
         let mut resolver = CertificateResolver::default();
+        let mut reports = Vec::with_capacity(source.certificates.len());
         for certificate in &source.certificates {
-            let key = load_certified_key(certificate, &provider)?;
+            let (key, report) = load_certified_key(certificate, &provider, now)?;
+            let entry = Arc::new(Entry {
+                key,
+                scope: Arc::new(CertificateScope::new(&certificate.names)),
+            });
             for name in &certificate.names {
                 let (table, lookup) = match name {
                     TlsName::Exact(name) => (&mut resolver.exact, name),
                     TlsName::Wildcard(parent) => (&mut resolver.wildcard, parent),
+                    TlsName::Address(_) => continue,
                 };
                 // Validation already rejected duplicates; this keeps the
                 // resolver honest if that ever changes.
-                if table.insert(lookup.clone(), Arc::clone(&key)).is_some() {
+                if table.insert(lookup.clone(), Arc::clone(&entry)).is_some() {
                     return Err(format!(
                         "{}.names {name} is configured twice",
                         certificate.field
@@ -171,20 +273,23 @@ impl TlsListener {
                 }
             }
             if certificate.default {
-                resolver.default = Some(key);
+                resolver.default = Some(entry);
             }
+            reports.push(report);
         }
+        let resolver = Arc::new(resolver);
         let mut config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|error| format!("server.tls: {error}"))?
             .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver));
+            .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
         config.alpn_protocols = vec![HTTP_1_1.to_vec()];
         Ok(Self {
             address: source.listen,
             acceptor: TlsAcceptor::from(Arc::new(config)),
+            resolver,
             handshake_timeout: source.handshake_timeout,
-            certificates: source.certificates.len(),
+            certificates: reports,
             stats: HandshakeStats::new(),
         })
     }
@@ -197,8 +302,18 @@ impl TlsListener {
         self.handshake_timeout
     }
 
-    pub const fn certificates(&self) -> usize {
-        self.certificates
+    pub fn certificates(&self) -> &[CertificateReport] {
+        &self.certificates
+    }
+
+    /// The scope of the certificate a completed handshake presented, found
+    /// with the same lookup rustls used to choose it. `None` only if no
+    /// certificate could have been chosen, which a completed handshake rules
+    /// out; the caller then drops the connection.
+    pub(crate) fn scope_for(&self, server_name: Option<&str>) -> Option<Arc<CertificateScope>> {
+        self.resolver
+            .select(server_name)
+            .map(|entry| Arc::clone(&entry.scope))
     }
 
     /// Handshakes that did not finish before the total deadline, or whose
@@ -229,12 +344,15 @@ impl TlsListener {
         &self,
         io: IO,
         deadline: tokio::time::Instant,
-    ) -> Option<TlsStream<IO>>
+    ) -> Option<(TlsStream<IO>, Arc<CertificateScope>)>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
         match tokio::time::timeout_at(deadline, self.acceptor.accept(io)).await {
-            Ok(Ok(stream)) => Some(stream),
+            Ok(Ok(stream)) => {
+                let scope = self.scope_for(stream.get_ref().1.server_name())?;
+                Some((stream, scope))
+            }
             Ok(Err(error)) => {
                 self.stats.record(&self.address, &error);
                 None
@@ -248,10 +366,19 @@ impl TlsListener {
     }
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
 fn load_certified_key(
     source: &CertificateSource,
     provider: &CryptoProvider,
-) -> Result<Arc<CertifiedKey>, String> {
+    now: i64,
+) -> Result<(Arc<CertifiedKey>, CertificateReport), String> {
     let field = &source.field;
     let cert_path = source.cert.display();
     let key_path = source.key.display();
@@ -308,7 +435,83 @@ fn load_certified_key(
             ));
         }
     }
-    Ok(Arc::new(certified))
+
+    // What the server can decide on its own: every certificate it will send
+    // is inside its validity period now, and the chain links. Whether the
+    // client trusts the last issuer is the client's decision.
+    let summaries = certified
+        .cert
+        .iter()
+        .map(|der| x509::summarize(der))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!("{field}.cert {cert_path}: a certificate cannot be read: {error}")
+        })?;
+    let last = summaries.len() - 1;
+    for (index, summary) in summaries.iter().enumerate() {
+        // A trailing self-signed root is ignored by clients, which use their
+        // own copy of it, so its dates decide nothing.
+        if index > 0 && index == last && summary.self_issued {
+            continue;
+        }
+        let which = if index == 0 {
+            "the leaf certificate".to_owned()
+        } else {
+            format!("chain certificate {}", index + 1)
+        };
+        if now < summary.not_before.0 {
+            return Err(format!(
+                "{field}.cert {cert_path}: {which} is not valid until {}",
+                summary.not_before
+            ));
+        }
+        if now > summary.not_after.0 {
+            return Err(format!(
+                "{field}.cert {cert_path}: {which} expired on {}",
+                summary.not_after
+            ));
+        }
+    }
+    let mut note = None;
+    if last > 0 {
+        // Treat the last certificate in the file as the anchor: this proves
+        // each signature, CA flag, path length and usage from the leaf up to
+        // it, without asserting anything about who trusts that anchor.
+        let mut anchor = RootCertStore::empty();
+        anchor
+            .add(certified.cert[last].clone())
+            .map_err(|error| format!("{field}.cert {cert_path}: last certificate: {error}"))?;
+        verify_server_cert_signed_by_trust_anchor(
+            &leaf,
+            &anchor,
+            &certified.cert[1..last],
+            UnixTime::since_unix_epoch(Duration::from_secs(now.max(0).unsigned_abs())),
+            provider.signature_verification_algorithms.all,
+        )
+        .map_err(|error| {
+            format!(
+                "{field}.cert {cert_path}: the chain does not link the leaf to the last certificate in the file: {error}"
+            )
+        })?;
+    } else if !summaries[0].self_issued {
+        note = Some(
+            "the file holds only the leaf and not its issuer; clients that do not already have the issuing CA certificate will reject it",
+        );
+    }
+    let not_after = summaries[0].not_after;
+    let report = CertificateReport {
+        field: field.clone(),
+        names: source
+            .names
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        not_after: not_after.to_string(),
+        days_left: (not_after.0 - now).div_euclid(86_400),
+        note,
+    };
+    Ok((Arc::new(certified), report))
 }
 
 /// A static SNI map built at startup. Lookup is two hash probes at most and
@@ -316,33 +519,45 @@ fn load_certified_key(
 /// middle of a handshake.
 #[derive(Debug, Default)]
 struct CertificateResolver {
-    exact: HashMap<Box<str>, Arc<CertifiedKey>>,
+    exact: HashMap<Box<str>, Arc<Entry>>,
     /// Keyed by the parent domain: `*.example.net` is stored as
     /// `example.net` and matches exactly one additional label.
-    wildcard: HashMap<Box<str>, Arc<CertifiedKey>>,
+    wildcard: HashMap<Box<str>, Arc<Entry>>,
     /// Used when the client sends no SNI or a name nothing else matches.
     /// Without one, such a handshake fails.
-    default: Option<Arc<CertifiedKey>>,
+    default: Option<Arc<Entry>>,
+}
+
+#[derive(Debug)]
+struct Entry {
+    key: Arc<CertifiedKey>,
+    scope: Arc<CertificateScope>,
 }
 
 impl CertificateResolver {
-    fn lookup(&self, server_name: &str) -> Option<Arc<CertifiedKey>> {
+    fn lookup(&self, server_name: &str) -> Option<&Arc<Entry>> {
         let name = server_name.to_ascii_lowercase();
         let name = name.strip_suffix('.').unwrap_or(&name);
-        if let Some(key) = self.exact.get(name) {
-            return Some(Arc::clone(key));
+        if let Some(entry) = self.exact.get(name) {
+            return Some(entry);
         }
         let (_, parent) = name.split_once('.')?;
-        self.wildcard.get(parent).map(Arc::clone)
+        self.wildcard.get(parent)
+    }
+
+    /// The single selection rule, shared by the handshake and by the scope
+    /// lookup after it, so the two cannot disagree.
+    fn select(&self, server_name: Option<&str>) -> Option<&Arc<Entry>> {
+        server_name
+            .and_then(|name| self.lookup(name))
+            .or(self.default.as_ref())
     }
 }
 
 impl ResolvesServerCert for CertificateResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        client_hello
-            .server_name()
-            .and_then(|name| self.lookup(name))
-            .or_else(|| self.default.clone())
+        self.select(client_hello.server_name())
+            .map(|entry| Arc::clone(&entry.key))
     }
 }
 
@@ -441,6 +656,10 @@ mod tests {
             TlsName::parse("*.example.net"),
             Ok(TlsName::Wildcard("example.net".into()))
         );
+        assert_eq!(
+            TlsName::parse("127.0.0.1"),
+            Ok(TlsName::Address([127, 0, 0, 1].into()))
+        );
         for invalid in [
             "",
             "*",
@@ -448,8 +667,7 @@ mod tests {
             "a.*.example.net",
             "*example.net",
             "**.example.net",
-            "127.0.0.1",
-            "::1",
+            "*.127.0.0.1",
             "example.com.",
             "exa_mple.com",
             "example.com:443",
@@ -461,24 +679,29 @@ mod tests {
     #[test]
     fn a_wildcard_matches_exactly_one_label_and_exact_names_win() {
         let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let key = |name: &str| {
+        let entry = |name: &str| {
             let generated = rcgen::generate_simple_self_signed(vec![name.to_owned()]).unwrap();
             let key =
                 PrivateKeyDer::from_pem_slice(generated.signing_key.serialize_pem().as_bytes())
                     .unwrap();
-            Arc::new(
-                CertifiedKey::from_der(vec![generated.cert.der().clone()], key, &provider).unwrap(),
-            )
+            Arc::new(Entry {
+                key: Arc::new(
+                    CertifiedKey::from_der(vec![generated.cert.der().clone()], key, &provider)
+                        .unwrap(),
+                ),
+                scope: Arc::new(CertificateScope::for_names(&[name])),
+            })
         };
-        let exact = key("api.example.net");
-        let wildcard = key("*.example.net");
+        let exact = entry("api.example.net");
+        let wildcard = entry("*.example.net");
+        let fallback = entry("fallback.test");
         let resolver = CertificateResolver {
             exact: HashMap::from([("api.example.net".into(), Arc::clone(&exact))]),
             wildcard: HashMap::from([("example.net".into(), Arc::clone(&wildcard))]),
-            default: None,
+            default: Some(Arc::clone(&fallback)),
         };
-        let same = |found: Option<Arc<CertifiedKey>>, expected: &Arc<CertifiedKey>| {
-            found.is_some_and(|found| Arc::ptr_eq(&found, expected))
+        let same = |found: Option<&Arc<Entry>>, expected: &Arc<Entry>| {
+            found.is_some_and(|found| Arc::ptr_eq(found, expected))
         };
         assert!(same(resolver.lookup("API.example.net"), &exact));
         assert!(same(resolver.lookup("www.example.net"), &wildcard));
@@ -486,6 +709,29 @@ mod tests {
         assert!(resolver.lookup("example.net").is_none());
         assert!(resolver.lookup("a.b.example.net").is_none());
         assert!(resolver.lookup("example.org").is_none());
+        assert!(same(resolver.select(Some("example.org")), &fallback));
+        assert!(same(resolver.select(None), &fallback));
+        assert!(same(resolver.select(Some("api.example.net")), &exact));
+    }
+
+    #[test]
+    fn a_scope_covers_exactly_its_configured_names() {
+        let scope =
+            CertificateScope::for_names(&["a.test", "*.b.test", "127.0.0.1", "2001:db8::1"]);
+        for covered in ["a.test", "A.TEST", "x.b.test", "127.0.0.1"] {
+            assert!(scope.covers(covered), "{covered}");
+        }
+        for uncovered in [
+            "b.test",
+            "y.x.b.test",
+            "c.test",
+            "127.0.0.2",
+            "localhost",
+            "test",
+        ] {
+            assert!(!scope.covers(uncovered), "{uncovered}");
+        }
+        assert!(!CertificateScope::default().covers("a.test"));
     }
 
     #[test]

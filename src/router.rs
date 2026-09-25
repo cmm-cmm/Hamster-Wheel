@@ -9,6 +9,7 @@ use hyper::{
 pub use crate::handler::{Handler, HandlerKind};
 use crate::{
     handler::{HandlerResponse, simple_response},
+    tls::CertificateScope,
     transport::ConnectionInfo,
 };
 
@@ -18,6 +19,9 @@ pub enum RouteError {
     InvalidHost,
     UnknownHost,
     InvalidPath,
+    /// The effective authority is not covered by the certificate this TLS
+    /// connection presented (RFC 9110 sections 4.3.3 and 15.5.20).
+    Misdirected,
 }
 
 impl RouteError {
@@ -25,6 +29,7 @@ impl RouteError {
         match self {
             Self::MissingHost | Self::InvalidHost | Self::InvalidPath => StatusCode::BAD_REQUEST,
             Self::UnknownHost => StatusCode::NOT_FOUND,
+            Self::Misdirected => StatusCode::MISDIRECTED_REQUEST,
         }
     }
 
@@ -34,6 +39,7 @@ impl RouteError {
             Self::InvalidHost => "Invalid Host",
             Self::UnknownHost => "Unknown Host",
             Self::InvalidPath => "Invalid Path",
+            Self::Misdirected => "Misdirected Request",
         }
     }
 }
@@ -184,15 +190,24 @@ impl HostRouter {
         mut request: Request<Incoming>,
         connection: ConnectionInfo,
         body_read_timeout: Duration,
+        scope: Option<&CertificateScope>,
     ) -> Result<HandlerResponse, std::convert::Infallible> {
-        let handler = match self.route_request(&mut request) {
+        let handler = match self.route_request(&mut request, scope) {
             Ok(handler) => handler,
             Err(error) => return Ok(simple_response(error.status(), error.message())),
         };
         handler.serve(request, connection, body_read_timeout).await
     }
 
-    fn route_request<B>(&self, request: &mut Request<B>) -> Result<&Handler, RouteError> {
+    /// `scope` is the presented certificate's scope on a TLS connection and
+    /// `None` on cleartext. It is checked after the authority is validated
+    /// (malformed stays 400) and before virtual-host lookup, so a 421 says
+    /// nothing about which hosts exist.
+    fn route_request<B>(
+        &self,
+        request: &mut Request<B>,
+        scope: Option<&CertificateScope>,
+    ) -> Result<&Handler, RouteError> {
         // HTTP/1.1 still requires exactly one valid Host field for every
         // request. For absolute-form, however, RFC 9112 requires an origin
         // server to ignore that field's identity and use the request-target
@@ -211,13 +226,19 @@ impl HostRouter {
         };
         let received_hostname = request_hostname(request.headers())?;
 
+        let authorize = |hostname: &str| match scope {
+            Some(scope) if !scope.covers(hostname) => Err(RouteError::Misdirected),
+            _ => Ok(()),
+        };
         let locations = if let Some(authority) = target_authority {
             let hostname = parse_authority(authority.as_str())?;
             let host =
                 HeaderValue::from_str(authority.as_str()).map_err(|_| RouteError::InvalidHost)?;
+            authorize(hostname)?;
             request.headers_mut().insert(HOST, host);
             self.find_hostname(hostname)?
         } else {
+            authorize(received_hostname)?;
             self.find_hostname(received_hostname)?
         };
         locations.route(request.uri().path())
@@ -424,7 +445,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let handler = router.route_request(&mut request).unwrap();
+        let handler = router.route_request(&mut request, None).unwrap();
 
         assert!(matches!(handler, Handler::Simple { body: "api", .. }));
         assert_eq!(request.headers().get_all(HOST).iter().count(), 1);
@@ -441,7 +462,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let handler = router.route_request(&mut request).unwrap();
+        let handler = router.route_request(&mut request, None).unwrap();
 
         assert!(matches!(handler, Handler::Simple { body: "api", .. }));
         assert_eq!(request.headers()[HOST], "Example.Test:8080");
@@ -456,7 +477,7 @@ mod tests {
             .body(())
             .unwrap();
         assert!(matches!(
-            router.route_request(&mut missing),
+            router.route_request(&mut missing, None),
             Err(RouteError::MissingHost)
         ));
 
@@ -466,7 +487,7 @@ mod tests {
             .body(())
             .unwrap();
         assert!(matches!(
-            router.route_request(&mut invalid),
+            router.route_request(&mut invalid, None),
             Err(RouteError::InvalidHost)
         ));
 
@@ -479,7 +500,7 @@ mod tests {
             .headers_mut()
             .append(HOST, HeaderValue::from_static("example.test"));
         assert!(matches!(
-            router.route_request(&mut duplicate),
+            router.route_request(&mut duplicate, None),
             Err(RouteError::InvalidHost)
         ));
     }
@@ -493,7 +514,7 @@ mod tests {
             .body(())
             .unwrap();
         assert!(matches!(
-            router.route_request(&mut invalid),
+            router.route_request(&mut invalid, None),
             Err(RouteError::InvalidHost)
         ));
 
@@ -503,8 +524,71 @@ mod tests {
             .body(())
             .unwrap();
         assert!(matches!(
-            router.route_request(&mut unknown),
+            router.route_request(&mut unknown, None),
             Err(RouteError::UnknownHost)
         ));
+    }
+
+    #[test]
+    fn a_tls_connection_serves_only_hosts_its_certificate_covers() {
+        let router = test_router();
+        let scope = CertificateScope::for_names(&["example.test"]);
+        let request = |uri: &str, host: &str| {
+            Request::builder()
+                .uri(uri)
+                .header(HOST, host)
+                .body(())
+                .unwrap()
+        };
+
+        let mut covered = request("/api", "EXAMPLE.test:8443");
+        assert!(matches!(
+            router.route_request(&mut covered, Some(&scope)),
+            Ok(Handler::Simple { body: "api", .. })
+        ));
+
+        // Not covered: refused before lookup, whether or not the host exists.
+        let narrow = CertificateScope::for_names(&["other.test"]);
+        let mut configured = request("/api", "example.test");
+        assert!(matches!(
+            router.route_request(&mut configured, Some(&narrow)),
+            Err(RouteError::Misdirected)
+        ));
+        let mut unknown = request("/api", "unknown.test");
+        assert!(matches!(
+            router.route_request(&mut unknown, Some(&scope)),
+            Err(RouteError::Misdirected)
+        ));
+        // Cleartext has no scope and keeps the existing answers.
+        let mut cleartext = request("/api", "unknown.test");
+        assert!(matches!(
+            router.route_request(&mut cleartext, None),
+            Err(RouteError::UnknownHost)
+        ));
+        // A malformed authority is still 400, not 421.
+        let mut malformed = request("/api", "bad_host");
+        assert!(matches!(
+            router.route_request(&mut malformed, Some(&scope)),
+            Err(RouteError::InvalidHost)
+        ));
+
+        // Absolute-form is judged by its target authority, not Host, and a
+        // refused request keeps its original Host.
+        let mut absolute = request("https://unknown.test/api", "example.test");
+        assert!(matches!(
+            router.route_request(&mut absolute, Some(&scope)),
+            Err(RouteError::Misdirected)
+        ));
+        assert_eq!(absolute.headers()[HOST], "example.test");
+        let mut absolute_covered = request("https://example.test/api", "other.test");
+        assert!(
+            router
+                .route_request(&mut absolute_covered, Some(&scope))
+                .is_ok()
+        );
+        assert_eq!(
+            RouteError::Misdirected.status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
     }
 }

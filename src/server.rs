@@ -20,7 +20,7 @@ use tokio::{
 use crate::{
     config::{HttpLimits, PhpPoolsError, RuntimeConfig},
     router::HostRouter,
-    tls::TlsListener,
+    tls::{CertificateScope, TlsListener},
     transport::{ConnectionInfo, Scheme, TransportInfo},
     write_progress::WriteProgressTimeout,
 };
@@ -145,11 +145,27 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         let address = listener.address();
         match &listener.tls {
             None => println!("Hamster Wheel listening on http://{address}"),
-            Some(tls) => println!(
-                "Hamster Wheel listening on https://{address} ({} certificate(s), TLS 1.2/1.3, ALPN http/1.1, handshake timeout {} s)",
-                tls.certificates(),
-                tls.handshake_timeout().as_secs()
-            ),
+            Some(tls) => {
+                println!(
+                    "Hamster Wheel listening on https://{address} ({} certificate(s), TLS 1.2/1.3, ALPN http/1.1, handshake timeout {} s)",
+                    tls.certificates().len(),
+                    tls.handshake_timeout().as_secs()
+                );
+                // Printed once, where the operator looks: the server does not
+                // reload certificates, so the date is when HTTPS stops working.
+                for certificate in tls.certificates() {
+                    println!(
+                        "TLS certificate {} for {}: valid until {} ({} days)",
+                        certificate.field,
+                        certificate.names,
+                        certificate.not_after,
+                        certificate.days_left
+                    );
+                    if let Some(note) = certificate.note {
+                        println!("TLS certificate {}: note: {note}", certificate.field);
+                    }
+                }
+            }
         }
     }
 
@@ -335,7 +351,7 @@ async fn serve_connection(
     let stream = WriteProgressTimeout::new(stream, http_limits.write_progress_timeout());
     let Some(tls) = tls else {
         let connection = ConnectionInfo::new(transport, Scheme::Http);
-        serve_http(stream, connection, router, http_limits, shutdown).await;
+        serve_http(stream, connection, None, router, http_limits, shutdown).await;
         return;
     };
     // Boxed so that a cleartext connection's task is not sized for the TLS
@@ -366,21 +382,32 @@ async fn serve_tls(
     // shutdown cancels the handshake at once because there is no request to
     // drain. Either way the socket and rustls state drop with this future.
     let deadline = accepted_at + tls.handshake_timeout();
-    let stream = tokio::select! {
-        stream = tls.handshake(stream, deadline) => stream,
+    let accepted = tokio::select! {
+        accepted = tls.handshake(stream, deadline) => accepted,
         _ = shutdown.wait_for(|stop| *stop) => None,
     };
-    if let Some(stream) = stream {
+    if let Some((stream, scope)) = accepted {
         let connection = ConnectionInfo::new(transport, Scheme::Https);
-        serve_http(stream, connection, router, http_limits, shutdown).await;
+        serve_http(
+            stream,
+            connection,
+            Some(scope),
+            router,
+            http_limits,
+            shutdown,
+        )
+        .await;
     }
 }
 
-/// The one HTTP serving path. Cleartext and TLS converge here; nothing below
-/// this point knows which it is except through the trusted scheme.
+/// The one HTTP serving path. Cleartext and TLS converge here. Handlers know
+/// which through the trusted scheme only; the router additionally receives the
+/// presented certificate's scope, which limits the hosts a TLS connection may
+/// be served for.
 async fn serve_http<I>(
     io: I,
     connection_info: ConnectionInfo,
+    scope: Option<Arc<CertificateScope>>,
     router: Arc<HostRouter>,
     http_limits: HttpLimits,
     mut shutdown: watch::Receiver<bool>,
@@ -390,9 +417,15 @@ async fn serve_http<I>(
     let transport = connection_info.transport();
     let service = hyper::service::service_fn(move |request| {
         let router = Arc::clone(&router);
+        let scope = scope.clone();
         async move {
             router
-                .serve(request, connection_info, http_limits.body_read_timeout())
+                .serve(
+                    request,
+                    connection_info,
+                    http_limits.body_read_timeout(),
+                    scope.as_deref(),
+                )
                 .await
         }
     });
@@ -1188,13 +1221,34 @@ mod tests {
             .await
             .expect("body error must close the connection")
             .expect("read partial response");
+        // What is guaranteed is that the corrupt response never looks complete,
+        // not how much of it arrives. Hyper 1.11 buffers body chunks and, when
+        // the body fails inside that loop, drops the connection without
+        // flushing them; a pipelined request left unread can also turn the
+        // close into a reset. So the head and the five bytes may or may not
+        // arrive: 1 in 600 stressed runs lost them before TLS, 2 in 600 after
+        // (`doc/TLS_V1.md`, Verification). Asserting their delivery made this
+        // test fail intermittently.
         let response_text = String::from_utf8_lossy(&response);
-        assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response_text.contains("content-length: 10\r\n"));
-        assert!(response.ends_with(b"\r\n\r\nshort"));
-        assert_eq!(
-            response_text.matches("HTTP/1.1 200 OK").count(),
-            1,
+        if !response.is_empty() {
+            assert!(
+                response_text.starts_with("HTTP/1.1 200 OK\r\n"),
+                "{} bytes: {response_text:?}",
+                response.len()
+            );
+            assert!(response_text.contains("content-length: 10\r\n"));
+            let head_end = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map_or(response.len(), |index| index + 4);
+            let body = &response[head_end..];
+            assert!(
+                b"short".starts_with(body),
+                "only a prefix of the file may arrive, got {body:?}"
+            );
+        }
+        assert!(
+            response_text.matches("HTTP/1.1 200 OK").count() <= 1,
             "the pipelined request must not run after a corrupt response body"
         );
 
@@ -1435,8 +1489,24 @@ mod tests {
 
         // One more body of the same, individually legal, size must be refused
         // now, and refused without waiting for anything to be released.
+        //
+        // The client waits for `100 Continue` before sending the body, as
+        // curl does for large bodies, so the refusal must come without asking
+        // for it. A client that pushes the body unconditionally is refused
+        // the same way, but Hyper then closes with that body unread and
+        // Windows answers with a reset that can destroy the 503 before the
+        // client reads it: that race, not the budget, made this test fail
+        // intermittently (`doc/TLS_V1.md`, Verification).
         let mut refused = connect(listen_addr).await;
-        write_sized_body(&mut refused, BODY).await;
+        refused
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: {BODY}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write request head");
         let mut answer = Vec::new();
         tokio::time::timeout(Duration::from_secs(1), refused.read_to_end(&mut answer))
             .await
@@ -1596,13 +1666,19 @@ mod tests {
             .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n")
             .await
             .expect("write chunked head");
+        // The chunk announces 128 KiB but the client stops one byte past the
+        // budget, so the refusal happens with nothing left unread. Unread
+        // bytes at close make Windows reset the connection, which could
+        // destroy the 503 before the client reads it.
         let oversized = 128 * 1_024;
         large
             .write_all(format!("{:x}\r\n", oversized).as_bytes())
             .await
             .expect("write chunk size");
-        let _ = large.write_all(&vec![b'z'; oversized]).await;
-        let _ = large.write_all(b"\r\n0\r\n\r\n").await;
+        large
+            .write_all(&vec![b'z'; budget.limit() + 1])
+            .await
+            .expect("write one byte more than the budget");
         let head = tokio::time::timeout(Duration::from_secs(2), read_response_head(&mut large))
             .await
             .expect("an over-budget chunked body must be answered");

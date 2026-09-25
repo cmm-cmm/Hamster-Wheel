@@ -1,7 +1,9 @@
 # TLS v1
 
-Status: implemented in the working tree on 2026-09-25, for Owner review. Not
-committed, tagged, released or accepted. The investigation it follows is
+Status: implemented on 2026-09-25 and committed by the Owner as `868eaff`;
+the authority policy, certificate date and chain checks, and the test fixes
+below are in the working tree on top of it, for Owner review. Not tagged,
+released or accepted. The investigation it follows is
 `doc/research/TLS_ARCHITECTURE_INVESTIGATION.md`; where this document and the
 investigation differ, this document and the source are current. Measurements
 are in `benchmarks/results/tls_v1_20260925.md`.
@@ -22,7 +24,7 @@ handshake_timeout = 10        # seconds, 1-60, total from accept (default 10)
 [[server.tls.certificates]]
 cert = "certs/site-chain.pem" # PEM: leaf first, then intermediates
 key = "certs/site-key.pem"    # unencrypted PKCS#8, PKCS#1 or SEC1
-names = ["example.com", "*.example.net"]
+names = ["example.com", "*.example.net"]  # also the hosts this certificate serves
 default = true                # at most one: used for no SNI or unknown SNI
 ```
 
@@ -30,13 +32,15 @@ In v1: HTTP/1.1 over TLS 1.2 and 1.3; rustls 0.23 with the aws-lc-rs provider
 and its default cipher suites and key exchange groups; ALPN advertising only
 `http/1.1`; PEM certificate chains and keys loaded once at startup; SNI
 selection over exact names and one-label wildcards with an optional default;
-a total handshake deadline; graceful shutdown and cancellation; a trusted
+a connection serves only the hosts its certificate's names cover (`421`
+otherwise); startup refusal of certificates outside their validity period and
+of chains that do not link; a total handshake deadline; graceful shutdown and cancellation; a trusted
 connection scheme for the reverse proxy and the PHP worker protocol.
 
 Not in v1, deliberately: ACME, certificate reload, OCSP stapling, client
 certificates (mTLS), upstream TLS, HTTP/2, HTTP/3, a Windows certificate store,
-automatic HTTP to HTTPS redirect, HSTS, per-host listener binding and an
-SNI/Host authorization policy (see Owner review points).
+automatic HTTP to HTTPS redirect, HSTS, and binding a host to the cleartext
+listener only.
 
 ## Architecture
 
@@ -47,13 +51,15 @@ connection except through the trusted scheme.
 ```text
 cleartext: TcpStream -> WriteProgressTimeout -------------------------> serve_http
 TLS:       TcpStream -> WriteProgressTimeout -> rustls handshake -> TlsStream -> serve_http
-serve_http<I: AsyncRead + AsyncWrite>: TokioIo -> Hyper http1 -> HostRouter(ConnectionInfo)
+serve_http<I: AsyncRead + AsyncWrite>: TokioIo -> Hyper http1
+    -> HostRouter(ConnectionInfo, Option<&CertificateScope>) -> Handler(ConnectionInfo)
 ```
 
 - `src/tls.rs` owns everything TLS: validated names (`TlsName`), certificate
-  loading and checks, the SNI resolver, the `TlsListener` (address, one
-  immutable `TlsAcceptor`, handshake deadline) and handshake failure counters.
-  No other module imports rustls.
+  loading and checks (`src/tls/x509.rs` reads validity dates), the SNI
+  resolver, each certificate's `CertificateScope`, the `TlsListener` (address,
+  one immutable `TlsAcceptor`, handshake deadline) and handshake failure
+  counters. No other module imports rustls.
 - `src/server.rs` binds every configured listener before serving any, then runs
   one accept loop over them (`serve_listeners`). A listener is a bound socket
   plus `Option<Arc<TlsListener>>`. Accept rotates which listener is polled
@@ -63,6 +69,9 @@ serve_http<I: AsyncRead + AsyncWrite>: TokioIo -> Hyper http1 -> HostRouter(Conn
   `Scheme::{Http, Https}` and `ConnectionInfo { transport, scheme }`, a `Copy`
   value passed once from the listener to the router and every handler. It holds
   no rustls type and nothing read from a request.
+- The router alone also receives the presented certificate's
+  `CertificateScope` (`None` on cleartext) and answers an authority it does
+  not cover with `421`. Handlers never see it.
 
 There is no transport trait or enum dispatch: the only per-connection branch
 is `Option<Arc<TlsListener>>` at accept, and `serve_http` is generic. The TLS
@@ -104,26 +113,68 @@ have missed it.
 
 ## Certificates and SNI
 
-`names` are the SNI names that select a certificate: exact DNS names, or `*.`
-plus a parent domain of at least two labels, matching exactly one extra label
-(`*.example.net` covers `a.example.net`, not `example.net` or
-`a.b.example.net`). Exact names win over wildcards. Names are compared
+`names` are exact DNS names, `*.` plus a parent domain of at least two labels
+matching exactly one extra label (`*.example.net` covers `a.example.net`, not
+`example.net` or `a.b.example.net`), or IP addresses. Names are compared
 ASCII-case-insensitively and a trailing dot in the client's SNI is ignored. A
-name may appear once across all certificates. IP addresses are rejected as
-names because clients never send them as SNI; serve an IP-addressed site with
-the default certificate.
+name may appear once across all certificates. DNS names do two things: they
+select the certificate by SNI, and they are the hosts a connection that
+presented that certificate may be served for. An IP address only does the
+second: clients never send one as SNI, so an IP name belongs on the
+certificate that serves no-SNI clients, normally the default.
 
 A handshake with no SNI, or with an SNI no entry matches, uses the certificate
 marked `default = true`; without one it fails. Resolution is a static map built
 at startup: at most two hash probes, no I/O, as required by rustls calling the
 resolver synchronously inside the handshake.
 
-SNI selects the certificate only. The effective HTTP authority (Host, or an
-absolute-form target) still selects the virtual host, exactly as on the
-cleartext listener, and every host is reachable on both listeners. A test
-completes a handshake as `a.test` and sends `Host: x.b.test`; it is served by
-`x.b.test`. This is the current behavior, not an accepted policy: see Owner
-review points.
+### Which hosts a TLS connection may be served for
+
+A TLS connection is authoritative only for the hosts its certificate's
+configured `names` cover. The router checks the effective authority (Host, or
+the absolute-form target) against the scope of the certificate the handshake
+presented, after validating it (a malformed authority is still `400`) and
+before virtual-host lookup (so the answer reveals nothing about which hosts
+exist). A request outside the scope is answered `421 Misdirected Request` with
+body `Misdirected Request`; the connection stays open for requests it does
+cover. Inside the scope, routing is unchanged.
+
+Why this rule: RFC 9110 section 4.3.3 makes an `https` origin authoritative
+for a host only when the certificate presented on the connection is valid for
+that host, and section 15.5.20 defines `421` for a request "directed at a
+server that is unable or unwilling to produce an authoritative response" on
+that connection, which a client may retry on a new connection. Hamster is the
+origin (or the gateway acting as one) for every configured host, never a
+forward proxy, so `421` is the status RFC 9110 prescribes. Before this change
+a handshake completed for `a.test` served `Host: x.b.test`, and a client with
+no SNI got the default certificate and any configured host, including hosts
+no certificate names at all. A browser never sends such a request because it
+checks the certificate against the host first; the rule closes the gap for
+every other client and makes the configured `names` the explicit list of hosts
+the TLS listener serves.
+
+Consequences, each covered by a test:
+
+| Connection presented | Request authority | Result |
+|---|---|---|
+| certificate naming `a.test` and `b.test` | `b.test` | served (one certificate for several hosts) |
+| certificate for `a.test` | `x.b.test`, which another certificate names | `421` |
+| any certificate | a configured host that no certificate names | `421` over TLS; still served over cleartext |
+| default certificate (no or unknown SNI) | a host the default names | served |
+| default certificate | any other host | `421` |
+| default certificate naming `127.0.0.1` | `Host: 127.0.0.1` | served |
+| any | absolute-form `https://other/` with a covered Host | `421`: the target authority decides |
+
+The check compares against the configured `names`, not the certificate's full
+SAN list: `names` are verified to be a subset of the SANs at startup, and a SAN
+the operator did not list is not a host this listener was asked to serve. The
+scope is found with the same selection function rustls used to choose the
+certificate, so the two cannot disagree.
+
+Alternatives considered: requiring the authority to equal the SNI is stricter
+than RFC 9110 and refuses legitimate reuse of one multi-name certificate;
+keeping independent routing leaves the gap above. A cleartext listener has no
+certificate and is unchanged.
 
 At startup, before any worker starts or any socket binds, each certificate is
 loaded and checked. Failures are `Compile` errors naming the field and path:
@@ -136,12 +187,36 @@ loaded and checked. Failures are `Compile` errors naming the field and path:
 - a key that does not match the leaf, or a key type the provider cannot load;
 - a configured name the leaf's subject alternative names do not cover. A
   wildcard name is checked with a probe label, so a certificate listing a few
-  explicit subdomains does not pass as a wildcard.
+  explicit subdomains does not pass as a wildcard; an IP name is checked
+  against the IP SANs;
+- the leaf, or any intermediate in the file, outside its validity period at
+  startup (`... expired on <date>` or `... is not valid until <date>`). A
+  trailing self-signed root is exempt: clients use their own copy of a root,
+  so a bundled one decides nothing;
+- a chain that does not link: with two or more certificates in the file, the
+  last one is used as the anchor and the path from the leaf to it is verified
+  with webpki at the current time (signatures, CA flags, path length, and the
+  server-auth usage when an EKU is present). A wrong issuer, a missing
+  intermediate between the leaf and a bundled root, or an intermediate that
+  is not a CA fails startup.
 
-Not checked: validity dates (an expired or not-yet-valid certificate starts),
-chain completeness and trust by real clients. rustls would need trust anchors
-to verify a chain, and a server does not have the client's. These are
-documented limitations and an Owner point, not silent guarantees.
+What the server can decide and what it cannot: it knows the current time and
+the certificates it will send, so it can refuse to serve with a certificate
+every client would reject for its dates, and it can prove the certificates it
+sends form a path. It cannot know which roots a client trusts. So a file that
+holds only a leaf whose issuer is not in the file is accepted, because that
+issuer may be a root every intended client holds (a private CA) or an
+intermediate the operator forgot; startup prints a note saying the issuer is
+not included. Revocation, certificate transparency and trust by real clients
+remain the client's decisions. The x509 reader only walks the fixed prefix of
+`TBSCertificate` (version, serial, algorithm, issuer, validity, subject) and
+rejects anything it does not recognise.
+
+Startup prints each certificate's field, names and expiry, for example
+`TLS certificate server.tls.certificates[0] for localhost: valid until
+2027-01-01 00:00:00 UTC (463 days)`, because Hamster does not reload
+certificates: a certificate that expires while the server runs keeps being
+served, and clients reject it, until a restart with a renewed file.
 
 ## Protocol and ALPN
 
@@ -179,6 +254,7 @@ on that connection. Nothing a client sends can produce it: not
 | no complete handshake by the deadline, including a trickling peer | socket dropped, no response | `timed_out` |
 | handshake flight not read by the peer for `write_progress_timeout` | socket dropped | `timed_out` |
 | cleartext HTTP, malformed record, no common version/suite, ALPN mismatch, SNI with no certificate | rustls alert, close | `rejected` |
+| request for an authority the presented certificate does not cover | `421 Misdirected Request`, connection kept | not counted |
 | peer closes or resets during the handshake | dropped | `abandoned` |
 | shutdown during a handshake | cancelled at once | not counted |
 | TLS read error or close without `close_notify` while serving | connection ends | not logged (peer-controlled) |
@@ -199,7 +275,9 @@ throwaway CA from `rcgen` (dev-dependency only):
 | Boundary | Permanent test |
 |---|---|
 | both listeners, one router, each its own scheme; keep-alive over TLS; forged `X-Forwarded-Proto` ignored; `close_notify` on `Connection: close` (rustls reports a close without it as an error) | `server::tls_tests::both_listeners_share_one_router_and_each_carries_its_own_trusted_scheme` |
-| SNI: exact, wildcard, one label only, unknown and absent SNI use the default; a verifying client accepts the wildcard chain; Host, not SNI, routes | `sni_selects_the_certificate_while_the_host_header_selects_the_virtual_host` |
+| SNI: exact, wildcard, one label only, unknown and absent SNI use the default; a verifying client accepts the wildcard chain; a host another certificate names is `421` and the connection then serves its own host | `sni_selects_the_certificate_and_a_host_it_does_not_cover_is_misdirected` |
+| authority scope: multi-name certificate, default certificate, IP name, configured host no certificate names (421 over TLS, served over cleartext), unknown host, absolute-form target | `a_tls_connection_serves_only_the_hosts_its_certificate_names` |
+| router: 421 after authority validation and before lookup; absolute-form judged by target; cleartext unaffected | `router::tests::a_tls_connection_serves_only_hosts_its_certificate_covers` |
 | without a default, unknown and absent SNI fail the handshake and are counted as rejected | `without_a_default_certificate_an_unknown_or_absent_sni_fails_the_handshake` |
 | ALPN: h2-only refused, h2+http/1.1 selects http/1.1, no ALPN serves HTTP/1.1 | `the_listener_negotiates_http_1_1_or_nothing` |
 | total handshake deadline against a peer trickling a byte every 50 ms; the held admission slot (`max_connections = 1`) frees at the deadline | `a_trickled_handshake_is_dropped_at_its_total_deadline_and_frees_its_slot` |
@@ -211,35 +289,81 @@ throwaway CA from `rcgen` (dev-dependency only):
 | a flush stalled beneath TLS times out (40 KiB fits rustls's buffer, not the 16 KiB pipe) | `a_flush_stalled_beneath_tls_times_out_instead_of_waiting_forever` |
 | an HTTPS bind failure releases the bound cleartext socket; `run` fails instead of serving on one listener | `server::tests::a_tls_bind_failure_leaves_no_listener_serving` |
 | proxy forwards `X-Forwarded-Proto: https` for a TLS client claiming http | `proxy::tests::an_https_client_is_forwarded_with_the_scheme_its_listener_established` |
-| name parsing, one-label wildcard lookup, rate-limited reporting | `tls::tests::*` (3) |
-| config: TLS with and without cleartext; 21 rejected configurations (listeners, timeouts, names, duplicates, defaults, unknown fields, unreadable/malformed/empty PEM, missing/encrypted/mismatched key, uncovered exact and wildcard names), none leaking key material | `tests/configuration.rs` `compiles_a_tls_listener_with_or_without_a_cleartext_listener`, `rejects_tls_configuration_that_cannot_be_served` |
+| name parsing, one-label wildcard lookup, shared selection rule, scope coverage, rate-limited reporting | `tls::tests::*` (4) |
+| validity dates from UTCTime and GeneralizedTime, self-issued detection, malformed DER | `tls::x509::tests::*` (3) |
+| config: TLS with and without cleartext; 22 rejected configurations (listeners, timeouts, names, duplicates, defaults, unknown fields, unreadable/malformed/empty PEM, missing/encrypted/mismatched key, uncovered exact, wildcard and IP names, IP wildcard), none leaking key material | `tests/configuration.rs` `compiles_a_tls_listener_with_or_without_a_cleartext_listener`, `rejects_tls_configuration_that_cannot_be_served` |
+| expired and not-yet-valid leaf (with CA, and self-signed alone), expired intermediate; an expired trailing root is accepted | `a_certificate_outside_its_validity_period_fails_startup` |
+| linked chains (with and without root) compile and report expiry; wrong issuer and missing intermediate fail; a bare leaf compiles with a note; a self-signed leaf has none | `a_chain_that_does_not_link_fails_startup_and_a_bare_leaf_is_reported` |
 | protocol v3 byte layout; READY v0/1/2/4/max rejected | `php_protocol::tests` |
 | PHP worker receives `https` from the TLS listener and `http` from the cleartext one in the same W1 process; forged headers ignored; local port is the TLS port | `tests/php_worker.rs::protocol_v3_carries_the_listener_scheme_not_a_forwarding_header` (ignored: needs `php/8.5/php.exe`) |
 | real Laravel/Symfony over HTTPS only (no cleartext listener): `REQUEST_SCHEME=https`, `HTTPS=on`, `getScheme()=https`, default port 443, a forged `X-Forwarded-Proto: http` from an untrusted peer ignored | `laravel_sees_https_from_the_tls_listener_and_not_from_a_forged_header` (ignored: needs a prepared scratch PMS) |
 | PHP decoder: http/https values, 0 and 3 rejected; Laravel server-bag mapping | `fixtures/php-worker/protocol_test.php`, `laravel_request_test.php` |
 
-Gates, Windows native, final tree: `cargo fmt --check`, strict `clippy
---all-targets --all-features -D warnings`, `cargo test` (135 lib, 26
-configuration, 7 routing, 5 static), MSVC release build and `cargo bench
---no-run --features profiling` pass. `cargo test -- --ignored` with
-`HAMSTER_LARAVEL_TEST_PATH` set to a fresh scratch copy of the prepared PMS:
-lib 9, multipool 9, visibility 1, timeout 10, containment 4 and 60 of 64
-`php_worker` tests pass, including both new TLS PHP tests and the existing
-Laravel metadata probe. The 4 failures: the ConPTY `ctrl_c` harness gap
-already documented, two Laravel tests whose scratch vendor tree lacks
-`predis/predis/src/Client.php` (also missing in the copy it came from), and
-the decoder check-count assertion, which this change had made stale (14 to 18
-checks) and which now passes. The TLS, proxy and server unit tests passed 10
-of 10 and then 50 of 50 sequential runs, and 40 of 40 under two parallel test
-processes; one earlier sequential run of that set failed once without
-reproducing, and under parallel load the only failure seen was the existing
-cleartext `midstream_response_error_closes_connection_and_server_recovers`,
-whose client leaves a pipelined request unread so the close can be an RST.
-`cargo check --target x86_64-unknown-linux-gnu` cannot run: the target is not
-installed. Native Linux: NOT VERIFIED.
+Gates, Windows native, working tree after the authority and certificate
+changes: `cargo fmt --check`, strict `clippy --all-targets --all-features -D
+warnings`, `cargo test` (141 lib, 28 configuration, 7 routing, 5 static), MSVC
+release build and `cargo bench --no-run --features profiling` pass. `cargo test
+-- --ignored` with `HAMSTER_LARAVEL_TEST_PATH` set to a scratch copy of the
+prepared PMS: lib 9, multipool 9, visibility 1, timeout 10, containment 4 and
+61 of 64 `php_worker` tests pass, including both TLS PHP tests and the
+Laravel metadata probe. The 3 failures are environmental and unchanged: the
+ConPTY `ctrl_c` harness gap already documented, and two Laravel tests whose
+scratch vendor tree lacks `predis/predis/src/Client.php` (also missing in the
+copy it came from). `cargo check --target x86_64-unknown-linux-gnu` cannot run:
+the target is not installed. Native Linux: NOT VERIFIED.
+
+End to end with the release binary, a TLS-only config and `curl`: `localhost`
+200, `https://127.0.0.1` with no SNI 200 through an IP name on the default
+certificate, `Host: other.test` (a configured alias the certificate does not
+name) 421 `Misdirected Request`; startup printed the certificate's expiry; an
+expired certificate made the binary exit with `the leaf certificate expired on
+2021-01-01 00:00:00 UTC` before binding.
+
+### Intermittent test failures
+
+The earlier report recorded one unidentified failure in ten runs of the
+TLS/proxy/server tests. It was reproduced and identified; neither cause is a
+TLS regression.
+
+1. `server::tests::the_body_budget_caps_concurrent_bodies_and_releases_every_one`
+   (and once `an_undeclared_body_is_charged_as_it_grows_and_refused_when_it_cannot_grow`):
+   10 of 100 full `--lib` runs on `868eaff` while the machine was also
+   building; the client's read of the 503 failed with `WSAECONNABORTED`
+   (10053). Cause: the test pushed a 64 KiB body that the budget refuses
+   before reading. Hyper 1.11 then reads at most one buffer of the unread
+   body (`poll_drain_or_close_read`) and closes; closing a socket with unread
+   bytes makes Windows send a reset, which can discard the 503 before the
+   client reads it. The same test binary built from `a7a31b4` (before Reverse
+   Proxy and TLS) failed the same way: over two alternating A/B series, 1 of
+   160 runs before, 3 of 160 after, inside the noise. Fix, in the tests: the
+   refused client sends `Expect: 100-continue` and waits, as curl does for large
+   bodies, and the chunked client stops one byte past the budget, so nothing is
+   left unread when Hamster closes. Both still assert the refusal, its body
+   text, the budget accounting and recovery. After the fix: 0 failures in 100
+   full runs.
+2. `server::tests::midstream_response_error_closes_connection_and_server_recovers`:
+   1 in 100 full runs, and 2 in 600 runs of the test with four copies in
+   parallel; the head arrived without the five body bytes that precede the
+   injected body error (and, under the same stress, sometimes nothing arrived). The `a7a31b4` build failed the same assertion 1 in 600
+   under the same stress. Cause: Hyper 1.11 buffers body chunks in a loop and,
+   when the body fails inside it, returns the error and drops the connection
+   without flushing what it buffered (`proto/h1/dispatch.rs`, `poll_write`); a
+   pipelined request left unread can also turn the close into a reset. The
+   delivered prefix is therefore not guaranteed. The test now asserts what is:
+   if anything arrives it is the 200 head with `content-length: 10` and at most
+   a prefix of the five bytes, so the response never looks complete; the
+   pipelined request never runs; the server recovers.
+
+Confirmation on the final tree: 100 full `--lib` runs with no failure, and
+600 runs of the three affected tests with four copies in parallel with no
+failure. A first version of the relaxed midstream assertion still required
+exactly one response head and failed 5 of 600 under that stress with an empty
+response: under load Hyper may flush nothing at all before the body error,
+which is the same cause.
 
 Mutation check (each applied alone, the named tests run, the file restored
-and its hash compared): 10 of 10 caught.
+and its hash compared): 10 of 10 caught for the first slice, and 9 of 9 for the
+authority and certificate changes (below the first table).
 
 | Mutation | Caught by |
 |---|---|
@@ -253,6 +377,18 @@ and its hash compared): 10 of 10 caught.
 | T8 wildcard matches any depth | SNI test |
 | T9 names not checked against the certificate | config rejection test |
 | T10 socket write deadline one hour | stops-reading test |
+
+| Mutation | Caught by |
+|---|---|
+| S1 router never refuses an uncovered authority | router scope test |
+| S2 scope taken from the default certificate, not the presented one | nine TLS server tests |
+| S3 scope wildcard matches any depth | scope unit test |
+| S4 absolute-form judged by Host instead of its target | router scope test |
+| D1 expiry not checked | validity test |
+| D2 not-yet-valid not checked | validity test |
+| D3 chain linkage not checked | chain test |
+| D4 trailing self-signed root date-checked | validity test (expired bundled root) |
+| D5 bare leaf not reported | chain test |
 
 T3 falsified an assumption made while writing the tests: that above TLS the
 deadline would still see `poll_write` return `Pending` once rustls's buffer
@@ -270,6 +406,11 @@ probe (removed) and by the benchmark's stderr; there is no permanent test
 because the report goes to stderr.
 
 ## Performance and memory
+
+Not re-measured after the authority and certificate changes: they add one
+resolver lookup per TLS handshake, one `Arc` clone and a few string
+comparisons per TLS request, nothing on cleartext requests, and a startup-only
+certificate walk, below the resolution of the harness below.
 
 FACT (release, Windows loopback, static files, three runs per cell; full
 tables in `benchmarks/results/tls_v1_20260925.md`). The bench client does its
@@ -316,16 +457,28 @@ was boxed).
 - **Deliberately not in v1:** ACME, certificate reload, OCSP stapling, mTLS,
   upstream TLS, HTTP/2 and HTTP/3, Windows certificate store, HTTP to HTTPS
   redirect, HSTS.
-- **Every host is on both listeners.** There is no per-host listener binding,
-  so a host meant only for HTTPS is also served on the cleartext listener when
-  one is configured. Run HTTPS-only (omit `server.listen`) if that matters.
-- **No SNI/Host authorization relation.** A client can complete the handshake
-  for one configured name and request another host; it is served. For
-  HTTP/1.1 a well-behaved client never does this, and a hostile client can
-  simply send the other SNI, so the risk is confusion rather than bypass; but
-  it is a policy decision, not a proof. No `421` is produced.
-- **Certificate time validity and chain completeness are not checked** at
-  startup. An expired certificate starts and every client rejects it.
+- **The cleartext listener still serves every host.** Over TLS a host is
+  served only if a certificate names it, but when `server.listen` is configured
+  a host meant only for HTTPS is also reachable over cleartext, and there is no
+  redirect or HSTS. Run HTTPS-only (omit `server.listen`) if that matters.
+- **Certificates are checked once, at startup.** A certificate that expires
+  while the server runs keeps being served until a restart with a renewed
+  file; startup prints each expiry date. Trust by real clients, revocation and
+  certificate transparency are not checked and are the client's decisions. A
+  bare leaf whose issuer is not in the file starts with a note, because only
+  clients know whether they hold that issuer. EKU is enforced only through the
+  chain check, so a bare leaf's key usage is not checked.
+- **Hosts added by `names` beyond the configured virtual hosts** are harmless
+  (lookup returns `404` as before), and a configured SAN that `names` omits is
+  not served over TLS: `names` is the authority list.
+- **Early refusals and mid-body failures are not guaranteed to reach a client
+  that keeps sending (existing, not TLS-specific).** When Hamster answers before
+  reading a body (body budget `503`, `413`, `408`), Hyper drains at most one
+  buffer and closes; on Windows the remaining unread bytes turn the close into
+  a reset that can destroy the response. A client that uses
+  `Expect: 100-continue` receives it reliably. Bytes buffered before a
+  response body fails mid-stream may not be flushed. Reproduced with the
+  pre-TLS build; see Verification.
 - **One private key per certificate entry, first key in the file.** Additional
   keys in the same PEM file are ignored.
 - **Handshake counters are not exported**; they are visible only through the
@@ -349,10 +502,10 @@ was boxed).
 
 ## Owner review points
 
-1. SNI/Host relation: keep independent routing (current), require the
-   effective authority to be covered by the handshake's certificate, or
-   require it to equal the SNI; and whether a mismatch is `421` or `400`.
-2. Per-host listener binding (a host served only on HTTPS, or only on HTTP).
-3. Certificate validity dates at startup: ignore (current), warn, or refuse.
-4. Provider: aws-lc-rs (current, native build step, +2.37 MB) or ring.
-5. Whether the handshake counters should become part of a metrics surface.
+1. Cleartext exposure of HTTPS hosts: keep serving every host on the cleartext
+   listener (current), or let a host be HTTPS-only (refuse or redirect over
+   cleartext). This is product scope, not a correctness defect of TLS v1.
+2. Early responses to clients that keep sending (existing, not TLS): accept
+   the reset-instead-of-status behavior, or add a bounded lingering close (shut
+   down writes, drain for a short time and byte limit, then close), which holds
+   a connection slot slightly longer after such refusals.

@@ -234,7 +234,7 @@ async fn both_listeners_share_one_router_and_each_carries_its_own_trusted_scheme
 }
 
 #[tokio::test]
-async fn sni_selects_the_certificate_while_the_host_header_selects_the_virtual_host() {
+async fn sni_selects_the_certificate_and_a_host_it_does_not_cover_is_misdirected() {
     let pki = Pki::new("sni");
     let exact = pki.leaf("exact", &["a.test"]);
     let wildcard = pki.leaf("wildcard", &["*.b.test"]);
@@ -286,16 +286,25 @@ async fn sni_selects_the_certificate_while_the_host_header_selects_the_virtual_h
         .await
         .expect("the wildcard chain verifies");
 
-    // SNI chose the certificate; the effective authority still routes.
+    // The connection presented the a.test certificate, so it is not
+    // authoritative for x.b.test even though that host exists: 421, and the
+    // connection stays usable for a host it does cover.
     let (connector, _) = recording_client(true, &[]);
     let mut stream = connect(&connector, server.tls_address, "a.test")
         .await
         .expect("handshake as a.test");
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: x.b.test\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET / HTTP/1.1\r\nHost: x.b.test\r\n\r\n")
         .await
         .expect("request for another host");
-    assert_eq!(read_response(&mut stream).await.1, b"site b");
+    let (head, body) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 421 "), "{head}");
+    assert_eq!(body, b"Misdirected Request");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("request for the covered host");
+    assert_eq!(read_response(&mut stream).await.1, b"site a");
 
     assert_eq!(server.tls.handshakes_rejected(), 0);
     server.stop().await;
@@ -744,7 +753,7 @@ async fn a_flush_stalled_beneath_tls_times_out_instead_of_waiting_forever() {
         tls.handshake(server_io, Instant::now() + GUARD),
         connector.connect(name, client_io)
     );
-    let mut server = server.expect("server handshake");
+    let (mut server, _scope) = server.expect("server handshake");
     let _client = client.expect("client handshake");
 
     // The client never reads again. 40 KiB fits rustls's 64 KiB buffer but
@@ -761,4 +770,114 @@ async fn a_flush_stalled_beneath_tls_times_out_instead_of_waiting_forever() {
         flushed.expect_err("a stalled flush is an error").kind(),
         std::io::ErrorKind::TimedOut
     );
+}
+
+/// Status line and body of one request on a fresh connection that presented
+/// whatever certificate `sni` selects (`None` sends no SNI).
+async fn request_over(address: SocketAddr, sni: Option<&str>, request: &str) -> (String, Vec<u8>) {
+    let (connector, _) = recording_client(sni.is_some(), &[]);
+    let mut stream = connect(&connector, address, sni.unwrap_or("fallback.test"))
+        .await
+        .expect("handshake");
+    stream.write_all(request.as_bytes()).await.expect("request");
+    let (head, body) = read_response(&mut stream).await;
+    (head.lines().next().unwrap_or_default().to_owned(), body)
+}
+
+/// RFC 9110 sections 4.3.3 and 15.5.20: over TLS, Hamster serves a request
+/// only for a host the presented certificate's configured names cover. A
+/// certificate naming several hosts serves all of them; the default
+/// certificate serves only its own names; an IP name authorizes an IP Host;
+/// a configured virtual host that no certificate names is not reachable over
+/// TLS at all, but still over cleartext.
+#[tokio::test]
+async fn a_tls_connection_serves_only_the_hosts_its_certificate_names() {
+    let pki = Pki::new("scope");
+    let shared = pki.leaf("shared", &["a.test", "b.test"]);
+    let fallback = pki.leaf("fallback", &["fallback.test", "127.0.0.1"]);
+    let server = Server::start(
+        router(vec![
+            ("a.test", Handler::simple(StatusCode::OK, "site a")),
+            ("b.test", Handler::simple(StatusCode::OK, "site b")),
+            ("fallback.test", Handler::simple(StatusCode::OK, "fallback")),
+            ("127.0.0.1", Handler::simple(StatusCode::OK, "by address")),
+            (
+                "uncovered.test",
+                Handler::simple(StatusCode::OK, "uncovered"),
+            ),
+        ]),
+        limits(8),
+        true,
+        |address| {
+            tls_listener(
+                address,
+                Duration::from_secs(5),
+                vec![
+                    source(&shared, &["a.test", "b.test"], false),
+                    source(&fallback, &["fallback.test", "127.0.0.1"], true),
+                ],
+            )
+        },
+    )
+    .await;
+    let get = |host: &str| format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    for (sni, host, status, body) in [
+        (Some("a.test"), "b.test", "200", &b"site b"[..]),
+        (
+            Some("a.test"),
+            "fallback.test",
+            "421",
+            b"Misdirected Request",
+        ),
+        (
+            Some("a.test"),
+            "uncovered.test",
+            "421",
+            b"Misdirected Request",
+        ),
+        (
+            Some("a.test"),
+            "unknown.test",
+            "421",
+            b"Misdirected Request",
+        ),
+        (None, "127.0.0.1", "200", b"by address"),
+        (None, "a.test", "421", b"Misdirected Request"),
+        (Some("unknown.test"), "fallback.test", "200", b"fallback"),
+        (
+            Some("unknown.test"),
+            "b.test",
+            "421",
+            b"Misdirected Request",
+        ),
+    ] {
+        let (status_line, received) = request_over(server.tls_address, sni, &get(host)).await;
+        assert!(
+            status_line.starts_with(&format!("HTTP/1.1 {status} ")),
+            "sni={sni:?} host={host}: {status_line}"
+        );
+        assert_eq!(received, body, "sni={sni:?} host={host}");
+    }
+
+    // Absolute-form is judged by its target authority, not by Host.
+    let (status_line, _) = request_over(
+        server.tls_address,
+        Some("a.test"),
+        "GET https://fallback.test/ HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(status_line.starts_with("HTTP/1.1 421 "), "{status_line}");
+
+    // Cleartext has no certificate and keeps routing every configured host.
+    let mut clear = TcpStream::connect(server.cleartext.expect("cleartext listener"))
+        .await
+        .expect("connect cleartext");
+    clear
+        .write_all(get("uncovered.test").as_bytes())
+        .await
+        .expect("cleartext request");
+    assert_eq!(read_response(&mut clear).await.1, b"uncovered");
+
+    server.stop().await;
 }

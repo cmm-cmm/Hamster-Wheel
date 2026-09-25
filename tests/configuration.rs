@@ -796,7 +796,7 @@ fn compiles_a_tls_listener_with_or_without_a_cleartext_listener() {
     let tls = both.tls().expect("TLS listener");
     assert_eq!(tls.address(), "127.0.0.1:8443".parse().unwrap());
     assert_eq!(tls.handshake_timeout(), std::time::Duration::from_secs(7));
-    assert_eq!(tls.certificates(), 1);
+    assert_eq!(tls.certificates().len(), 1);
 
     let only = config::compile_str(&tls_config(None, "", &certificates), &directory.path)
         .expect("a TLS-only server should compile");
@@ -865,9 +865,14 @@ fn rejects_tls_configuration_that_cannot_be_served() {
             "names must contain at least one name",
         ),
         (
-            "an IP address name",
+            "an IP address name the certificate does not cover",
             tls_config(None, "", &site("[\"127.0.0.1\"]", "")),
-            "is an IP address",
+            "names 127.0.0.1 is not covered",
+        ),
+        (
+            "a wildcard over an IP address",
+            tls_config(None, "", &site("[\"*.127.0.0.1\"]", "")),
+            "is a wildcard over an IP address",
         ),
         (
             "a top-level wildcard",
@@ -982,4 +987,184 @@ fn rejects_tls_configuration_that_cannot_be_served() {
         let key_body = key_pem.lines().nth(1).expect("key body line");
         assert!(!message.contains(key_body), "{why} leaked key material");
     }
+}
+
+/// A CA (or intermediate) that signs `localhost` leaves, with explicit dates.
+struct DatedCa {
+    issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+}
+
+fn dated_ca_params(common_name: &str, not_before: i32, not_after: i32) -> rcgen::CertificateParams {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params.not_before = rcgen::date_time_ymd(not_before, 1, 1);
+    params.not_after = rcgen::date_time_ymd(not_after, 1, 1);
+    params
+}
+
+impl DatedCa {
+    fn root(common_name: &str, not_before: i32, not_after: i32) -> Self {
+        Self {
+            issuer: rcgen::CertifiedIssuer::self_signed(
+                dated_ca_params(common_name, not_before, not_after),
+                rcgen::KeyPair::generate().unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn intermediate(&self, common_name: &str, not_before: i32, not_after: i32) -> Self {
+        Self {
+            issuer: rcgen::CertifiedIssuer::signed_by(
+                dated_ca_params(common_name, not_before, not_after),
+                rcgen::KeyPair::generate().unwrap(),
+                &self.issuer,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Writes `<file>.key` and returns the leaf PEM for `localhost`.
+    fn leaf(&self, directory: &Path, file: &str, not_before: i32, not_after: i32) -> String {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(not_before, 1, 1);
+        params.not_after = rcgen::date_time_ymd(not_after, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &self.issuer).unwrap();
+        std::fs::write(directory.join(format!("{file}.key")), key.serialize_pem()).unwrap();
+        certificate.pem()
+    }
+
+    fn pem(&self) -> String {
+        self.issuer.pem()
+    }
+}
+
+/// Writes `<file>.crt` from `chain` and compiles a TLS-only config using it
+/// and `<file>.key`.
+fn compile_tls(
+    directory: &Path,
+    file: &str,
+    chain: &[String],
+) -> Result<config::RuntimeConfig, String> {
+    std::fs::write(directory.join(format!("{file}.crt")), chain.concat()).unwrap();
+    let source = tls_config(None, "", &certificate_table(file, "[\"localhost\"]", ""));
+    config::compile_str(&source, directory).map_err(|error| match error {
+        ConfigError::Compile(message) | ConfigError::Validation(message) => message,
+        other => panic!("unexpected error kind: {other}"),
+    })
+}
+
+#[test]
+fn a_certificate_outside_its_validity_period_fails_startup() {
+    let directory = TestDirectory::new();
+    let base = directory.path.as_path();
+    let ca = DatedCa::root("Hamster Dated CA", 2000, 2090);
+
+    let expired = ca.leaf(base, "expired", 2010, 2011);
+    let message = compile_tls(base, "expired", &[expired, ca.pem()])
+        .err()
+        .expect("must not compile");
+    assert!(
+        message.contains("the leaf certificate expired on 2011-01-01 00:00:00 UTC"),
+        "{message}"
+    );
+
+    let future = ca.leaf(base, "future", 2080, 2085);
+    let message = compile_tls(base, "future", &[future, ca.pem()])
+        .err()
+        .expect("must not compile");
+    assert!(
+        message.contains("the leaf certificate is not valid until 2080-01-01 00:00:00 UTC"),
+        "{message}"
+    );
+
+    // A self-signed leaf alone is judged by its own dates too.
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    params.not_before = rcgen::date_time_ymd(2011, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2012, 1, 1);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let self_signed = params.self_signed(&key).unwrap();
+    std::fs::write(base.join("selfsigned.key"), key.serialize_pem()).unwrap();
+    let message = compile_tls(base, "selfsigned", &[self_signed.pem()])
+        .err()
+        .expect("must not compile");
+    assert!(message.contains("expired on 2012-01-01"), "{message}");
+
+    // An expired intermediate fails even though the leaf is current.
+    let stale = ca.intermediate("Hamster Stale Intermediate", 2000, 2012);
+    let leaf = stale.leaf(base, "stale", 2001, 2090);
+    let message = compile_tls(base, "stale", &[leaf, stale.pem(), ca.pem()])
+        .err()
+        .expect("must not compile");
+    assert!(
+        message.contains("chain certificate 2 expired on 2012-01-01"),
+        "{message}"
+    );
+
+    // A trailing self-signed root is not date-checked: clients use their
+    // own copy of a root, so a bundled expired one decides nothing.
+    let old_root = DatedCa::root("Hamster Old Root", 2000, 2012);
+    let intermediate = old_root.intermediate("Hamster Current Intermediate", 2000, 2090);
+    let leaf = intermediate.leaf(base, "oldroot", 2001, 2090);
+    compile_tls(base, "oldroot", &[leaf, intermediate.pem(), old_root.pem()])
+        .expect("an expired trailing root is not the server's to judge");
+}
+
+#[test]
+fn a_chain_that_does_not_link_fails_startup_and_a_bare_leaf_is_reported() {
+    let directory = TestDirectory::new();
+    let base = directory.path.as_path();
+    let ca = DatedCa::root("Hamster Chain CA", 2000, 2090);
+    let other = DatedCa::root("Hamster Other CA", 2000, 2090);
+    let intermediate = ca.intermediate("Hamster Intermediate", 2000, 2090);
+    let leaf = intermediate.leaf(base, "linked", 2001, 2090);
+    for file in ["noroot", "wrong", "gap", "bare"] {
+        std::fs::copy(base.join("linked.key"), base.join(format!("{file}.key"))).unwrap();
+    }
+
+    // Linked: leaf, intermediate, root; and the usual form without the root.
+    let runtime = compile_tls(
+        base,
+        "linked",
+        &[leaf.clone(), intermediate.pem(), ca.pem()],
+    )
+    .expect("a linked chain compiles");
+    let report = &runtime.tls().unwrap().certificates()[0];
+    assert!(report.note.is_none());
+    assert_eq!(report.not_after, "2090-01-01 00:00:00 UTC");
+    assert!(report.days_left > 20_000, "{}", report.days_left);
+    compile_tls(base, "noroot", &[leaf.clone(), intermediate.pem()]).expect("root omitted");
+
+    // An unrelated issuer after the leaf.
+    let message = compile_tls(base, "wrong", &[leaf.clone(), other.pem()])
+        .err()
+        .expect("must not compile");
+    assert!(
+        message.contains("the chain does not link the leaf to the last certificate"),
+        "{message}"
+    );
+
+    // The intermediate missing between leaf and root.
+    let message = compile_tls(base, "gap", &[leaf.clone(), ca.pem()])
+        .err()
+        .expect("must not compile");
+    assert!(message.contains("does not link"), "{message}");
+
+    // A leaf alone whose issuer is not in the file: whether clients hold
+    // that issuer is theirs to know, so the server starts and says so.
+    let runtime = compile_tls(base, "bare", &[leaf]).expect("a bare leaf still compiles");
+    let note = runtime.tls().unwrap().certificates()[0]
+        .note
+        .expect("a bare leaf is reported");
+    assert!(note.contains("only the leaf"), "{note}");
+
+    // A self-signed leaf alone has no missing issuer.
+    write_certificate(base, "self", &["localhost"]);
+    let source = tls_config(None, "", &certificate_table("self", "[\"localhost\"]", ""));
+    let runtime = config::compile_str(&source, base).expect("self-signed");
+    assert!(runtime.tls().unwrap().certificates()[0].note.is_none());
 }

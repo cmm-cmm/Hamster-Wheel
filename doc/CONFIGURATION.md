@@ -109,7 +109,7 @@ handshake_timeout = 10        # seconds, 1-60, total from accept
 [[server.tls.certificates]]
 cert = "certs/site-chain.pem" # leaf first, then intermediates
 key = "certs/site-key.pem"    # unencrypted PKCS#8, PKCS#1 or SEC1
-names = ["example.com", "*.example.net"]
+names = ["example.com", "*.example.net"]  # SNI names and the hosts it serves
 default = true                # at most one; used for no or unknown SNI
 ```
 
@@ -120,24 +120,34 @@ connection that has not finished its handshake occupies a connection slot, and
 `handshake_timeout` is a total deadline from accept, not an inactivity timer.
 The two listen addresses must not overlap.
 
-`names` are the SNI names that select a certificate: exact DNS names or `*.`
-plus a parent domain, matching exactly one extra label. Exact names win over
-wildcards; a name may appear only once across all certificates; IP addresses
-are rejected because clients never send them as SNI. Every configured name is
-checked against the leaf's subject alternative names while the configuration
-compiles, so a certificate that does not cover a name it claims fails startup
-instead of every handshake. A handshake with no SNI, or an SNI nothing matches,
-uses the `default = true` certificate, and fails when there is none. SNI only
-selects the certificate: the request's effective HTTP authority still selects
-the virtual host, exactly as on the cleartext listener.
+`names` are exact DNS names, `*.` plus a parent domain matching exactly one
+extra label, or IP addresses. DNS names select the certificate by SNI (exact
+names win over wildcards); every name is also a host that a connection which
+presented this certificate may be served for. An IP name cannot be selected by
+SNI, which never carries an address, and only authorizes a `Host` that is that
+address, so it belongs on the default certificate. A name may appear only once
+across all certificates. Every configured name is checked against the leaf's
+subject alternative names while the configuration compiles, so a certificate
+that does not cover a name it claims fails startup instead of every handshake.
+A handshake with no SNI, or an SNI nothing matches, uses the `default = true`
+certificate, and fails when there is none.
+
+Over TLS, the request's effective HTTP authority still selects the virtual
+host, but only among the hosts the presented certificate's `names` cover; any
+other authority, including a configured host that no certificate names, is
+answered `421 Misdirected Request` (RFC 9110). The cleartext listener is
+unaffected.
 
 Certificate and key paths resolve against the configuration file's directory.
 Files are read and checked once, before any worker starts or socket binds:
 unreadable files, PEM without a certificate, an unreadable, unsupported or
-encrypted key, and a key that does not match the leaf are `Compile` errors
-naming the field and path. Key contents never appear in a diagnostic.
-Certificate validity dates and the completeness of the chain are **not**
-checked; see `doc/TLS_V1.md`. TLS 1.2 and 1.3 use rustls's defaults with the
+encrypted key, a key that does not match the leaf, a leaf or intermediate that
+is expired or not yet valid, and a chain whose certificates do not link from
+the leaf to the last one in the file are `Compile` errors naming the field and
+path. Key contents never appear in a diagnostic. A file holding only a leaf
+whose issuer is not included starts with a printed note, because only clients
+know which issuers they trust; startup also prints each certificate's expiry
+date, since certificates are not reloaded. TLS 1.2 and 1.3 use rustls's defaults with the
 aws-lc-rs provider, and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md`
 for the full semantics.
 
@@ -416,7 +426,8 @@ invalid explicit files never fall back to the built-in configuration.
 Configuration fails fast for an invalid or overlapping listen address, no
 listener at all, or an HTTP bound out of range; invalid TLS names, duplicate
 names, more than one default certificate, TLS files that cannot be read or used
-together, and names the certificate does not cover; empty or invalid host
+together, names the certificate does not cover, certificates outside their
+validity dates and chains that do not link; empty or invalid host
 names; case-insensitive primary/alias collisions; absent hosts or locations;
 invalid or duplicate normalized location paths; unknown handlers; missing or
 unexpected handler fields; invalid pool bounds; static roots that cannot be

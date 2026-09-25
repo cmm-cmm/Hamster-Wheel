@@ -28,11 +28,13 @@ hostname comparison is case-insensitive. Explicit port-based virtual hosts,
 wildcards, bracketed IPv6 literal authorities, authority-form and asterisk-form
 routing are intentionally unsupported.
 
-On the TLS listener, SNI selects only the certificate. Routing is unchanged:
-the effective HTTP authority above selects the virtual host, every host is
-reachable on both listeners, and a request whose Host differs from the SNI it
-completed the handshake with is routed by its Host. Whether that relation
-should be restricted is an open Owner decision; see `doc/TLS_V1.md`.
+On the TLS listener, SNI selects the certificate and the certificate limits
+the authorities a connection may be served for. After the authority is
+validated (malformed stays `400`) and before virtual-host lookup, an authority
+the presented certificate's configured `names` do not cover is answered
+`421 Misdirected Request` (RFC 9110 sections 4.3.3 and 15.5.20), whether or not
+that host is configured; within the scope, routing is exactly as above. The
+cleartext listener passes no scope and is unchanged. See `doc/TLS_V1.md`.
 
 A vector avoids allocating a lowercase hostname on every request. It is the
 simplest representation for the two hard-coded milestone hosts; a different
