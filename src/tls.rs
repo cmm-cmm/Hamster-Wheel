@@ -2,7 +2,8 @@
 //!
 //! TLS is a property of a listener, not of a handler. Everything here happens
 //! before HTTP exists on a connection: certificates are loaded and checked
-//! while configuration compiles, and an accepted socket either completes a
+//! while configuration compiles or a replacement set reloads. An accepted
+//! socket either completes a
 //! handshake inside its deadline or is dropped without an HTTP response. After
 //! the handshake the connection enters the same HTTP serving path as
 //! cleartext, carrying only a trusted `Scheme::Https`; no handler sees a
@@ -20,13 +21,16 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::Mutex,
+};
 use tokio_rustls::{
     TlsAcceptor,
     rustls::{
@@ -189,6 +193,7 @@ impl CertificateScope {
 }
 
 /// One validated certificate entry. Nothing has been read from disk yet.
+#[derive(Clone)]
 pub(crate) struct CertificateSource {
     pub(crate) field: String,
     pub(crate) cert: PathBuf,
@@ -204,21 +209,28 @@ pub(crate) struct TlsSource {
     pub(crate) certificates: Vec<CertificateSource>,
 }
 
-/// A compiled HTTPS listener: address, immutable rustls configuration and the
-/// handshake deadline. Built once at startup and shared by every connection.
+/// A compiled HTTPS listener with one atomically replaced certificate set.
 pub struct TlsListener {
     address: SocketAddr,
-    acceptor: TlsAcceptor,
-    /// The same resolver rustls holds, kept to recover which certificate a
-    /// completed handshake presented.
-    resolver: Arc<CertificateResolver>,
+    source: Box<[CertificateSource]>,
+    provider: Arc<CryptoProvider>,
+    current: RwLock<Arc<CertificateSet>>,
+    reload_gate: Mutex<()>,
     handshake_timeout: Duration,
-    certificates: Vec<CertificateReport>,
     stats: HandshakeStats,
+    #[cfg(test)]
+    handshakes_started: AtomicU64,
+}
+
+/// One generation of keys, SNI selection, Host scopes and rustls settings.
+struct CertificateSet {
+    acceptor: TlsAcceptor,
+    resolver: Arc<CertificateResolver>,
+    reports: Arc<[CertificateReport]>,
 }
 
 /// What startup prints about one certificate entry.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CertificateReport {
     pub field: String,
     pub names: String,
@@ -235,7 +247,7 @@ impl fmt::Debug for TlsListener {
             .debug_struct("TlsListener")
             .field("address", &self.address)
             .field("handshake_timeout", &self.handshake_timeout)
-            .field("certificates", &self.certificates.len())
+            .field("certificates", &self.certificates().len())
             .finish_non_exhaustive()
     }
 }
@@ -248,50 +260,40 @@ impl TlsListener {
     /// setup. Errors name the configuration field and path, never key bytes.
     pub(crate) fn compile(source: TlsSource) -> Result<Self, String> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let now = unix_now();
-        let mut resolver = CertificateResolver::default();
-        let mut reports = Vec::with_capacity(source.certificates.len());
-        for certificate in &source.certificates {
-            let (key, report) = load_certified_key(certificate, &provider, now)?;
-            let entry = Arc::new(Entry {
-                key,
-                scope: Arc::new(CertificateScope::new(&certificate.names)),
-            });
-            for name in &certificate.names {
-                let (table, lookup) = match name {
-                    TlsName::Exact(name) => (&mut resolver.exact, name),
-                    TlsName::Wildcard(parent) => (&mut resolver.wildcard, parent),
-                    TlsName::Address(_) => continue,
-                };
-                // Validation already rejected duplicates; this keeps the
-                // resolver honest if that ever changes.
-                if table.insert(lookup.clone(), Arc::clone(&entry)).is_some() {
-                    return Err(format!(
-                        "{}.names {name} is configured twice",
-                        certificate.field
-                    ));
-                }
-            }
-            if certificate.default {
-                resolver.default = Some(entry);
-            }
-            reports.push(report);
-        }
-        let resolver = Arc::new(resolver);
-        let mut config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|error| format!("server.tls: {error}"))?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
-        config.alpn_protocols = vec![HTTP_1_1.to_vec()];
+        let current = compile_set(&source.certificates, Arc::clone(&provider))?;
         Ok(Self {
             address: source.listen,
-            acceptor: TlsAcceptor::from(Arc::new(config)),
-            resolver,
+            source: source.certificates.into_boxed_slice(),
+            provider,
+            current: RwLock::new(Arc::new(current)),
+            reload_gate: Mutex::new(()),
             handshake_timeout: source.handshake_timeout,
-            certificates: reports,
             stats: HandshakeStats::new(),
+            #[cfg(test)]
+            handshakes_started: AtomicU64::new(0),
         })
+    }
+
+    /// Re-read only configured certificate and key paths. Compilation occurs
+    /// outside the snapshot lock; failure leaves the serving set untouched.
+    pub async fn reload_certificates(&self) -> Result<Arc<[CertificateReport]>, String> {
+        let _gate = self.reload_gate.lock().await;
+        let source = self.source.to_vec();
+        let provider = Arc::clone(&self.provider);
+        let replacement = tokio::task::spawn_blocking(move || compile_set(&source, provider))
+            .await
+            .map_err(|error| format!("TLS certificate reload task failed: {error}"))??;
+        let reports = Arc::clone(&replacement.reports);
+        let previous = {
+            let mut current = self.current.write().expect("TLS snapshot lock");
+            std::mem::replace(&mut *current, Arc::new(replacement))
+        };
+        drop(previous);
+        Ok(reports)
+    }
+
+    fn snapshot(&self) -> Arc<CertificateSet> {
+        Arc::clone(&self.current.read().expect("TLS snapshot lock"))
     }
 
     pub const fn address(&self) -> SocketAddr {
@@ -302,18 +304,13 @@ impl TlsListener {
         self.handshake_timeout
     }
 
-    pub fn certificates(&self) -> &[CertificateReport] {
-        &self.certificates
+    pub fn certificates(&self) -> Arc<[CertificateReport]> {
+        Arc::clone(&self.snapshot().reports)
     }
 
-    /// The scope of the certificate a completed handshake presented, found
-    /// with the same lookup rustls used to choose it. `None` only if no
-    /// certificate could have been chosen, which a completed handshake rules
-    /// out; the caller then drops the connection.
-    pub(crate) fn scope_for(&self, server_name: Option<&str>) -> Option<Arc<CertificateScope>> {
-        self.resolver
-            .select(server_name)
-            .map(|entry| Arc::clone(&entry.scope))
+    #[cfg(test)]
+    pub(crate) fn handshakes_started(&self) -> u64 {
+        self.handshakes_started.load(Ordering::Relaxed)
     }
 
     /// Handshakes that did not finish before the total deadline, or whose
@@ -334,12 +331,7 @@ impl TlsListener {
         self.stats.abandoned.load(Ordering::Relaxed)
     }
 
-    /// Runs one handshake to completion or to `deadline`, whichever is first.
-    ///
-    /// The deadline is total, not an inactivity timer: a peer that trickles
-    /// one byte at a time cannot keep a handshake, and its admission slot,
-    /// alive. The caller owns cancellation for shutdown; dropping this future
-    /// drops the socket and all rustls state, and no task is left behind.
+    /// Each handshake holds one generation until its scope has been selected.
     pub(crate) async fn handshake<IO>(
         &self,
         io: IO,
@@ -348,9 +340,15 @@ impl TlsListener {
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        match tokio::time::timeout_at(deadline, self.acceptor.accept(io)).await {
+        let snapshot = self.snapshot();
+        #[cfg(test)]
+        self.handshakes_started.fetch_add(1, Ordering::Relaxed);
+        match tokio::time::timeout_at(deadline, snapshot.acceptor.accept(io)).await {
             Ok(Ok(stream)) => {
-                let scope = self.scope_for(stream.get_ref().1.server_name())?;
+                let scope = snapshot
+                    .resolver
+                    .select(stream.get_ref().1.server_name())
+                    .map(|entry| Arc::clone(&entry.scope))?;
                 Some((stream, scope))
             }
             Ok(Err(error)) => {
@@ -364,6 +362,53 @@ impl TlsListener {
             }
         }
     }
+}
+
+fn compile_set(
+    certificates: &[CertificateSource],
+    provider: Arc<CryptoProvider>,
+) -> Result<CertificateSet, String> {
+    let now = unix_now();
+    let mut resolver = CertificateResolver::default();
+    let mut reports = Vec::with_capacity(certificates.len());
+    for certificate in certificates {
+        let (key, report) = load_certified_key(certificate, &provider, now)?;
+        let entry = Arc::new(Entry {
+            key,
+            scope: Arc::new(CertificateScope::new(&certificate.names)),
+        });
+        for name in &certificate.names {
+            let (table, lookup) = match name {
+                TlsName::Exact(name) => (&mut resolver.exact, name),
+                TlsName::Wildcard(parent) => (&mut resolver.wildcard, parent),
+                TlsName::Address(_) => continue,
+            };
+            // Validation already rejected duplicates; this keeps the
+            // resolver honest if that ever changes.
+            if table.insert(lookup.clone(), Arc::clone(&entry)).is_some() {
+                return Err(format!(
+                    "{}.names {name} is configured twice",
+                    certificate.field
+                ));
+            }
+        }
+        if certificate.default {
+            resolver.default = Some(entry);
+        }
+        reports.push(report);
+    }
+    let resolver = Arc::new(resolver);
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("server.tls: {error}"))?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
+    config.alpn_protocols = vec![HTTP_1_1.to_vec()];
+    Ok(CertificateSet {
+        acceptor: TlsAcceptor::from(Arc::new(config)),
+        resolver,
+        reports: reports.into(),
+    })
 }
 
 fn unix_now() -> i64 {
@@ -422,6 +467,8 @@ fn load_certified_key(
         .map_err(|error| {
             format!("{field}.cert {cert_path}: leaf certificate cannot be parsed: {error}")
         })?;
+    x509::check_leaf_server_auth(&certified.cert[0])
+        .map_err(|error| format!("{field}.cert {cert_path}: {error}"))?;
     for name in &source.names {
         let probe = name.probe();
         let covered = ServerName::try_from(probe.as_str())
@@ -474,9 +521,11 @@ fn load_certified_key(
     }
     let mut note = None;
     if last > 0 {
-        // Treat the last certificate in the file as the anchor: this proves
-        // each signature, CA flag, path length and usage from the leaf up to
-        // it, without asserting anything about who trusts that anchor.
+        x509::check_issuer_ca(&certified.cert[last])
+            .map_err(|error| format!("{field}.cert {cert_path}: {error}"))?;
+        // Treat the last certificate in the file as the anchor: webpki checks
+        // signatures and the constraints below it. Its own CA bit was checked
+        // above because webpki does not apply intermediate rules to anchors.
         let mut anchor = RootCertStore::empty();
         anchor
             .add(certified.cert[last].clone())

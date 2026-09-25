@@ -4,6 +4,7 @@
 //! socket write deadline beneath TLS, graceful drain, and close_notify.
 
 use std::{
+    io::Cursor,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -18,6 +19,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
+use tokio_rustls::rustls::{ClientConnection, pki_types::ServerName};
 
 use super::{Listener, serve_listeners};
 use crate::{
@@ -112,6 +114,25 @@ fn router(hosts: Vec<(&str, Handler)>) -> HostRouter {
             .collect(),
     )
     .expect("valid router")
+}
+
+fn replace_certificate(
+    target: &crate::tls::test_support::Leaf,
+    replacement: &crate::tls::test_support::Leaf,
+) {
+    std::fs::copy(&replacement.cert, &target.cert).expect("replace certificate file");
+    std::fs::copy(&replacement.key, &target.key).expect("replace key file");
+}
+
+async fn presented_certificate(
+    address: SocketAddr,
+    name: &str,
+) -> tokio_rustls::rustls::pki_types::CertificateDer<'static> {
+    let (connector, seen) = recording_client(true, &[]);
+    let _stream = connect(&connector, address, name)
+        .await
+        .expect("new TLS handshake");
+    seen.lock().unwrap().clone().expect("presented certificate")
 }
 
 async fn wait_until(what: &str, condition: impl Fn() -> bool) {
@@ -879,5 +900,258 @@ async fn a_tls_connection_serves_only_the_hosts_its_certificate_names() {
         .expect("cleartext request");
     assert_eq!(read_response(&mut clear).await.1, b"uncovered");
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn successful_reload_keeps_old_tls_and_cleartext_connections_serving() {
+    let pki = Pki::new("reload-keepalive");
+    let old = pki.leaf("old", &["localhost"]);
+    let new = pki.leaf("new", &["localhost"]);
+    let server = Server::start(
+        router(vec![(
+            "localhost",
+            Handler::simple(StatusCode::OK, "alive"),
+        )]),
+        limits(8),
+        true,
+        |address| {
+            tls_listener(
+                address,
+                Duration::from_secs(5),
+                vec![source(&old, &["localhost"], true)],
+            )
+        },
+    )
+    .await;
+
+    let mut old_connection = connect(&pki.client(&[HTTP_1_1]), server.tls_address, "localhost")
+        .await
+        .expect("old handshake");
+    assert_eq!(
+        old_connection.get_ref().1.peer_certificates().unwrap()[0],
+        old.der
+    );
+    old_connection
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut old_connection).await.1, b"alive");
+
+    replace_certificate(&old, &new);
+    server
+        .tls
+        .reload_certificates()
+        .await
+        .expect("valid reload");
+    assert_eq!(
+        presented_certificate(server.tls_address, "localhost").await,
+        new.der
+    );
+    connect(&pki.client(&[HTTP_1_1]), server.tls_address, "localhost")
+        .await
+        .expect("verifying client accepts new certificate");
+
+    old_connection
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut old_connection).await.1, b"alive");
+    assert_eq!(
+        old_connection.get_ref().1.peer_certificates().unwrap()[0],
+        old.der
+    );
+
+    let mut clear = TcpStream::connect(server.cleartext.unwrap()).await.unwrap();
+    clear
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut clear).await.1, b"alive");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reload_is_all_or_nothing_across_sni_entries_and_successive_generations() {
+    let pki = Pki::new("reload-multiple");
+    let a1 = pki.leaf("a1", &["a.test"]);
+    let b1 = pki.leaf("b1", &["b.test"]);
+    let a2 = pki.leaf("a2", &["a.test"]);
+    let b2 = pki.leaf("b2", &["b.test"]);
+    let a3 = pki.leaf("a3", &["a.test"]);
+    let b3 = pki.leaf("b3", &["b.test"]);
+    let wrong_name = pki.leaf("wrong-name", &["wrong.test"]);
+    let server = Server::start(
+        router(vec![
+            ("a.test", Handler::simple(StatusCode::OK, "a")),
+            ("b.test", Handler::simple(StatusCode::OK, "b")),
+        ]),
+        limits(8),
+        false,
+        |address| {
+            tls_listener(
+                address,
+                Duration::from_secs(5),
+                vec![
+                    source(&a1, &["a.test"], false),
+                    source(&b1, &["b.test"], true),
+                ],
+            )
+        },
+    )
+    .await;
+    let mut old_a = connect(&pki.client(&[HTTP_1_1]), server.tls_address, "a.test")
+        .await
+        .unwrap();
+
+    replace_certificate(&a1, &a2);
+    std::fs::copy(&b2.cert, &b1.cert).unwrap();
+    let error = server
+        .tls
+        .reload_certificates()
+        .await
+        .expect_err("mismatched B key fails entire set");
+    assert!(error.contains("cannot be used together"), "{error}");
+    assert_eq!(
+        presented_certificate(server.tls_address, "a.test").await,
+        a1.der
+    );
+    assert_eq!(
+        presented_certificate(server.tls_address, "b.test").await,
+        b1.der
+    );
+
+    std::fs::copy(&b2.key, &b1.key).unwrap();
+    server
+        .tls
+        .reload_certificates()
+        .await
+        .expect("both replacements valid");
+    assert_eq!(
+        presented_certificate(server.tls_address, "a.test").await,
+        a2.der
+    );
+    assert_eq!(
+        presented_certificate(server.tls_address, "b.test").await,
+        b2.der
+    );
+    let (no_sni, seen) = recording_client(false, &[]);
+    connect(&no_sni, server.tls_address, "b.test")
+        .await
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().as_ref(), Some(&b2.der));
+
+    // Old connections retain their original authority scope after the swap.
+    old_a
+        .write_all(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        read_response(&mut old_a)
+            .await
+            .0
+            .starts_with("HTTP/1.1 421 ")
+    );
+    old_a
+        .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut old_a).await.1, b"a");
+
+    replace_certificate(&a1, &wrong_name);
+    let error = server
+        .tls
+        .reload_certificates()
+        .await
+        .expect_err("SAN mismatch fails reload");
+    assert!(error.contains("is not covered"), "{error}");
+    assert_eq!(
+        presented_certificate(server.tls_address, "a.test").await,
+        a2.der
+    );
+    assert_eq!(
+        presented_certificate(server.tls_address, "b.test").await,
+        b2.der
+    );
+
+    replace_certificate(&a1, &a3);
+    replace_certificate(&b1, &b3);
+    server
+        .tls
+        .reload_certificates()
+        .await
+        .expect("second valid reload");
+    assert_eq!(
+        presented_certificate(server.tls_address, "a.test").await,
+        a3.der
+    );
+    assert_eq!(
+        presented_certificate(server.tls_address, "b.test").await,
+        b3.der
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_handshake_in_progress_finishes_with_its_original_certificate_set() {
+    let pki = Pki::new("reload-inflight");
+    let old = pki.leaf("old", &["localhost"]);
+    let new = pki.leaf("new", &["localhost"]);
+    let server = Server::start(
+        router(vec![("localhost", Handler::simple(StatusCode::OK, "ok"))]),
+        limits(8),
+        false,
+        |address| {
+            tls_listener(
+                address,
+                Duration::from_secs(5),
+                vec![source(&old, &["localhost"], true)],
+            )
+        },
+    )
+    .await;
+
+    let config = pki.client(&[HTTP_1_1]);
+    let mut client = ClientConnection::new(
+        Arc::clone(config.config()),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    let mut socket = TcpStream::connect(server.tls_address).await.unwrap();
+    socket.write_all(&hello[..5]).await.unwrap();
+    wait_until("server captured the old handshake snapshot", || {
+        server.tls.handshakes_started() == 1
+    })
+    .await;
+
+    replace_certificate(&old, &new);
+    server
+        .tls
+        .reload_certificates()
+        .await
+        .expect("reload while handshake waits for ClientHello");
+    socket.write_all(&hello[5..]).await.unwrap();
+    while client.is_handshaking() {
+        let mut bytes = [0_u8; 8_192];
+        let count = timeout(GUARD, socket.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(count, 0, "server closed in-flight handshake");
+        client.read_tls(&mut Cursor::new(&bytes[..count])).unwrap();
+        client.process_new_packets().unwrap();
+        if client.wants_write() {
+            let mut reply = Vec::new();
+            client.write_tls(&mut reply).unwrap();
+            socket.write_all(&reply).await.unwrap();
+        }
+    }
+    assert_eq!(client.peer_certificates().unwrap()[0], old.der);
+    assert_eq!(
+        presented_certificate(server.tls_address, "localhost").await,
+        new.der
+    );
     server.stop().await;
 }

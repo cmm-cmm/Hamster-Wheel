@@ -1,12 +1,45 @@
 # AI Handoff
 
-## Current Working Scope — TLS v1 (implemented, in review)
+## Current Working Scope — Transactional certificate reload
+
+After the TLS v1 Windows review, the next capability is implemented in the
+working tree. `TlsListener` loads and verifies an entire replacement set before
+one atomic `Arc<CertificateSet>` swap. Handshakes hold one set from before the
+ClientHello through Host scope selection; established connections retain their
+old stream and scope. Invalid key or SAN in any SNI entry leaves the entire
+prior set serving. Windows Ctrl+Break and Linux SIGHUP trigger certificate-only
+reload from the configured paths; Ctrl+C/SIGINT remain shutdown. No full
+configuration reload or TOML change was added. See
+`doc/TLS_CERTIFICATE_RELOAD.md` for the operator contract and evidence.
+
+Windows socket regressions for success, rollback, in-progress handshakes,
+keep-alive, cleartext, SNI/default selection and successive generations pass.
+The Windows process-level trigger is now verified: a `CREATE_NEW_CONSOLE`
+server child received `CTRL_BREAK_EVENT` from an attached helper; stdout
+reported success, a new handshake showed the replacement leaf, and a prior
+TLS keep-alive connection continued serving. Subsequent events with a bad key
+and malformed certificate logged field/file-specific failures, left the
+process running, and preserved the last good leaf for new handshakes. The
+first attempt exposed a test-helper mistake (`SetConsoleCtrlHandler(None, 1)`
+does not ignore Ctrl+Break), fixed with an explicit handler. No production
+reload code changed in this operational pass. Details and command are in
+`doc/TLS_CERTIFICATE_RELOAD.md`. The process test is ignored by default because
+it creates a child console; its explicit run passed. Linux SIGHUP remains
+unverified.
+Native Linux remains NOT VERIFIED: only the MSVC Rust target is installed;
+`docker-desktop` WSL has no Cargo and its Docker daemon is unavailable. Windows
+format, default tests (144 library passed, 9 ignored; 30 configuration passed),
+strict Clippy, MSVC release build, profiling bench link and the ignored PHP
+listener-scheme regression passed. No benchmark was run. No
+commit, tag, push, merge or release was performed. `ssl/` remains untouched.
+
+## Recorded Checkpoint — TLS v1 (Windows technical review)
 
 The Owner recorded the Reverse Proxy v1 checkpoint and, after the TLS
 architecture investigation (`doc/research/TLS_ARCHITECTURE_INVESTIGATION.md`),
-moved TLS v1 to implementation on 2026-09-25. It is implemented in the
-uncommitted working tree on top of the Reverse Proxy v1 working tree. Not
-committed, tagged, released or accepted; the Owner decides. Authoritative
+moved TLS v1 to implementation on 2026-09-25. The current committed baseline
+is `ed5845b`; the final EKU fix and this handoff update are uncommitted. No
+tag, push, merge or release was performed in the final review. Authoritative
 record: `doc/TLS_V1.md`; measurements:
 `benchmarks/results/tls_v1_20260925.md`.
 
@@ -37,6 +70,29 @@ printed. The intermittent test failures were identified as pre-existing
 Windows reset/flush races (reproduced on `a7a31b4`), not TLS regressions; the
 two affected tests now assert only guaranteed behavior. Details and evidence
 in `doc/TLS_V1.md`.
+
+Final technical review: the Owner keeps cleartext routing for every host and
+the existing early-refusal close behavior. There is no per-host HTTPS-only
+policy or redirect in TLS v1. A client that keeps sending after an early
+refusal may see a reset; lingering close waits for real-client evidence.
+Source review corrected an EKU mistake: a bare leaf's EKU is readable even
+without its issuer. Startup now rejects a leaf with client-auth-only EKU for
+both bare and bundled certificates; absent EKU and serverAuth remain valid.
+A bare leaf still cannot have its signature or full chain verified without
+the issuer. Review also found that webpki exempts the last bundled certificate
+from intermediate CA rules when it is used as the verification anchor. Startup
+now checks that this final issuer is a CA. Regressions cover both defects.
+
+Final readiness on Windows: format check, default tests (141 library passed,
+9 ignored; 30 configuration passed), strict Clippy, MSVC release build and profiling bench
+link passed. The ignored PHP listener-scheme regression passed with local PHP.
+The scratch PMS variable was unset, so the ignored real Laravel TLS test was
+not rerun; its earlier Windows pass remains recorded in `doc/TLS_V1.md`.
+Native Linux is still unverified because only the MSVC target is installed.
+No new benchmark was run: the EKU check is startup-only. No TLS v1 blocker was
+found after the fix. The next capability should be transactional certificate
+reload, with native Linux bring-up as an explicit qualification gate; do not
+infer that reload or Linux support is part of TLS v1.
 
 Known limits kept out of v1: no ACME, reload, OCSP, mTLS, upstream TLS,
 HTTP/2/3, redirect/HSTS, HTTPS-only hosts on a server that also listens in

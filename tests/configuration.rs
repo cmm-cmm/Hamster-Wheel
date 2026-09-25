@@ -1168,3 +1168,85 @@ fn a_chain_that_does_not_link_fails_startup_and_a_bare_leaf_is_reported() {
     let runtime = config::compile_str(&source, base).expect("self-signed");
     assert!(runtime.tls().unwrap().certificates()[0].note.is_none());
 }
+
+#[test]
+fn a_bare_leaf_with_client_auth_only_eku_fails_startup() {
+    use rcgen::ExtendedKeyUsagePurpose;
+
+    let directory = TestDirectory::new();
+    let base = directory.path.as_path();
+    let ca = DatedCa::root("Hamster EKU CA", 2000, 2090);
+    for (file, usages, bundled, accepted) in [
+        (
+            "client",
+            vec![ExtendedKeyUsagePurpose::ClientAuth],
+            false,
+            false,
+        ),
+        (
+            "client-chain",
+            vec![ExtendedKeyUsagePurpose::ClientAuth],
+            true,
+            false,
+        ),
+        (
+            "server",
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+            false,
+            true,
+        ),
+        (
+            "both",
+            vec![
+                ExtendedKeyUsagePurpose::ClientAuth,
+                ExtendedKeyUsagePurpose::ServerAuth,
+            ],
+            false,
+            true,
+        ),
+        ("absent", vec![], false, true),
+    ] {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2090, 1, 1);
+        params.extended_key_usages = usages;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &ca.issuer).unwrap();
+        std::fs::write(base.join(format!("{file}.key")), key.serialize_pem()).unwrap();
+        let chain = if bundled {
+            vec![cert.pem(), ca.pem()]
+        } else {
+            vec![cert.pem()]
+        };
+        let result = compile_tls(base, file, &chain);
+        if accepted {
+            let runtime = result.expect(file);
+            assert!(runtime.tls().unwrap().certificates()[0].note.is_some());
+        } else {
+            let error = result.err().expect("client-auth-only leaf must fail");
+            assert!(
+                error.contains("extended key usage does not permit server authentication"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_non_ca_issuer_at_the_end_of_a_chain_fails_startup() {
+    let directory = TestDirectory::new();
+    let base = directory.path.as_path();
+    let params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    let issuer =
+        rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap()).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    std::fs::write(base.join("nonca.key"), key.serialize_pem()).unwrap();
+    let error = compile_tls(base, "nonca", &[leaf.pem(), issuer.pem()])
+        .err()
+        .expect("a non-CA issuer must not validate a chain");
+    assert!(error.contains("not a CA"), "{error}");
+}

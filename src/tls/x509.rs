@@ -3,10 +3,8 @@
 //!
 //! rustls and webpki verify signatures and paths but do not expose a
 //! certificate's dates, and a leaf whose issuer is not in the file cannot be
-//! path-verified at all. This is a minimal DER walk over the fixed prefix of
-//! `TBSCertificate` (RFC 5280 section 4.1): version, serial, signature
-//! algorithm, issuer, validity, subject. It never interprets extensions and
-//! rejects anything it does not recognise instead of guessing.
+//! path-verified at all. We read the fixed prefix of `TBSCertificate` for
+//! dates and names, and inspect the leaf's EKU independently of its issuer.
 
 use std::fmt;
 
@@ -15,6 +13,13 @@ const INTEGER: u8 = 0x02;
 const EXPLICIT_VERSION: u8 = 0xa0;
 const UTC_TIME: u8 = 0x17;
 const GENERALIZED_TIME: u8 = 0x18;
+const OBJECT_IDENTIFIER: u8 = 0x06;
+const OCTET_STRING: u8 = 0x04;
+const BOOLEAN: u8 = 0x01;
+const EXTENSIONS: u8 = 0xa3;
+const EKU_OID: &[u8] = &[0x55, 0x1d, 0x25]; // 2.5.29.37
+const BASIC_CONSTRAINTS_OID: &[u8] = &[0x55, 0x1d, 0x13]; // 2.5.29.19
+const SERVER_AUTH_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01]; // 1.3.6.1.5.5.7.3.1
 
 /// Seconds since the Unix epoch, UTC. Signed: `notBefore` may predate 1970.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,6 +67,95 @@ pub(crate) fn summarize(der: &[u8]) -> Result<Summary, &'static str> {
         not_after,
         self_issued: issuer.0 == subject.0,
     })
+}
+
+/// An absent EKU imposes no purpose restriction. A present EKU must explicitly
+/// include serverAuth, even when the PEM contains no issuer to verify a path.
+pub(crate) fn check_leaf_server_auth(der: &[u8]) -> Result<(), &'static str> {
+    let Some(value) = extension_value(der, EKU_OID)? else {
+        return Ok(());
+    };
+    let mut encoded = Reader(value);
+    let mut usages = encoded.element(SEQUENCE)?;
+    if encoded.peek().is_some() {
+        return Err("malformed extended key usage");
+    }
+    let mut server_auth = false;
+    while usages.peek().is_some() {
+        server_auth |= usages.element(OBJECT_IDENTIFIER)?.0 == SERVER_AUTH_OID;
+    }
+    if !server_auth {
+        return Err("leaf extended key usage does not permit server authentication");
+    }
+    Ok(())
+}
+
+/// The final bundled issuer is used as webpki's anchor, which exempts it from
+/// intermediate CA checks. Require its own basicConstraints CA bit first.
+pub(crate) fn check_issuer_ca(der: &[u8]) -> Result<(), &'static str> {
+    let Some(value) = extension_value(der, BASIC_CONSTRAINTS_OID)? else {
+        return Err("last certificate in the chain is not a CA");
+    };
+    let mut encoded = Reader(value);
+    let mut constraints = encoded.element(SEQUENCE)?;
+    if encoded.peek().is_some() {
+        return Err("malformed basic constraints");
+    }
+    if constraints.peek() != Some(BOOLEAN) || constraints.element(BOOLEAN)?.0 != [0xff] {
+        return Err("last certificate in the chain is not a CA");
+    }
+    if constraints.peek() == Some(INTEGER) {
+        constraints.element(INTEGER)?; // anchor pathLenConstraint is not checked by webpki
+    }
+    if constraints.peek().is_some() {
+        return Err("malformed basic constraints");
+    }
+    Ok(())
+}
+
+fn extension_value<'a>(der: &'a [u8], target: &[u8]) -> Result<Option<&'a [u8]>, &'static str> {
+    let mut certificate = Reader(der).element(SEQUENCE)?;
+    let mut tbs = Reader(certificate.element(SEQUENCE)?.0);
+    if tbs.peek() == Some(EXPLICIT_VERSION) {
+        tbs.element(EXPLICIT_VERSION)?;
+    }
+    tbs.element(INTEGER)?;
+    tbs.element(SEQUENCE)?;
+    tbs.element(SEQUENCE)?; // issuer
+    tbs.element(SEQUENCE)?; // validity
+    tbs.element(SEQUENCE)?; // subject
+    tbs.element(SEQUENCE)?; // subjectPublicKeyInfo
+    while matches!(tbs.peek(), Some(0x81 | 0xa1 | 0x82 | 0xa2)) {
+        let tag = tbs.peek().unwrap();
+        tbs.element(tag)?;
+    }
+    if tbs.peek().is_none() {
+        return Ok(None);
+    }
+    let mut wrapper = tbs.element(EXTENSIONS)?;
+    if tbs.peek().is_some() {
+        return Err("unexpected fields after certificate extensions");
+    }
+    let mut extensions = wrapper.element(SEQUENCE)?;
+    if wrapper.peek().is_some() {
+        return Err("malformed certificate extensions");
+    }
+    let mut found = None;
+    while extensions.peek().is_some() {
+        let mut extension = extensions.element(SEQUENCE)?;
+        let oid = extension.element(OBJECT_IDENTIFIER)?;
+        if extension.peek() == Some(BOOLEAN) {
+            extension.element(BOOLEAN)?;
+        }
+        let value = extension.element(OCTET_STRING)?;
+        if extension.peek().is_some() {
+            return Err("malformed certificate extension");
+        }
+        if oid.0 == target && found.replace(value.0).is_some() {
+            return Err("duplicate certificate extension");
+        }
+    }
+    Ok(found)
 }
 
 struct Reader<'a>(&'a [u8]);

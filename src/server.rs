@@ -133,6 +133,14 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         Ok(shutdown) => shutdown,
         Err(error) => return Err(stop_workers_after(&config, error).await),
     };
+    let mut reload_task = if let Some(tls) = config.tls() {
+        match certificate_reload_signal(Arc::clone(tls)) {
+            Ok(reload) => Some(tokio::spawn(reload)),
+            Err(error) => return Err(stop_workers_after(&config, error).await),
+        }
+    } else {
+        None
+    };
     // Printed once at startup, beside the other readiness lines. A refused
     // request is only explainable if the operator can see what the ceiling was
     // set to, and a configured limit is not something a running server should
@@ -151,9 +159,8 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
                     tls.certificates().len(),
                     tls.handshake_timeout().as_secs()
                 );
-                // Printed once, where the operator looks: the server does not
-                // reload certificates, so the date is when HTTPS stops working.
-                for certificate in tls.certificates() {
+                // Report the current generation at startup and after reload.
+                for certificate in tls.certificates().iter() {
                     println!(
                         "TLS certificate {} for {}: valid until {} ({} days)",
                         certificate.field,
@@ -171,6 +178,10 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
 
     let router = config.router_arc();
     let serve_result = serve_listeners(listeners, router, config.http_limits(), shutdown).await;
+    if let Some(task) = reload_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     // Every downstream connection, and therefore every active proxy exchange,
     // has ended. Close what remains idle instead of leaving it to process exit.
     for upstream in config.upstreams() {
@@ -534,6 +545,52 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
     Ok(async move {
         let _ = signal.recv().await;
     })
+}
+
+#[cfg(windows)]
+fn certificate_reload_signal(tls: Arc<TlsListener>) -> io::Result<impl Future<Output = ()>> {
+    let mut signal = tokio::signal::windows::ctrl_break()?;
+    Ok(async move {
+        while signal.recv().await.is_some() {
+            report_certificate_reload(&tls).await;
+        }
+    })
+}
+
+#[cfg(not(windows))]
+fn certificate_reload_signal(tls: Arc<TlsListener>) -> io::Result<impl Future<Output = ()>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    Ok(async move {
+        while signal.recv().await.is_some() {
+            report_certificate_reload(&tls).await;
+        }
+    })
+}
+
+async fn report_certificate_reload(tls: &TlsListener) {
+    match tls.reload_certificates().await {
+        Ok(reports) => {
+            println!(
+                "TLS certificate reload succeeded ({} certificate(s))",
+                reports.len()
+            );
+            for certificate in reports.iter() {
+                println!(
+                    "TLS certificate {} for {}: valid until {} ({} days)",
+                    certificate.field,
+                    certificate.names,
+                    certificate.not_after,
+                    certificate.days_left
+                );
+                if let Some(note) = certificate.note {
+                    println!("TLS certificate {}: note: {note}", certificate.field);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("TLS certificate reload failed; previous set remains active: {error}")
+        }
+    }
 }
 
 #[cfg(not(windows))]

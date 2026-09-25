@@ -1,9 +1,13 @@
 # TLS v1
 
-Status: implemented on 2026-09-25 and committed by the Owner as `868eaff`;
-the authority policy, certificate date and chain checks, and the test fixes
-below are in the working tree on top of it, for Owner review. Not tagged,
-released or accepted. The investigation it follows is
+Transactional certificate reload was added after the TLS v1 review. Its
+current behavior and verification are in `doc/TLS_CERTIFICATE_RELOAD.md`;
+statements below about reload being outside v1 describe the historical v1
+boundary.
+
+Status: implemented on 2026-09-25; the current baseline, including the
+authority policy and certificate checks, is `ed5845b`. The final EKU fix and
+readiness review below are uncommitted. Not tagged or released. The investigation it follows is
 `doc/research/TLS_ARCHITECTURE_INVESTIGATION.md`; where this document and the
 investigation differ, this document and the source are current. Measurements
 are in `benchmarks/results/tls_v1_20260925.md`.
@@ -189,16 +193,25 @@ loaded and checked. Failures are `Compile` errors naming the field and path:
   wildcard name is checked with a probe label, so a certificate listing a few
   explicit subdomains does not pass as a wildcard; an IP name is checked
   against the IP SANs;
+- a leaf whose extended key usage (EKU), when present, does not explicitly
+  include `serverAuth`, including when the file contains only that leaf;
 - the leaf, or any intermediate in the file, outside its validity period at
   startup (`... expired on <date>` or `... is not valid until <date>`). A
   trailing self-signed root is exempt: clients use their own copy of a root,
   so a bundled one decides nothing;
 - a chain that does not link: with two or more certificates in the file, the
   last one is used as the anchor and the path from the leaf to it is verified
-  with webpki at the current time (signatures, CA flags, path length, and the
-  server-auth usage when an EKU is present). A wrong issuer, a missing
-  intermediate between the leaf and a bundled root, or an intermediate that
-  is not a CA fails startup.
+  with webpki at the current time (signatures, CA flags and path length for
+  intermediates below the anchor, and server-auth usage when an EKU is
+  present). The last certificate's CA bit is checked separately. A wrong
+  issuer, a missing intermediate between the leaf and a bundled root, or an
+  issuer that is not a CA fails startup.
+
+Leaf EKU is readable without an issuer certificate: it is an extension of the
+leaf itself. The startup check reads it for every leaf. This does not verify
+the leaf's signature or its path to an issuer. Those path checks need at least
+two certificates in the configured file; with only a leaf, the server cannot
+tell whether its issuer is trusted or whether an omitted intermediate is needed.
 
 What the server can decide and what it cannot: it knows the current time and
 the certificates it will send, so it can refuse to serve with a certificate
@@ -208,9 +221,8 @@ holds only a leaf whose issuer is not in the file is accepted, because that
 issuer may be a root every intended client holds (a private CA) or an
 intermediate the operator forgot; startup prints a note saying the issuer is
 not included. Revocation, certificate transparency and trust by real clients
-remain the client's decisions. The x509 reader only walks the fixed prefix of
-`TBSCertificate` (version, serial, algorithm, issuer, validity, subject) and
-rejects anything it does not recognise.
+remain the client's decisions. The x509 reader walks the fixed prefix of
+`TBSCertificate` for dates and names and reads the leaf's EKU extension.
 
 Startup prints each certificate's field, names and expiry, for example
 `TLS certificate server.tls.certificates[0] for localhost: valid until
@@ -294,15 +306,17 @@ throwaway CA from `rcgen` (dev-dependency only):
 | config: TLS with and without cleartext; 22 rejected configurations (listeners, timeouts, names, duplicates, defaults, unknown fields, unreadable/malformed/empty PEM, missing/encrypted/mismatched key, uncovered exact, wildcard and IP names, IP wildcard), none leaking key material | `tests/configuration.rs` `compiles_a_tls_listener_with_or_without_a_cleartext_listener`, `rejects_tls_configuration_that_cannot_be_served` |
 | expired and not-yet-valid leaf (with CA, and self-signed alone), expired intermediate; an expired trailing root is accepted | `a_certificate_outside_its_validity_period_fails_startup` |
 | linked chains (with and without root) compile and report expiry; wrong issuer and missing intermediate fail; a bare leaf compiles with a note; a self-signed leaf has none | `a_chain_that_does_not_link_fails_startup_and_a_bare_leaf_is_reported` |
+| bare leaf with client-auth-only EKU fails startup; server-auth EKU and absent EKU compile with the missing-issuer note | `a_bare_leaf_with_client_auth_only_eku_fails_startup` |
+| a non-CA certificate at the end of a two-certificate file cannot serve as an issuer anchor | `a_non_ca_issuer_at_the_end_of_a_chain_fails_startup` |
 | protocol v3 byte layout; READY v0/1/2/4/max rejected | `php_protocol::tests` |
 | PHP worker receives `https` from the TLS listener and `http` from the cleartext one in the same W1 process; forged headers ignored; local port is the TLS port | `tests/php_worker.rs::protocol_v3_carries_the_listener_scheme_not_a_forwarding_header` (ignored: needs `php/8.5/php.exe`) |
 | real Laravel/Symfony over HTTPS only (no cleartext listener): `REQUEST_SCHEME=https`, `HTTPS=on`, `getScheme()=https`, default port 443, a forged `X-Forwarded-Proto: http` from an untrusted peer ignored | `laravel_sees_https_from_the_tls_listener_and_not_from_a_forged_header` (ignored: needs a prepared scratch PMS) |
 | PHP decoder: http/https values, 0 and 3 rejected; Laravel server-bag mapping | `fixtures/php-worker/protocol_test.php`, `laravel_request_test.php` |
 
-Gates, Windows native, working tree after the authority and certificate
-changes: `cargo fmt --check`, strict `clippy --all-targets --all-features -D
-warnings`, `cargo test` (141 lib, 28 configuration, 7 routing, 5 static), MSVC
-release build and `cargo bench --no-run --features profiling` pass. `cargo test
+Earlier gates, Windows native, after the authority and certificate changes:
+`cargo fmt --check`, strict `clippy --all-targets --all-features -D warnings`,
+`cargo test` (141 lib, 28 configuration, 7 routing, 5 static), MSVC release
+build and `cargo bench --no-run --features profiling` passed. `cargo test
 -- --ignored` with `HAMSTER_LARAVEL_TEST_PATH` set to a scratch copy of the
 prepared PMS: lib 9, multipool 9, visibility 1, timeout 10, containment 4 and
 61 of 64 `php_worker` tests pass, including both TLS PHP tests and the
@@ -466,8 +480,12 @@ was boxed).
   file; startup prints each expiry date. Trust by real clients, revocation and
   certificate transparency are not checked and are the client's decisions. A
   bare leaf whose issuer is not in the file starts with a note, because only
-  clients know whether they hold that issuer. EKU is enforced only through the
-  chain check, so a bare leaf's key usage is not checked.
+  clients know whether they hold that issuer. Its EKU is checked at startup;
+  the missing issuer still prevents signature and path verification.
+- **The final bundled issuer is a verification anchor.** Its CA bit is checked,
+  but webpki does not apply that anchor's own path-length or key-usage
+  restrictions at startup. A client building a path through a higher root may
+  reject a chain Hamster accepts; actual client trust remains authoritative.
 - **Hosts added by `names` beyond the configured virtual hosts** are harmless
   (lookup returns `404` as before), and a configured SAN that `names` omits is
   not served over TLS: `names` is the authority list.
@@ -500,12 +518,27 @@ was boxed).
   loopback send-stall findings apply to the transport underneath and were not
   re-investigated for TLS.
 
-## Owner review points
+## Owner decisions and final readiness
 
-1. Cleartext exposure of HTTPS hosts: keep serving every host on the cleartext
-   listener (current), or let a host be HTTPS-only (refuse or redirect over
-   cleartext). This is product scope, not a correctness defect of TLS v1.
-2. Early responses to clients that keep sending (existing, not TLS): accept
-   the reset-instead-of-status behavior, or add a bounded lingering close (shut
-   down writes, drain for a short time and byte limit, then close), which holds
-   a connection slot slightly longer after such refusals.
+The Owner keeps the HTTP listener serving every configured host at this
+milestone. No per-host HTTPS-only policy or redirect is added. Early refusals
+continue to close the connection after the response; a client that keeps
+sending can observe a reset instead of the status. Lingering close is deferred
+until evidence from a real client warrants it.
+
+The final source review found two TLS startup defects: a bare leaf with
+client-auth-only EKU previously passed because EKU was checked only during
+chain verification, and a non-CA certificate used as the final bundled issuer
+passed because webpki treats that final certificate as an anchor. The leaf EKU
+check and final-issuer CA check, with regressions above, close both gaps.
+These checks do not establish client trust. Windows final gates passed:
+`cargo fmt --all -- --check`, `cargo test`
+(141 library passed, 9 ignored; 30 configuration passed, including both new
+regressions),
+strict Clippy, MSVC release build, and bench link with profiling. The ignored
+PHP regression `protocol_v3_carries_the_listener_scheme_not_a_forwarding_header`
+passed with the local PHP distribution. The scratch PMS environment variable
+was unset, so the ignored real Laravel TLS test was not rerun; its earlier
+Windows result is recorded in Verification. No benchmark was rerun because
+the fix runs only at startup. Native Linux remains unverified: only the MSVC
+target is installed here. No TLS v1 blocker remains from this review.
