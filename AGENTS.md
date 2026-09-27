@@ -23,7 +23,8 @@ integration tests can run. On Linux and other non-Windows hosts the tests and be
 `mkdir -p php/8.5 && ln -s "$(command -v php8.5)" php/8.5/php`. `hamster.toml` still names
 `php.exe`; point its `executable` at `php/8.5/php` in a local copy to run it there. The crash and
 kill tests use `taskkill`/`tasklist` on Windows and `kill`/`/proc` elsewhere. The Laravel tests
-additionally need `HAMSTER_LARAVEL_TEST_PATH`.
+additionally need `HAMSTER_LARAVEL_TEST_PATH`; `fixtures/php-worker/pms/prepare_scratch_app.sh`
+builds a PMS-shaped Laravel 12 + Octane application for it under the git-ignored `www/`.
 
 ## Build, Test, and Development Commands
 
