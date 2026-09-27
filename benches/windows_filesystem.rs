@@ -1,7 +1,5 @@
 use std::{
-    ffi::c_void,
     fs, io,
-    mem::MaybeUninit,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -247,7 +245,7 @@ async fn run_case(
 
     let mut runs = Vec::with_capacity(TRIALS);
     for run in 1..=TRIALS {
-        let cpu_start = process_cpu_seconds()?;
+        let cpu_start = windows::process_cpu_seconds()?;
         let summary = windows_fs_profile::profile(
             executor.clone(),
             operation,
@@ -257,7 +255,7 @@ async fn run_case(
             measured,
         )
         .await?;
-        let cpu_seconds = process_cpu_seconds()? - cpu_start;
+        let cpu_seconds = windows::process_cpu_seconds()? - cpu_start;
         let result = TrialResult::new(summary, cpu_seconds);
         print_run(
             suite,
@@ -575,49 +573,65 @@ fn create_files(
     Ok(paths)
 }
 
-#[repr(C)]
-struct FileTime {
-    low: u32,
-    high: u32,
-}
+#[cfg(windows)]
+mod windows {
+    use std::{ffi::c_void, io, mem::MaybeUninit};
 
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn GetCurrentProcess() -> *mut c_void;
-    fn GetProcessTimes(
-        process: *mut c_void,
-        creation: *mut FileTime,
-        exit: *mut FileTime,
-        kernel: *mut FileTime,
-        user: *mut FileTime,
-    ) -> i32;
-}
-
-fn process_cpu_seconds() -> io::Result<f64> {
-    let mut creation = MaybeUninit::<FileTime>::uninit();
-    let mut exit = MaybeUninit::<FileTime>::uninit();
-    let mut kernel = MaybeUninit::<FileTime>::uninit();
-    let mut user = MaybeUninit::<FileTime>::uninit();
-    // SAFETY: all pointers refer to writable FILETIME-sized storage and the
-    // pseudo-handle returned by GetCurrentProcess is valid in this process.
-    let succeeded = unsafe {
-        GetProcessTimes(
-            GetCurrentProcess(),
-            creation.as_mut_ptr(),
-            exit.as_mut_ptr(),
-            kernel.as_mut_ptr(),
-            user.as_mut_ptr(),
-        )
-    };
-    if succeeded == 0 {
-        return Err(io::Error::last_os_error());
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
     }
-    // SAFETY: GetProcessTimes initialized every FILETIME after succeeding.
-    let (kernel, user) = unsafe { (kernel.assume_init(), user.assume_init()) };
-    let ticks = file_time_ticks(kernel) + file_time_ticks(user);
-    Ok(ticks as f64 / 10_000_000.0)
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    pub fn process_cpu_seconds() -> io::Result<f64> {
+        let mut creation = MaybeUninit::<FileTime>::uninit();
+        let mut exit = MaybeUninit::<FileTime>::uninit();
+        let mut kernel = MaybeUninit::<FileTime>::uninit();
+        let mut user = MaybeUninit::<FileTime>::uninit();
+        // SAFETY: all pointers refer to writable FILETIME-sized storage and the
+        // pseudo-handle returned by GetCurrentProcess is valid in this process.
+        let succeeded = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetProcessTimes initialized every FILETIME after succeeding.
+        let (kernel, user) = unsafe { (kernel.assume_init(), user.assume_init()) };
+        let ticks = file_time_ticks(kernel) + file_time_ticks(user);
+        Ok(ticks as f64 / 10_000_000.0)
+    }
+
+    fn file_time_ticks(time: FileTime) -> u64 {
+        (u64::from(time.high) << 32) | u64::from(time.low)
+    }
 }
 
-fn file_time_ticks(time: FileTime) -> u64 {
-    (u64::from(time.high) << 32) | u64::from(time.low)
+// The CPU column is a Windows measurement; elsewhere the bench still links and
+// runs, and reports NaN for it, as benches/proxy.rs does.
+#[cfg(not(windows))]
+mod windows {
+    use std::io;
+
+    pub fn process_cpu_seconds() -> io::Result<f64> {
+        Ok(f64::NAN)
+    }
 }
