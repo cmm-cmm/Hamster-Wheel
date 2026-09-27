@@ -2796,6 +2796,10 @@ async fn ctrl_c_stops_server_and_reaps_pool() {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetConsoleCP() -> u32;
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
     }
     if unsafe { GetConsoleCP() } == 0 {
         eprintln!(
@@ -2803,6 +2807,17 @@ async fn ctrl_c_stops_server_and_reaps_pool() {
         );
         return;
     }
+    // A process that ignores Ctrl+C passes that attribute to every child it
+    // creates, and shells disagree about setting it: a plain console session
+    // does not, while some non-interactive shells do. Inherited through cargo
+    // and this test binary, it reaches the server and silently swallows the
+    // event, so the test would measure the launching shell instead of
+    // Hamster. Clearing it here makes the server's disposition the same on
+    // every machine. Verified: without this the server never sees CTRL_C_EVENT
+    // and stays up; with it the server shuts down in about 0.2 s.
+    // SAFETY: a null handler with `add = 0` only clears this process's own
+    // ignore attribute; it installs nothing.
+    unsafe { SetConsoleCtrlHandler(None, 0) };
 
     let config_path = marker_path("ctrl-config").with_extension("toml");
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_hamster-wheel"));

@@ -1,6 +1,59 @@
 # AI Handoff
 
-## Current Working Scope — Transactional certificate reload
+## Current Working Scope — Windows readiness pass (2026-09-27)
+
+A verification pass, not a feature. One test changed; no production code did.
+
+Two recorded diagnoses below this section are wrong and are corrected here.
+
+**`ctrl_c_stops_server_and_reaps_pool` was never a ConPTY problem.** Windows
+lets a process disable Ctrl+C for itself with `SetConsoleCtrlHandler(NULL,
+TRUE)`, and that attribute is inherited by every child it creates. Shells
+disagree about setting it, so when one that sets it launches Cargo, the
+attribute reaches the server under test and the console event is swallowed;
+Ctrl+Break is unaffected because the attribute covers Ctrl+C only. A variant
+matrix (piped and unpiped stdio, null and real helper handler, Ctrl+C and
+Ctrl+Break) reproduced it in all Ctrl+C cases and in none of the others, and
+clearing the inherited attribute in the parent before spawning fixed it. The
+test now clears it and passes; it passed three consecutive runs and inside the
+full suite. Hamster itself was never at fault: a server launched from a shell
+without the attribute shuts down on Ctrl+C in about 30 ms with every worker
+reaped, measured directly.
+
+**The Linux target is installed.** `rustup target list --installed` reports
+`x86_64-unknown-linux-gnu` beside the MSVC target. The cross-target check is
+blocked by something else: `aws-lc-sys` (through `tokio-rustls`, a mandatory
+dependency since TLS v1) compiles C and needs `x86_64-linux-gnu-gcc`, which
+this machine does not have. Linux is still NOT VERIFIED, and now not even
+compile-checked; the reason in the older sections is inaccurate.
+
+Real applications now exist for the ignored tests. `www/` holds a Laravel
+12.69.2 application with Octane 2.20 and the checked-in probe provider, plus a
+framework-free persistent PHP application and static assets;
+`doc/LOCAL_TEST_APPLICATIONS.md` records how they were built, what they cover
+and where they are only stand-ins. With `HAMSTER_LARAVEL_TEST_PATH` set, all 64
+`php_worker` ignored tests pass, including both PMS isolation tests, which had
+never run on this machine.
+
+Verified on Windows in this pass: format, strict Clippy, the default suite
+(144 library, 30 configuration, 7 routing, 5 static), every ignored suite
+(9 library, 9 multipool, 64 `php_worker`, 1 visibility, 10 timeout, 2 TLS
+reload process, 4 containment), the MSVC release build and the profiling bench
+link. Ctrl+C shutdown, Ctrl+Break certificate reload and abnormal-parent
+containment were each also exercised outside the test suite against a running
+server. No benchmark was run; nothing was committed, tagged, pushed or merged;
+`ssl/` and the untracked research backlog were left alone.
+
+Open, unchanged: native Linux, upstream TLS, and the items already listed as
+out of scope for Reverse Proxy v1 and TLS v1. One new observation needs an
+owner decision: Hamster prints operational lines with `println!`, which panics
+if stdout is closed while the process runs. A scratch harness that dropped its
+read end saw `failed printing to stdout: The pipe is being closed` and exit
+code 101 instead of a clean shutdown. A plain `| head -1` pipe did not
+reproduce it, so the exposure is narrow, but a supervisor that closes the pipe
+early would turn a graceful stop into a panic.
+
+## Recorded Checkpoint — Transactional certificate reload
 
 After the TLS v1 Windows review, the next capability is implemented in the
 working tree. `TlsListener` loads and verifies an entire replacement set before
@@ -535,8 +588,10 @@ The first item is done on `dev` after the `v0.3.0` tag.
   `prolonged_failure_never_retires_a_slot_permanently` and
   `one_bad_slot_does_not_disturb_healthy_slots` drive a real slot past
   `MAX_CONSECUTIVE_FAILURES` and assert the resulting state.
-- Strengthen the `ctrl_c_stops_server_and_reaps_pool` console guard so a
-  ConPTY session skips instead of failing.
+- DONE, and the diagnosis was wrong: `ctrl_c_stops_server_and_reaps_pool` did
+  not need a ConPTY guard. The server inherited an "ignore Ctrl+C" attribute
+  from the launching shell through Cargo. The test now clears that attribute
+  before spawning; see the current scope section.
 - DONE: "the process exited before REQUEST was written" is distinguished from a
   possibly-started failure. `PhpWorkerError::NotStarted` is returned when
   `try_wait` reaps the process first or when the frame write transfers zero

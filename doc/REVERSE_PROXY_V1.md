@@ -472,3 +472,6 @@ Also known:
 - Only Windows `x86_64-pc-windows-msvc` was measured, on loopback; no real NIC.
   Native Linux: NOT VERIFIED. Linux was not even cross-checked for this
   change: the Linux target is not installed in the current toolchain.
+  Corrected on 2026-09-27: the target *is* installed. The cross-target check
+  is blocked instead by `aws-lc-sys`, which compiles C and needs
+  `x86_64-linux-gnu-gcc`. Linux remains NOT VERIFIED either way.

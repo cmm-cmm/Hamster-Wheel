@@ -326,6 +326,13 @@ scratch vendor tree lacks `predis/predis/src/Client.php` (also missing in the
 copy it came from). `cargo check --target x86_64-unknown-linux-gnu` cannot run:
 the target is not installed. Native Linux: NOT VERIFIED.
 
+Corrected on 2026-09-27. Two environment claims above were wrong. The `ctrl_c`
+failure is not ConPTY: the server inherited an "ignore Ctrl+C" attribute from
+the launching shell, the test now clears it, and it passes. The Linux target is
+installed; the cross-target check is blocked by `aws-lc-sys` needing
+`x86_64-linux-gnu-gcc`. Native Linux is still NOT VERIFIED. See
+`doc/AI_HANDOFF.md` and `doc/LOCAL_TEST_APPLICATIONS.md`.
+
 End to end with the release binary, a TLS-only config and `curl`: `localhost`
 200, `https://127.0.0.1` with no SNI 200 through an IP name on the default
 certificate, `Host: other.test` (a configured alias the certificate does not
