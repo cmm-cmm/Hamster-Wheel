@@ -2,9 +2,14 @@
 //!
 //! Investigation instrumentation, not a regression suite. It measures what the
 //! runtime state already exposes and what an operator can actually conclude
-//! from it. All tests are `#[ignore]`d and need `php/8.5/php.exe`.
+//! from it. All tests are `#[ignore]`d and need the repository PHP runtime
+//! (`support::PHP_RELATIVE_PATH`).
 //!
 //! `cargo test --test pool_visibility_probe <name> -- --ignored --nocapture`
+
+mod support;
+
+use support::PHP_RELATIVE_PATH;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -25,11 +30,11 @@ use tokio::{
 
 fn probe_runtime(workers: usize, request_timeout: u64) -> config::RuntimeConfig {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     let script = root.join("fixtures/php-worker/worker.php");
     assert!(
         executable.is_file(),
-        "visibility probe requires repository php/8.5/php.exe"
+        "visibility probe requires repository {PHP_RELATIVE_PATH}"
     );
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = 32\nrequest_timeout = {request_timeout}\n",

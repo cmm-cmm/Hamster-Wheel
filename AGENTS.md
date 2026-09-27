@@ -18,7 +18,12 @@ to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`)
 
 `php/` is deliberately git-ignored. A locally supplied PHP 8.5 NTS distribution must exist at
 `php/8.5/php.exe` before the checked-in `hamster.toml`, the PHP benchmarks, or the ignored PHP
-integration tests can run.
+integration tests can run. On Linux and other non-Windows hosts the tests and benches look for
+`php/8.5/php` instead, so a symlink to the system binary is enough:
+`mkdir -p php/8.5 && ln -s "$(command -v php8.5)" php/8.5/php`. `hamster.toml` still names
+`php.exe`; point its `executable` at `php/8.5/php` in a local copy to run it there. The crash and
+kill tests use `taskkill`/`tasklist` on Windows and `kill`/`/proc` elsewhere. The Laravel tests
+additionally need `HAMSTER_LARAVEL_TEST_PATH`.
 
 ## Build, Test, and Development Commands
 

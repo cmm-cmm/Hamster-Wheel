@@ -5,8 +5,13 @@
 //! slot/generation/failure trajectory so the cascade hypothesis can be
 //! confirmed or refuted from measurement rather than from source reading.
 //!
-//! Every test is `#[ignore]`d and needs `php/8.5/php.exe`. Run one at a time:
+//! Every test is `#[ignore]`d and needs the repository PHP runtime
+//! (`support::PHP_RELATIVE_PATH`). Run one at a time:
 //! `cargo test --test timeout_probe <name> -- --ignored --nocapture`
+
+mod support;
+
+use support::PHP_RELATIVE_PATH;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -207,11 +212,11 @@ fn probe_runtime(
     request_timeout: u64,
 ) -> config::RuntimeConfig {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     let script = root.join("fixtures/php-worker/worker.php");
     assert!(
         executable.is_file(),
-        "timeout probe requires repository php/8.5/php.exe"
+        "timeout probe requires repository {PHP_RELATIVE_PATH}"
     );
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\nrequest_timeout = {request_timeout}\n",
@@ -710,6 +715,7 @@ async fn f1_respawn_cost_at_candidate_timeout_floors() {
 /// The PHP children are spawned by this process, so `Get-Process` on the test
 /// process alone would miss them. Measuring the whole tree is what makes the
 /// respawn cost visible.
+#[cfg(windows)]
 fn process_cpu_seconds() -> f64 {
     let output = std::process::Command::new("powershell")
         .args([
@@ -856,6 +862,7 @@ async fn g1_every_request_times_out_forever() {
 }
 
 /// Private working set of this test process, which owns the pool.
+#[cfg(windows)]
 fn server_private_mib() -> f64 {
     // The pool runs in this process, so read this process directly.
     let output = std::process::Command::new("powershell")
@@ -874,4 +881,79 @@ fn server_private_mib() -> f64 {
         .parse::<f64>()
         .unwrap_or(0.0)
         / (1024.0 * 1024.0)
+}
+
+/// Total CPU seconds this process and its children have consumed: this
+/// process, the PHP children already reaped (`cutime`/`cstime`), and the ones
+/// still running. Replaced workers are counted too, which is the respawn cost
+/// this probe measures.
+#[cfg(not(windows))]
+fn process_cpu_seconds() -> f64 {
+    let own = std::process::id();
+    let mut ticks = proc_stat_fields(own).map_or(0, |fields| {
+        fields[11..=14]
+            .iter()
+            .filter_map(|field| field.parse::<u64>().ok())
+            .sum()
+    });
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        if let Some(fields) = proc_stat_fields(pid)
+            && fields[1] == own.to_string()
+        {
+            ticks += fields[11..=12]
+                .iter()
+                .filter_map(|field| field.parse::<u64>().ok())
+                .sum::<u64>();
+        }
+    }
+    ticks as f64 / clock_ticks_per_second()
+}
+
+/// The `/proc/<pid>/stat` fields after the command name: state is index 0,
+/// ppid 1, utime 11, stime 12, cutime 13 and cstime 14.
+#[cfg(not(windows))]
+fn proc_stat_fields(pid: u32) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let fields: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+    (fields.len() > 14).then_some(fields)
+}
+
+#[cfg(not(windows))]
+fn clock_ticks_per_second() -> f64 {
+    std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .unwrap_or(100.0)
+}
+
+/// Private resident memory of this test process, which owns the pool: the
+/// anonymous pages, which is what the Windows private working set counts.
+#[cfg(not(windows))]
+fn server_private_mib() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("RssAnon:"))
+                .and_then(|value| {
+                    value
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                })
+        })
+        .map_or(0.0, |kib| kib / 1024.0)
 }

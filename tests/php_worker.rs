@@ -1,3 +1,7 @@
+mod support;
+
+use support::PHP_RELATIVE_PATH;
+
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -185,10 +189,10 @@ fn php_runtime_with_script_at(
     script: &Path,
     listen: &str,
 ) -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let mut source = format!(
         "[server]\nlisten = \"{listen}\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
@@ -212,10 +216,10 @@ fn php_runtime_with_body_policy(
     body_read_timeout: u64,
     script: &Path,
 ) -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\nmax_connections = {max_connections}\nbody_read_timeout = {body_read_timeout}\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
@@ -231,10 +235,10 @@ fn php_runtime_with_env(
     script: &Path,
     env: &[(&str, &str)],
 ) -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let mut source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = 8\n\n[hosts.locations.php.env]\n",
@@ -322,6 +326,7 @@ fn all_workers_live(snapshot: &PoolSnapshot) -> bool {
     })
 }
 
+#[cfg(windows)]
 async fn kill_process(pid: u32) {
     let status = tokio::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
@@ -331,6 +336,7 @@ async fn kill_process(pid: u32) {
     assert!(status.success(), "taskkill must terminate PHP PID {pid}");
 }
 
+#[cfg(windows)]
 async fn process_exists(pid: u32) -> bool {
     let output = tokio::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
@@ -338,6 +344,43 @@ async fn process_exists(pid: u32) -> bool {
         .await
         .expect("tasklist must be available on Windows");
     String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Kills the process and returns once it has stopped running. `kill` returns
+/// when the signal is sent, not when the process is gone; `taskkill /F` returns
+/// after termination. Tests that kill an idle worker and then send a request
+/// rely on the worker already being dead, so wait for it here.
+#[cfg(not(windows))]
+async fn kill_process(pid: u32) {
+    let status = tokio::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .await
+        .expect("kill must be available");
+    assert!(status.success(), "kill must terminate PHP PID {pid}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while process_exists(pid).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "PHP PID {pid} kept running after SIGKILL"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Whether the process is still running. A killed child stays a zombie until
+/// its parent reaps it, but it no longer runs; `tasklist` does not list exited
+/// processes either, so both platforms answer the same question.
+#[cfg(not(windows))]
+async fn process_exists(pid: u32) -> bool {
+    let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await else {
+        return false;
+    };
+    // The state follows the parenthesised command name, which may itself
+    // contain spaces or parentheses.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state != "Z")
 }
 
 fn close_request(path: &str) -> Vec<u8> {
@@ -406,10 +449,10 @@ async fn laravel_request_reconstruction_passes_its_own_checks() {
     // PHP-style field names are where the defects were, and none of them needs
     // a framework to test.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let output = tokio::process::Command::new(executable)
         .arg(root.join("fixtures/php-worker/laravel_request_test.php"))
@@ -431,7 +474,7 @@ async fn laravel_request_reconstruction_passes_its_own_checks() {
 }
 
 fn metadata_multi_pool_runtime(script: &Path) -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"one.test\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 8\n\n[[hosts]]\nname = \"two.test\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 8\n",
         toml_literal(&executable),
@@ -492,7 +535,7 @@ fn assert_json_string(body: &[u8], field: &str, expected: &str) {
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn protocol_php_decoder_passes_adversarial_checks() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     assert!(executable.is_file());
     let output = tokio::process::Command::new(executable)
         .arg(root.join("fixtures/php-worker/protocol_test.php"))
@@ -512,10 +555,10 @@ async fn protocol_php_decoder_passes_adversarial_checks() {
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn laravel_octane_adapter_stages_response_until_cleanup_commit() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let output = tokio::process::Command::new(executable)
         .arg(root.join("fixtures/php-worker/laravel_octane_client_test.php"))
@@ -538,10 +581,10 @@ async fn laravel_octane_adapter_stages_response_until_cleanup_commit() {
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn laravel_worker_reserves_stdout_for_protocol_only() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let output = tokio::process::Command::new(executable)
         .arg(root.join("fixtures/php-worker/laravel_stdout_test.php"))
@@ -561,7 +604,7 @@ async fn laravel_worker_reserves_stdout_for_protocol_only() {
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn unsafe_laravel_reset_modes_fail_before_ready() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     for strategy in ["none", "targeted"] {
         let output = tokio::process::Command::new(&executable)
             .arg(root.join("fixtures/php-worker/laravel_worker.php"))
@@ -589,10 +632,10 @@ async fn unsafe_laravel_reset_modes_fail_before_ready() {
 async fn one_worker_enforces_laravel_octane_ownership_contract() {
     let _app_guard = LARAVEL_APP_TEST_LOCK.lock().await;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let app = PathBuf::from(
         std::env::var_os("HAMSTER_LARAVEL_TEST_PATH")
@@ -1351,10 +1394,10 @@ fn php_runtime_with_body_budget(
     max_body_memory: usize,
     script: &Path,
 ) -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\nmax_connections = {max_connections}\nbody_read_timeout = 10\nmax_body_memory = {max_body_memory}\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = {queue_capacity}\n",
@@ -2806,7 +2849,7 @@ async fn ctrl_c_stops_server_and_reaps_pool() {
 
     let config_path = marker_path("ctrl-config").with_extension("toml");
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_hamster-wheel"));
-    let php = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let php = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:0\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 2\nqueue_capacity = 8\n",
@@ -2975,10 +3018,10 @@ fn php_runtime_with_request_timeout(
     request_timeout: u64,
     script: &Path,
 ) -> config::RuntimeConfig {
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "PHP integration test requires repository php/8.5/php.exe"
+        "PHP integration test requires repository {PHP_RELATIVE_PATH}"
     );
     let source = format!(
         "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = 8\nrequest_timeout = {request_timeout}\n",
@@ -3284,7 +3327,7 @@ async fn https_request(
 #[ignore = "requires repository php/8.5/php.exe"]
 async fn protocol_v3_carries_the_listener_scheme_not_a_forwarding_header() {
     let (cert, key, der, dir) = localhost_certificate("scheme");
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
     // Configuration is the path under test: the certificate is loaded and
     // checked while the config compiles, before any worker or socket exists.
@@ -3393,7 +3436,7 @@ async fn laravel_sees_https_from_the_tls_listener_and_not_from_a_forged_header()
         .unwrap_or_else(|_| format!("{app}/php.ini"))
         .replace('\\', "/");
     let (cert, key, der, dir) = localhost_certificate("laravel");
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     let mut source = format!(
         "[server]\n\n[server.tls]\nlisten = \"127.0.0.1:8443\"\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\n\n[hosts.locations.php.env]\n",
         toml_literal(&cert),
