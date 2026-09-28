@@ -300,7 +300,7 @@ impl Upstream {
         if !self.claim_notice(elapsed_ms) {
             return;
         }
-        eprintln!(
+        errln!(
             "proxy upstream {} ({}): {what} ({total} of this kind since start; reported at most once per {} s)",
             self.config.label,
             self.config.address,

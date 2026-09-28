@@ -1,4 +1,4 @@
-use std::{error::Error, process::ExitCode};
+use std::{error::Error, io::Write, process::ExitCode};
 
 use hamster_wheel::{config, server};
 
@@ -7,7 +7,9 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("hamster-wheel: {error}");
+            // Not `eprintln!`: with stderr closed it would panic and replace
+            // this exit code with 101. See `src/output.rs`.
+            let _ = writeln!(std::io::stderr().lock(), "hamster-wheel: {error}");
             ExitCode::FAILURE
         }
     }

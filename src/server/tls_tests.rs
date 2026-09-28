@@ -673,6 +673,63 @@ async fn a_tls_client_that_stops_reading_is_released_by_the_socket_write_deadlin
     files.remove();
 }
 
+/// Lingering close beneath TLS: a request refused before its body is read
+/// reaches a client that sends the whole body first, over HTTPS as over
+/// cleartext. Hyper's shutdown sends close_notify through rustls, then the
+/// socket wrapper beneath it drains the remaining TLS records.
+#[tokio::test]
+async fn an_early_refusal_over_tls_reaches_a_client_that_sends_its_whole_body_first() {
+    const BODY: usize = 20 * 1_024 * 1_024;
+    let pki = Pki::new("tls-early-refusal");
+    let leaf = pki.leaf("localhost", &["localhost"]);
+    let budget = crate::body_budget::BodyBudget::new(64 * 1_024);
+    let server = Server::start(
+        router(vec![("localhost", Handler::body_echo(budget, None))]),
+        limits(4),
+        false,
+        |address| {
+            tls_listener(
+                address,
+                Duration::from_secs(5),
+                vec![source(&leaf, &["localhost"], false)],
+            )
+        },
+    )
+    .await;
+    let connector = pki.client(&[HTTP_1_1]);
+
+    // Even attempts send everything at once; odd ones pause after a little
+    // body while the server refuses and closes.
+    for attempt in 0..4 {
+        let mut stream = connect(&connector, server.tls_address, "localhost")
+            .await
+            .expect("handshake");
+        let head = format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {BODY}\r\n\r\n");
+        let mut request = head.into_bytes();
+        request.extend(std::iter::repeat_n(b'x', BODY));
+        let pause_after = if attempt % 2 == 1 {
+            1_024
+        } else {
+            request.len()
+        };
+        timeout(GUARD, async {
+            stream.write_all(&request[..pause_after]).await?;
+            sleep(Duration::from_millis(200)).await;
+            stream.write_all(&request[pause_after..]).await?;
+            stream.flush().await
+        })
+        .await
+        .expect("the server keeps reading until the body is sent")
+        .unwrap_or_else(|error| panic!("attempt {attempt}: sending the body: {error}"));
+        let head = read_head(&mut stream, &mut Vec::new()).await;
+        assert!(
+            head.starts_with("HTTP/1.1 413 "),
+            "attempt {attempt}: {head}"
+        );
+    }
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn graceful_shutdown_bounds_a_tls_download_stalled_on_the_client() {
     let pki = Pki::new("drain");

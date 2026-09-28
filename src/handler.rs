@@ -10,8 +10,8 @@ use hyper::{
 #[cfg(test)]
 use crate::body_budget::BodyBudget;
 use crate::{
-    config::SERVER_NAME, php_worker::PhpWorkerPool, proxy::Upstream, response_body::ResponseBody,
-    static_files, transport::ConnectionInfo,
+    config::SERVER_NAME, fastcgi::FastCgiBackend, php_worker::PhpWorkerPool, proxy::Upstream,
+    response_body::ResponseBody, static_files, transport::ConnectionInfo,
 };
 
 pub(crate) type HandlerResponse = Response<ResponseBody>;
@@ -22,6 +22,7 @@ pub enum HandlerKind {
     Simple,
     PhpWorker,
     Proxy,
+    FastCgi,
     #[cfg(test)]
     TransportEcho,
     #[cfg(test)]
@@ -44,6 +45,9 @@ pub enum Handler {
     },
     Proxy {
         upstream: Arc<Upstream>,
+    },
+    FastCgi {
+        backend: Arc<FastCgiBackend>,
     },
     #[cfg(test)]
     TransportEcho,
@@ -87,6 +91,10 @@ impl Handler {
         Self::Proxy { upstream }
     }
 
+    pub fn fastcgi(backend: Arc<FastCgiBackend>) -> Self {
+        Self::FastCgi { backend }
+    }
+
     #[cfg(test)]
     pub(crate) const fn transport_echo() -> Self {
         Self::TransportEcho
@@ -111,6 +119,7 @@ impl Handler {
             Self::Simple { .. } => HandlerKind::Simple,
             Self::PhpWorker { .. } => HandlerKind::PhpWorker,
             Self::Proxy { .. } => HandlerKind::Proxy,
+            Self::FastCgi { .. } => HandlerKind::FastCgi,
             #[cfg(test)]
             Self::TransportEcho => HandlerKind::TransportEcho,
             #[cfg(test)]
@@ -136,6 +145,9 @@ impl Handler {
                 .await),
             Self::Proxy { upstream } => {
                 Ok(crate::proxy::serve(upstream, request, connection).await)
+            }
+            Self::FastCgi { backend } => {
+                Ok(crate::fastcgi::serve(backend, request, connection, body_read_timeout).await)
             }
             #[cfg(test)]
             Self::TransportEcho => Ok(transport_response(connection)),
@@ -174,6 +186,7 @@ impl Handler {
             Self::Static { .. } => simple_response(StatusCode::OK, "Static"),
             Self::PhpWorker { .. } => simple_response(StatusCode::OK, "PHP Worker"),
             Self::Proxy { .. } => simple_response(StatusCode::OK, "Proxy"),
+            Self::FastCgi { .. } => simple_response(StatusCode::OK, "FastCGI"),
             #[cfg(test)]
             Self::TransportEcho => simple_response(StatusCode::OK, "Transport Echo"),
             #[cfg(test)]

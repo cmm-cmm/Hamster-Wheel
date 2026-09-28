@@ -414,6 +414,8 @@ fn validates_php_pool_worker_and_queue_bounds() {
         // I/O rather than on application execution.
         "request_timeout = 0",
         "request_timeout = 3601",
+        "startup_timeout = 0",
+        "startup_timeout = 301",
     ] {
         let source = not_found_config(&format!("{base}{field}\n"));
         assert!(matches!(
@@ -435,6 +437,18 @@ fn validates_php_pool_worker_and_queue_bounds() {
         pool.request_timeout(),
         std::time::Duration::from_secs(5),
         "an unset request_timeout keeps the compatibility default"
+    );
+    assert_eq!(
+        pool.startup_timeout(),
+        std::time::Duration::from_secs(5),
+        "an unset startup_timeout keeps the historical READY budget"
+    );
+
+    let source = not_found_config(&format!("{base}startup_timeout = 120\n"));
+    let runtime = config::compile_str(&source, &temporary.path).unwrap();
+    assert_eq!(
+        runtime.php_worker().unwrap().startup_timeout(),
+        std::time::Duration::from_secs(120)
     );
 
     let source = not_found_config(&format!(
@@ -1249,4 +1263,100 @@ fn a_non_ca_issuer_at_the_end_of_a_chain_fails_startup() {
         .err()
         .expect("a non-CA issuer must not validate a chain");
     assert!(error.contains("not a CA"), "{error}");
+}
+
+/// A `fastcgi` location: its root and servers are required, its addresses are
+/// numeric, unique and have ports, its index is a `.php` path inside the root,
+/// its timeouts are bounded, and its block is refused on any other handler.
+#[test]
+fn validates_and_compiles_fastcgi_locations() {
+    let temporary = TestDirectory::new();
+    std::fs::create_dir(temporary.path.join("public")).unwrap();
+    let location = |fields: &str, block: &str| {
+        not_found_config(&format!(
+            "\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"fastcgi\"\n{fields}\n{block}"
+        ))
+    };
+    let block = |fields: &str| {
+        format!("[hosts.locations.fastcgi]\nservers = [\"127.0.0.1:9000\"]\n{fields}\n")
+    };
+
+    let runtime = config::compile_str(&location("root = \"public\"", &block("")), &temporary.path)
+        .expect("a minimal fastcgi location compiles");
+    assert_eq!(
+        runtime
+            .router()
+            .route(&headers("localhost"), "/index.php")
+            .unwrap()
+            .kind(),
+        HandlerKind::FastCgi
+    );
+    let backend = &runtime.fastcgi_backends()[0];
+    assert_eq!(backend.label(), "localhost/");
+    assert_eq!(backend.servers(), ["127.0.0.1:9000".parse().unwrap()]);
+
+    let full = block(
+        "concurrency = 4\nindex = \"app/front.php\"\nconnect_timeout = 2\nresponse_timeout = 120",
+    );
+    config::compile_str(&location("root = \"public\"", &full), &temporary.path)
+        .expect("every field in range compiles");
+
+    for (fields, block_fields, servers) in [
+        ("", "", None),
+        ("root = \"public\"", "", Some("")),
+        ("root = \"public\"", "", Some("\"localhost:9000\"")),
+        ("root = \"public\"", "", Some("\"127.0.0.1:0\"")),
+        (
+            "root = \"public\"",
+            "",
+            Some("\"127.0.0.1:9000\", \"127.0.0.1:9000\""),
+        ),
+        ("root = \"public\"", "concurrency = 0", None),
+        ("root = \"public\"", "concurrency = 257", None),
+        ("root = \"public\"", "index = \"../index.php\"", None),
+        ("root = \"public\"", "index = \"/index.php\"", None),
+        ("root = \"public\"", "index = \"index.html\"", None),
+        ("root = \"public\"", "index = \"c:index.php\"", None),
+        ("root = \"public\"", "connect_timeout = 0", None),
+        ("root = \"public\"", "response_timeout = 3601", None),
+        (
+            "root = \"public\"\nphp = { executable = \"php.exe\", script = \"w.php\" }",
+            "",
+            None,
+        ),
+    ] {
+        let block = match servers {
+            Some(servers) => {
+                format!("[hosts.locations.fastcgi]\nservers = [{servers}]\n{block_fields}\n")
+            }
+            None => block(block_fields),
+        };
+        let result = config::compile_str(&location(fields, &block), &temporary.path);
+        assert!(
+            matches!(result, Err(ConfigError::Validation(_))),
+            "{fields} / {block}: {:?}",
+            result.err()
+        );
+    }
+    // The block is required, and not accepted on another handler.
+    let missing = not_found_config(
+        "\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"fastcgi\"\nroot = \"public\"\n",
+    );
+    assert!(matches!(
+        config::compile_str(&missing, &temporary.path),
+        Err(ConfigError::Validation(_))
+    ));
+    let misplaced = not_found_config(
+        "\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"static\"\nroot = \"public\"\n\n[hosts.locations.fastcgi]\nservers = [\"127.0.0.1:9000\"]\n",
+    );
+    assert!(matches!(
+        config::compile_str(&misplaced, &temporary.path),
+        Err(ConfigError::Validation(_))
+    ));
+    // A root that does not exist is a compile error, before anything binds.
+    let absent = location("root = \"absent\"", &block(""));
+    assert!(matches!(
+        config::compile_str(&absent, &temporary.path),
+        Err(ConfigError::Compile(_))
+    ));
 }

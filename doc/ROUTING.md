@@ -53,6 +53,13 @@ root catch-all. Invalid configuration and duplicates fail during construction.
 `Static` delegates directly to the milestone 0.0.2 static implementation and
 holds its pre-canonicalized document root. `Simple` constructs fixed responses
 and currently supplies the `/api` placeholder and routing errors.
+`FastCgi` holds a per-location backend (document root, index, servers and slots)
+and decides per request, on the file actually opened, whether the path runs a
+script, is served as a static file or goes to the front controller
+(`doc/FASTCGI_V1.md`). Longest-prefix matching is what closes an application's
+private directories: a `not_found` location at `/data` wins over a `fastcgi`
+location at `/` for `/data/...`, which is how Apache deny rules that Hamster
+does not read are replaced.
 
 The router is built once, shared by `Arc`, and never mutated. Request routing
 does not parse configuration, canonicalize the document root, rebuild tables,

@@ -2,6 +2,8 @@
 
 //! Exercises the actual console trigger against a separate server process.
 
+mod common;
+
 use std::{
     net::SocketAddr,
     os::windows::process::CommandExt,
@@ -208,6 +210,7 @@ async fn ctrl_break_reloads_a_real_server_process_and_rolls_back_on_error() {
         toml_path(&old.cert), toml_path(&old.key),
     )).unwrap();
 
+    common::end_children_with_this_process();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hamster-wheel"));
     command
         .arg("--config")
@@ -332,4 +335,100 @@ async fn ctrl_break_reloads_a_real_server_process_and_rolls_back_on_error() {
 
     child.kill().await.unwrap();
     child.wait().await.unwrap();
+}
+
+/// A reload reports on stdout. With stdout closed, that report must not end
+/// the reload task: Windows ends a process on a Ctrl+Break nobody handles, so
+/// a dead reload task turns the next reload request into process exit.
+#[tokio::test]
+#[ignore = "requires a Windows desktop capable of creating a child console"]
+async fn ctrl_break_reloads_after_stdout_is_closed() {
+    let scratch = Scratch::new();
+    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let issuer = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
+    let old = issue_leaf(&scratch.0, "old", &issuer);
+    let new = issue_leaf(&scratch.0, "new", &issuer);
+    let config_path = scratch.0.join("hamster.toml");
+    std::fs::write(&config_path, format!(
+        "[server.tls]\nlisten = \"127.0.0.1:0\"\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\ndefault = true\n\n[[hosts]]\nname = \"localhost\"\nlocations = [{{ path = \"/\", handler = \"not_found\" }}]\n",
+        toml_path(&old.cert), toml_path(&old.key),
+    )).unwrap();
+
+    common::end_children_with_this_process();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hamster-wheel"));
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.as_std_mut().creation_flags(CREATE_NEW_CONSOLE);
+    let mut child = command.spawn().unwrap();
+    let pid = child.id().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let diagnostics = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut output = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            output.push(line);
+        }
+        output
+    });
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+    let address = timeout(GUARD, async {
+        while let Some(line) = stdout.next_line().await.unwrap() {
+            if let Some(rest) = line.split("https://").nth(1) {
+                return rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<SocketAddr>()
+                    .unwrap();
+            }
+        }
+        panic!("server exited before listening");
+    })
+    .await
+    .expect("server should become ready");
+    drop(stdout);
+
+    let mut roots = RootCertStore::empty();
+    roots.add(issuer.der().clone()).unwrap();
+    let client = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client));
+
+    std::fs::copy(&new.cert, &old.cert).unwrap();
+    std::fs::copy(&new.key, &old.key).unwrap();
+    for attempt in 1..=2 {
+        send_ctrl_break(pid).await;
+        // Nothing can be read from stdout any more; give the reload time.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "server exited with {status:?} after reload {attempt} with stdout closed: {:?}",
+                diagnostics.await.unwrap()
+            );
+        }
+    }
+    let mut connection = connect(&connector, address).await;
+    assert_eq!(
+        connection.get_ref().1.peer_certificates().unwrap()[0],
+        new.der
+    );
+    request(&mut connection).await;
+
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    let diagnostics = diagnostics.await.unwrap();
+    assert!(
+        diagnostics.is_empty(),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
 }

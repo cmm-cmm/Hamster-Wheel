@@ -1,6 +1,248 @@
 # AI Handoff
 
-## Current Working Scope — Windows readiness pass (2026-09-27)
+## Current Working Scope — third pass: FastCGI v1 slice + open issues (2026-09-28)
+
+Uncommitted, on top of the second pass below. Not committed, tagged or
+released; Owner review pending. Windows only; Linux NOT VERIFIED (the Linux
+target's standard library is not installed, so even `cargo check` does not
+run on this machine).
+
+- FastCGI v1 (`src/fastcgi.rs`, `doc/FASTCGI_V1.md`): `handler = "fastcgi"`
+  runs scripts under `root` through operator-started `php-cgi -b` endpoints
+  (Hamster does not start them). Script/static/front-controller resolution
+  with the static handler's opened-handle containment, CGI/1.1 variables with
+  httpoxy removed, streamed request body written concurrently with the
+  response, streamed response, connect-only failover, per-location slots,
+  503 busy / 502 unavailable or malformed / 504 response timeout / 411
+  chunked. Evidence: 18 unit tests (fake FastCGI server), 8/8 mutations
+  caught, 9 ignored `tests/php_cgi.rs` tests against real `php-cgi.exe`
+  (fixture `fixtures/php-cgi` + DokuWiki 2026-07-14c unmodified: pages, edit,
+  media upload, session cookie), stable 3 of 3 parallel runs.
+  `validates_and_compiles_fastcgi_locations` in `tests/configuration.rs`.
+  DokuWiki's `data/` is served unless closed with `not_found` locations
+  (measured); `.htaccess` is not read.
+- Test isolation: `src/test_ports.rs` gives "dead"/free ports from outside the
+  Windows dynamic range; three tests used bind-then-drop ports that parallel
+  tests could be handed (3 failures in 40 concurrent suite runs, 0 in 48
+  after). Likely cause of the `upstreams_of_different_hosts_are_independent`
+  flake (inference: its own failure was never captured).
+- Lingering close: 16 MiB discard bound removed (.NET 413 0/10 -> 10/10 up to
+  100 MiB); total bound is `body_read_timeout`; 1 s idle bound kept.
+- Cold READY: per-pool `php.startup_timeout` (1-300 s, default 5). Amends the
+  accepted 5 s budget (`doc/WORKER_LIFECYCLE_0_3.md`): Owner review.
+- Adapter defect fixed: repeated request headers are joined as CGI does.
+- `prepare_php_apps.ps1` now downloads DokuWiki. Its URL and `tar.exe`
+  extraction were checked by hand: the tarball's tree is identical to the test
+  workspace except runtime files DokuWiki wrote itself (`data/`,
+  `conf/plugins.local.php`). The whole script was not re-run from an empty
+  directory after this change.
+
+Gates, 2026-09-28 afternoon, Windows: fmt ok; clippy failed on two lints in
+`src/fastcgi/tests.rs` (fixed; clippy then clean); `cargo test` 171 lib + 31
+configuration + integration all pass; ignored: lib 9, multipool 9, php_worker
+69 (with the Laravel stand-in), visibility 1, timeout 10, tls_reload_process
+3, windows_containment 4, php_applications 11, php_cgi 9; bench link ok;
+release ok; Linux `cargo check` cannot run here (target std not installed).
+No `hamster-wheel`/`php-cgi`/repository `php.exe` left afterwards; 450 stale
+test/probe temp entries from earlier killed runs removed from `%TEMP%`.
+Then, misreading a request to stop test processes as a request to delete
+files, the session also deleted the nine `%TEMP%\hamster*` investigation/PMS
+copies and every scratch workspace, including the `php-apps` (Symfony Demo,
+Slim, DokuWiki) and Laravel stand-in used by these gates. `www/` was not
+touched (`www/pms` 14,903 files, `git status` clean). Rerunning the ignored
+application suites needs `prepare_php_apps.ps1` and `prepare_scratch_app.ps1`
+first; the `%TEMP%` investigation notes are not recoverable.
+
+Owner decisions open: managed php-cgi lifecycle (a/b/c in
+`doc/FASTCGI_V1.md`); one timeout status policy for gateways (FastCGI 504,
+proxy 504, PHP worker 502); deny-list convenience for FastCGI locations;
+`startup_timeout` amendment.
+
+Next Windows step: decide managed vs operator-managed php-cgi; if managed,
+build it as its own slice under the lifecycle matrix. Then a FastCGI load
+measurement (one connection per request is unmeasured) and one more
+SAPI application (for example WordPress on SQLite) before calling FastCGI
+general.
+
+## Current Working Scope — PHP application compatibility on Windows (2026-09-28, second pass)
+
+Working tree on top of `7ca716f`, together with the uncommitted console and
+output work recorded in the next section; nothing committed, tagged, pushed or
+merged. `ssl/` and `www/` untouched: every application in this pass was built
+in a scratch workspace. The prior section's fixes were re-verified first
+(console tests 6/6, TLS reload process 3/3, default suite).
+
+**Scope.** Hamster was exercised as a general PHP server with independent
+applications of different structure, each in its own pool, alone and side by
+side: Symfony Demo 3.1.0 (Symfony 8.1, external, unmodified), Slim skeleton
+4.5.0 (external, application code unmodified), a framework-free test
+application in `fixtures/php-apps/native` (simulated), and the Laravel stand-in
+(simulated). The authoritative record, including what persistent workers cannot
+run, is `doc/PHP_APPLICATION_COMPATIBILITY.md`.
+
+**Product defect found and fixed: early refusals were lost as resets.** A 413
+or 503 sent before reading a body reached curl, but .NET's HttpClient, which
+sends the whole body first, saw a connection reset in 20 of 20 two-megabyte
+uploads against the `7ca716f` release build. The Owner had deferred lingering
+close until a real client showed the need; this is that evidence.
+`src/lingering_close.rs` wraps every socket: when a connection closes while
+its last request declared a body, or with bytes waiting, it sends FIN and
+discards input until the client closes, 1 s idle, 5 s or 16 MiB; never after
+shutdown has begun. .NET now gets 413 in 20 of 20. The first version lacked the
+idle and shutdown bounds and the existing
+`shutdown_waits_for_body_deadline_but_not_forever` caught it. Four
+regressions, five mutations each caught 3 of 3.
+
+**Adapters.** `symfony_worker.php` (any HttpKernel application) and
+`psr15_worker.php` (any PSR-15 handler, reached through an entry file such as
+`entries/slim_skeleton.php`) join the Laravel adapter. The framework-neutral
+SAPI work moved out of `laravel_request.php` into `adapter_support.php` and
+`httpfoundation.php`; all 11 Laravel tests still pass. Adapter-level fixes: a
+response over the 8 MiB frame is now `500 Response Too Large` with the worker
+kept (it used to kill the worker and answer 502), including in the Laravel
+adapter; the PSR-15 adapter closes a native PHP session after every request,
+because under the CLI SAPI it would otherwise leak into the next client's
+request.
+
+**Compatibility boundary, measured.** Under the CLI SAPI `header()`,
+`setcookie()`, `http_response_code()` and native session cookies do nothing,
+superglobals are not per request, and the `STDOUT` constant is closed.
+Applications built on those need FastCGI (roadmap 0.6, not implemented). The
+Slim skeleton's own `SessionMiddleware` reads `$_SERVER` and so never activates
+under Hamster, and its `ResponseEmitter` headers are reproduced by the entry
+file; both are stated in the entry file, not hidden.
+
+**Environments are rebuildable.** `fixtures/php-apps/prepare_php_apps.ps1`
+built the workspace from nothing in 3 min 14 s; `tests/php_applications.rs`
+(9 ignored tests) runs against it with `HAMSTER_PHP_APPS`, adding the Laravel
+stand-in when `HAMSTER_LARAVEL_TEST_PATH` is set.
+
+Verified on Windows after the final change: format, strict Clippy, default
+suite (147 library, 30 configuration, 7 routing, 5 static), every ignored suite
+(9 library, 9 multipool, 68 `php_worker`, 1 visibility, 10 timeout, 3 TLS
+reload process, 4 containment, 9 `php_applications`), MSVC release build,
+profiling bench link. `upstreams_of_different_hosts_are_independent` failed
+once in 48 full library runs of the final tree and never in 30 runs alone; its
+assertion was not captured, it concerns upstream connection counters on a
+"dead" port that a parallel test can reuse, and it was not attributed.
+
+**Test harness leak, found after the report and fixed.** The console tests
+start the real server in its own console and owned it only through
+`kill_on_drop`. When the test process itself was ended (timeout, terminal
+stop, killed `cargo test`) the server survived with its PHP workers: killing
+the test binary mid-run left `hamster-wheel.exe` plus two `php.exe` for
+`ctrl_break_reload_leaves_php_workers_serving` and `hamster-wheel.exe` for
+`ctrl_break_reloads_after_stdout_is_closed`; Ctrl+C in the test's terminal
+cannot reach a server in another console. The same applied to the older
+`ctrl_c_stops_server_and_reaps_pool` and the TLS reload process test.
+`tests/common/mod.rs` now joins the test process to a kill-on-close Job
+Object before any server is spawned. Re-run of the same abrupt kill, three
+times each with the server confirmed alive at the kill: nothing survived.
+In-process tests were never affected, since their PHP workers are in the Job
+Object Hamster creates. Product code did not change for this.
+
+**Not verified:** the real PMS (the only Octane-enabled copy uses the live PMS
+MySQL and Redis, which this pass must not touch; no isolated copy exists);
+native Linux (`x86_64-unknown-linux-gnu` is not installed here, `can't find
+crate for core`); frameworks other than the four above; request bodies over
+1 MiB (protocol limit) and streamed responses (buffered by design).
+
+Open for the Owner:
+
+- READY budget. Fresh copies booted cold in 3.4-3.8 s (Laravel stand-in) and
+  1.7 s (Symfony Demo) against 0.1-0.3 s warm; the pool's READY limit is a
+  fixed 5 s in the accepted lifecycle contract. One side-by-side run right
+  after building the workspace failed startup this way. Keep it fixed, or make
+  it configurable per pool like `request_timeout`.
+- Whether the Symfony and PSR-15 adapters become a supported product surface
+  (the roadmap's 0.6 persistent-adapter contract) or stay test fixtures.
+- Lingering close holds a connection slot for up to 1 s idle / 5 s total after
+  an early refusal; these are constants, not configuration.
+
+## Recorded Checkpoint — Windows console and output robustness (2026-09-28)
+
+Working tree on top of `7ca716f`; nothing committed, tagged, pushed or merged.
+`ssl/` and `www/` were not touched.
+
+**Closed-pipe output is fixed.** Every operational line in `src/` now goes
+through `outln!`/`errln!` (`src/output.rs`), which drop a line that cannot be
+written instead of panicking. Before, with the pipe's reader gone (Windows
+error 232), three process regressions failed on the unfixed tree: Ctrl+C with
+stdout closed exited 101 before worker shutdown; with stderr closed, one PHP
+worker crash killed the whole server (exit 101, the crashing request got an
+empty response); with stdout closed, the first Ctrl+Break reload killed the
+reload task and the second ended the process with `STATUS_CONTROL_C_EXIT`.
+Mutations show which paths matter: a connection task's line (the accept loop
+then panicked on reporting it), the pool supervisor's line (the pool then
+answered 503 for good), the shutdown line and the reload line. A generation
+task was already contained. Unit tests keep the standard macros so libtest
+still captures them; integration tests that run the library in-process now
+show its diagnostics in their output.
+
+**A larger Windows defect was found and fixed: PHP workers shared Hamster's
+console.** A console delivers Ctrl+C and Ctrl+Break to every attached process
+and `php.exe` ends on either. So Ctrl+C, the documented stop, killed workers
+mid-request (in-flight request `502 PHP Worker Unavailable`, worker exit
+0xC000013A) instead of draining them, and Ctrl+Break, the documented TLS
+reload, killed and replaced every worker on each reload. The 0.2 docs had
+recorded the Ctrl+C half as an observation; the reload half was new. Workers
+are now spawned with `CREATE_NO_WINDOW`. Cost, measured in release with eight
+workers over five alternating runs: one `conhost.exe` per worker (about
+1.2 MiB private each) and a READY time of 104.2 ms instead of 86.6 ms, paid at
+spawn only (`benchmarks/results/worker_console_isolation_20260928.md`).
+Rejected: `DETACHED_PROCESS` (no conhost, but console programs started by the
+application would get visible windows; reasoning, not measured).
+
+New permanent Windows process regressions (ignored, need PHP and a console):
+`a_closed_stdout_does_not_turn_ctrl_c_into_a_panic`,
+`a_closed_stderr_does_not_stop_a_crashed_worker_from_being_replaced`,
+`ctrl_c_drains_an_in_flight_php_request`,
+`ctrl_break_reload_leaves_php_workers_serving` (`tests/php_worker.rs`) and
+`ctrl_break_reloads_after_stdout_is_closed` (`tests/tls_reload_process.rs`).
+They hold worker process handles, not PIDs, and require exit code 0 (SHUTDOWN)
+or 42 (the deliberate crash); a first PID-based version failed once in a
+parallel suite through PID reuse. All five failed on the unfixed tree.
+`execution_timeouts_never_enter_the_infrastructure_backoff_ladder` failed once
+in six parallel runs: it read the counter the moment the 502 arrived, before
+the supervisor records the timeout. It now waits for the record.
+
+**Test environment.** The previous section described `www/laravel`,
+`www/plain-php` and 64/64 on the machine that wrote it. This machine's `www/`
+holds only `pms`, a plain clone of the real PMS (no Octane, no probe), and the
+`%TEMP%` scratch PMS copy has an incomplete vendor tree. The Windows document
+could not rebuild the stand-in: its models and migration were described, not
+given; `& $php artisan` with arguments inside `$php` does not run in
+PowerShell; and `composer.bat` strips `^`, so `laravel/octane:^2` reached
+Composer as exactly 2.0.0 and failed to resolve. The new
+`fixtures/php-worker/pms/prepare_scratch_app.ps1` writes the same application
+as the `dev-linux` shell script and built it from nothing in 2 min 27 s.
+`doc/LOCAL_TEST_APPLICATIONS.md` now separates the stand-in (rebuildable,
+synthetic) from the real PMS (owner's source, database and Redis).
+
+Verified on Windows in this pass, with the rebuilt stand-in: format, strict
+Clippy, default suite (144 library, 30 configuration, 7 routing, 5 static),
+every ignored suite (9 library, 9 multipool, 68 `php_worker` including all
+eleven Laravel tests and the new console tests, 1 visibility, 10 timeout,
+3 TLS reload process, 4 containment), MSVC release build and profiling bench
+link. The release binary with `hamster.toml` served `/`, `/php` and `/api`
+(200/200/404) with one `conhost.exe` per worker and left no `php.exe` after
+being killed. Before the timeout-test fix the complete `php_worker` suite ran
+six times in parallel: five clean, one with the two races described above.
+
+**Not verified:** anything against the real PMS in this pass; native Linux.
+On this machine `rustup target list --installed` shows only
+`x86_64-pc-windows-msvc`, so `cargo check --target x86_64-unknown-linux-gnu`
+stops at `can't find crate for core`. The 2026-09-27 statement that the Linux
+target is installed and `aws-lc-sys` needs `x86_64-linux-gnu-gcc` describes the
+machine that wrote it. The target was not installed here.
+
+Open, for the Owner: whether one `conhost.exe` per worker (and +18 ms per
+spawn) is acceptable, or whether the Windows Service work in 0.8 should revisit
+the flag; and how a real-PMS environment should be provided for the next pass
+(an Octane-enabled copy of `www/pms` needs the platform ignore recorded in
+`doc/LARAVEL_WORKER_0_4.md` and touches the PMS MySQL and Redis).
+
+## Recorded Checkpoint — Windows readiness pass (2026-09-27)
 
 A verification pass, not a feature. One test changed; no production code did.
 

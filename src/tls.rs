@@ -666,7 +666,7 @@ impl HandshakeStats {
         if !self.claim_notice(elapsed_ms) {
             return;
         }
-        eprintln!(
+        errln!(
             "TLS listener {address}: {} handshake(s) rejected, {} timed out, {} abandoned since start; last: {last}; reported at most once per {} s",
             self.rejected.load(Ordering::Relaxed),
             self.timed_out.load(Ordering::Relaxed),

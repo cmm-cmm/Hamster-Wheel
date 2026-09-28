@@ -44,7 +44,22 @@ pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
 pub const MAX_WORKERS: usize = 64;
 pub const MAX_QUEUE_CAPACITY: usize = 128;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default budget for a new generation to reach READY: spawn, application
+/// bootstrap and the READY frame, for the initial workers and every
+/// replacement. Warm bootstraps measured 60-400 ms, but the first start of an
+/// application whose files the machine has not opened recently is dominated by
+/// that first open: on the Windows development machine, with on-access
+/// antivirus scanning enabled, reading 10,072 vendor files took 100.7 s the
+/// first time and 0.47 s the second, and a Laravel stand-in's READY went from
+/// 0.25 s warm to 3.4-3.8 s cold. `startup_timeout` lets a pool whose
+/// application opens many files wait longer; see `doc/CONFIGURATION.md`.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Smallest configurable `startup_timeout`.
+pub const MIN_STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Largest configurable `startup_timeout`. A supervisor waits this long for a
+/// replacement before it counts the failure, so the ceiling also bounds how
+/// long one stuck bootstrap can keep a slot out of service.
+pub const MAX_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 /// Default ceiling on one application transaction, from the REQUEST frame
 /// write through the RESPONSE read.
 ///
@@ -77,6 +92,9 @@ pub const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 /// runs longer than an hour does not belong behind a synchronous HTTP request.
 pub const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// `CREATE_NO_WINDOW` process creation flag; see the worker spawn.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// How long a generation must stay READY, with at least one successful
 /// request, before its slot's failure history is forgiven.
 ///
@@ -171,6 +189,9 @@ pub struct PhpWorkerPoolConfig {
     /// kills the worker, so the value also bounds the slot's worst-case
     /// respawn rate; `config` enforces the floor that keeps that bound useful.
     pub request_timeout: Duration,
+    /// Budget for each generation of this pool to reach READY, initial and
+    /// replacement alike.
+    pub startup_timeout: Duration,
     pub max_requests: Option<u64>,
     pub max_worker_age: Option<Duration>,
     /// The process-wide request-body ceiling. Every PHP pool compiled from one
@@ -389,7 +410,7 @@ struct WorkerTimeouts {
 impl Default for WorkerTimeouts {
     fn default() -> Self {
         Self {
-            startup: STARTUP_TIMEOUT,
+            startup: DEFAULT_STARTUP_TIMEOUT,
             request: DEFAULT_REQUEST_TIMEOUT,
             shutdown: SHUTDOWN_TIMEOUT,
         }
@@ -437,13 +458,19 @@ impl PhpWorker {
         }
     }
 
-    /// Builds a worker whose transaction deadline comes from its pool's
-    /// configuration. Startup and shutdown deadlines stay fixed: they bound
-    /// Hamster's own handshake, not application execution.
-    fn with_request_timeout(config: PhpWorkerConfig, request: Duration, label: Arc<str>) -> Self {
+    /// Builds a worker whose READY and transaction deadlines come from its
+    /// pool's configuration. The shutdown deadline stays fixed: it bounds
+    /// Hamster's own SHUTDOWN handshake, not the application.
+    fn with_pool_timeouts(
+        config: PhpWorkerConfig,
+        startup: Duration,
+        request: Duration,
+        label: Arc<str>,
+    ) -> Self {
         Self::with_label(
             config,
             WorkerTimeouts {
+                startup,
                 request,
                 ..WorkerTimeouts::default()
             },
@@ -499,6 +526,17 @@ impl PhpWorker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // A console delivers Ctrl+C and Ctrl+Break to every process attached
+        // to it, and php.exe ends on either. Sharing Hamster's console would
+        // let the key press that asks Hamster to stop (Ctrl+C) or to reload
+        // certificates (Ctrl+Break) kill every worker mid-request, before the
+        // drain and SHUTDOWN that are the pool's actual stop path. The worker
+        // gets its own windowless console instead: its stdio are pipes and it
+        // needs no console of Hamster's, and unlike DETACHED_PROCESS this
+        // still gives console programs the application starts a console to
+        // inherit rather than a new visible window each.
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
         let mut child = if let Some(spawn_gate) = spawn_gate {
             let phase = spawn_gate
                 .phase
@@ -982,6 +1020,7 @@ impl PhpWorkerPool {
             queue_capacity,
             label: Arc::from("test"),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -1023,6 +1062,10 @@ impl PhpWorkerPool {
 
     pub fn request_timeout(&self) -> Duration {
         self.shared.config.request_timeout
+    }
+
+    pub fn startup_timeout(&self) -> Duration {
+        self.shared.config.startup_timeout
     }
 
     pub fn max_requests(&self) -> Option<u64> {
@@ -1076,8 +1119,9 @@ impl PhpWorkerPool {
         for (index, config) in self.shared.worker_configs.iter().cloned().enumerate() {
             let shared = Arc::clone(&self.shared);
             startup.spawn(async move {
-                let mut worker = PhpWorker::with_request_timeout(
+                let mut worker = PhpWorker::with_pool_timeouts(
                     config,
+                    shared.config.startup_timeout,
                     shared.config.request_timeout,
                     Arc::clone(&shared.config.label),
                 );
@@ -1257,7 +1301,7 @@ impl PhpWorkerPool {
             Ok(response) => match http_response(response) {
                 Ok(response) => response,
                 Err(error) => {
-                    eprintln!("invalid PHP worker response: {error}");
+                    errln!("invalid PHP worker response: {error}");
                     simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Error")
                 }
             },
@@ -1269,7 +1313,7 @@ impl PhpWorkerPool {
                 "PHP Worker Pool Unavailable",
             ),
             Err(PoolExecuteError::Worker(error)) => {
-                eprintln!("PHP worker request failed: {error}");
+                errln!("PHP worker request failed: {error}");
                 simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Unavailable")
             }
             // 502, not 504, by owner decision. The request is already
@@ -1280,7 +1324,7 @@ impl PhpWorkerPool {
             // to. The body is what distinguishes this condition, exactly as the
             // body budget's 503 does. See `doc/EXECUTION_TIMEOUT_POLICY.md`.
             Err(PoolExecuteError::ExecutionTimeout(error)) => {
-                eprintln!("PHP worker execution timeout: {error}");
+                errln!("PHP worker execution timeout: {error}");
                 simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Execution Timeout")
             }
         }
@@ -1508,7 +1552,7 @@ impl PoolShared {
         if outage < POOL_OUTAGE_NOTICE_AFTER.as_millis() as u64 {
             return;
         }
-        eprintln!(
+        errln!(
             "PHP worker pool {} recovered: {} of {} workers live after {outage} ms with none",
             self.config.label,
             self.live_workers.load(Ordering::Acquire),
@@ -1545,7 +1589,7 @@ impl PoolShared {
             {
                 return;
             }
-            eprintln!(
+            errln!(
                 "PHP worker pool {} has no live worker after {} ms; requests are refused until one is READY",
                 shared.config.label,
                 POOL_OUTAGE_NOTICE_AFTER.as_millis()
@@ -1845,7 +1889,7 @@ async fn run_worker_generation(
                             let _ = job.response_tx.send(Err(job_error(&error, message)));
                         }
                         shared.mark_unavailable(slot, generation);
-                        eprintln!(
+                        errln!(
                             "PHP worker pool {} slot {slot} generation {generation} became unavailable: {error}",
                             shared.config.label
                         );
@@ -2005,8 +2049,9 @@ async fn replacement_generation_task(mut spec: GenerationSpec) -> GenerationExit
     spec.shared.update_slot(spec.slot, |snapshot| {
         snapshot.state = WorkerLifecycleState::Bootstrapping;
     });
-    let mut worker = PhpWorker::with_request_timeout(
+    let mut worker = PhpWorker::with_pool_timeouts(
         spec.shared.worker_configs[spec.slot].clone(),
+        spec.shared.config.startup_timeout,
         spec.shared.config.request_timeout,
         Arc::clone(&spec.shared.config.label),
     );
@@ -2168,7 +2213,7 @@ fn handle_serving_exit(
                 shared.release_recycle(exit.slot);
             }
             let timeouts = shared.record_execution_timeout(exit.slot);
-            eprintln!(
+            errln!(
                 "PHP worker pool {} slot {} scheduling generation {} immediately (execution timeout {timeouts}; slot failure history unchanged)",
                 shared.config.label,
                 exit.slot,
@@ -2200,7 +2245,7 @@ fn handle_serving_exit(
             }
             let failures = shared.increment_failure(exit.slot);
             let delay = replacement_delay(failures);
-            eprintln!(
+            errln!(
                 "PHP worker pool {} slot {} scheduling generation {} after {} ms (failure {failures}{})",
                 shared.config.label,
                 exit.slot,
@@ -2240,9 +2285,11 @@ fn handle_serving_exit(
                 Ok(()) => "generation stopped".to_owned(),
                 Err(error) => error.to_string(),
             };
-            eprintln!(
+            errln!(
                 "PHP worker pool {} slot {} generation {} stopped unexpectedly: {reason}",
-                shared.config.label, exit.slot, exit.generation
+                shared.config.label,
+                exit.slot,
+                exit.generation
             );
             shared.record_exit(&exit, reason);
             shared.stop_slot(exit.slot, exit.generation);
@@ -2534,9 +2581,11 @@ async fn dispatcher_task(
                     job = returned;
                 }
                 Err(mpsc::error::TrySendError::Full(WorkerCommand::Job(returned))) => {
-                    eprintln!(
+                    errln!(
                         "PHP worker pool {} slot {} generation {} published an invalid full idle mailbox",
-                        shared.config.label, idle_worker.slot, idle_worker.generation
+                        shared.config.label,
+                        idle_worker.slot,
+                        idle_worker.generation
                     );
                     let _ = returned.response_tx.send(Err(PoolJobError::Unavailable));
                     break;
@@ -2575,12 +2624,12 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr, label: Arc<str>) 
         loop {
             match stderr.read(&mut buffer).await {
                 Ok(0) => break,
-                Ok(length) => eprintln!(
+                Ok(length) => errln!(
                     "PHP worker pool {label} stderr: {}",
                     String::from_utf8_lossy(&buffer[..length]).trim_end()
                 ),
                 Err(error) => {
-                    eprintln!("failed to drain PHP worker pool {label} stderr: {error}");
+                    errln!("failed to drain PHP worker pool {label} stderr: {error}");
                     break;
                 }
             }
@@ -2830,6 +2879,7 @@ mod tests {
             queue_capacity,
             label: Arc::from("test"),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -2998,6 +3048,7 @@ mod tests {
             queue_capacity: 8,
             label: Arc::from("test"),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),
@@ -3047,6 +3098,7 @@ mod tests {
             queue_capacity: 8,
             label: Arc::from("test"),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             max_requests: None,
             max_worker_age: None,
             body_budget: BodyBudget::disabled(),

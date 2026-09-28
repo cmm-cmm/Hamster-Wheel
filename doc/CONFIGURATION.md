@@ -49,6 +49,8 @@ workers = 4
 queue_capacity = 32
 # Ceiling on one application transaction, in seconds. Defaults to 5.
 request_timeout = 30
+# Budget for each generation to reach READY, in seconds (1-300). Defaults to 5.
+startup_timeout = 30
 # Optional lifecycle policies; omitted means OFF.
 max_requests = 10000
 max_worker_age = 3600
@@ -93,6 +95,31 @@ because it buffers no request body. `idle_timeout` defaults below the 5-second
 keep-alive timeout common to several upstream servers so Hamster normally
 retires an idle connection first; it is a policy default, not a measured
 optimum. See `doc/REVERSE_PROXY_V1.md` for the full semantics.
+
+A FastCGI location runs the PHP scripts under `root` through FastCGI endpoints
+the operator starts, for example `php-cgi.exe -b 127.0.0.1:9001` with
+`PHP_FCGI_MAX_REQUESTS=0`. Hamster never starts or restarts them. `root` and
+`servers` are required; the other fields show their defaults:
+
+```toml
+[[hosts.locations]]
+path = "/"
+handler = "fastcgi"
+root = "sites/wiki"
+
+[hosts.locations.fastcgi]
+servers = ["127.0.0.1:9001", "127.0.0.1:9002"]  # 1-64, numeric IP:port, no duplicates
+concurrency = 1               # 1-256 exchanges per server at once
+index = "index.php"           # relative .php path: front controller and directory index
+connect_timeout = 5           # seconds, 1-3600: waiting for a slot, then the connect
+response_timeout = 60         # seconds, 1-3600: backend inactivity
+```
+
+`php-cgi` on Windows serves one connection at a time, so each process is one
+`servers` entry with `concurrency = 1`. Hostnames are refused rather than
+resolved. The whole root is served: an application's private directories must
+be closed with `not_found` locations, because `.htaccess` is not read. See
+`doc/FASTCGI_V1.md` for the request mapping, CGI variables and failure answers.
 
 An optional HTTPS listener terminates TLS in front of the same hosts. Only
 `listen` and at least one certificate are required; the example shows the
@@ -185,6 +212,20 @@ returns HTTP 408 and closes the incomplete HTTP/1 exchange; it does not cancel a
 PHP request because PHP has not received one. The existing 1 MiB PHP body limit
 remains independent of this timer.
 
+`body_read_timeout` also bounds lingering close. When Hamster answers a request
+before reading its body (a declared body over the PHP limit is `413`, over the
+body budget `503`), it sends the response and FIN and then keeps reading and
+discarding what the client still sends, so the client, which may send its whole
+body before reading, receives the status instead of a TCP reset. That discard
+stops when the client closes, when nothing arrives for one second, when
+`body_read_timeout` has passed, or immediately once server shutdown has begun;
+a refused body is never read longer than an accepted one would be, and there is
+no byte bound. Measured with .NET `HttpClient` against a 1 MiB PHP limit:
+refused uploads of 2-100 MiB and a 4 MiB upload sent at 640 KiB/s all received
+`413`; a client pausing longer than one second between writes is still reset.
+The connection keeps its `max_connections` slot while lingering. See
+`src/lingering_close.rs`.
+
 `write_progress_timeout` is the maximum number of seconds an HTTP response
 socket write may remain backpressured without writing at least one byte. It
 defaults to 30 and must be 1-3600. The timer is lazy: it starts only when the
@@ -224,6 +265,21 @@ applications. The 1-second floor exists for the same reason, and because the
 deadline also covers Hamster's own protocol I/O: the worst legal payload, a
 1 MiB body echoed back, round-trips in 18.1 ms, so one second still leaves the
 application over 98% of the smallest allowed deadline.
+
+`startup_timeout` is the budget, in seconds, for one worker generation to
+reach READY: process start, the application's bootstrap and the READY frame.
+It applies to the initial workers, whose failure fails server startup, and to
+every replacement and recycle, whose failure counts against the slot's
+backoff. It is configured per `php_worker` location, defaults to 5 (the value
+that was fixed before it became configurable) and must be between 1 and 300.
+Raise it for an application whose first start is slow. Measured on the Windows
+development machine: reading 10,072 PHP files took 100.7 s the first time and
+0.47 s the second (on-access scanning was enabled), so a cold first start is
+dominated by opening files the machine has not opened recently; a Laravel
+stand-in went from 0.25 s warm to 3.4-3.8 s cold, and Symfony Demo in its
+debug environment needed 9.9-11.7 s. A larger value also lets a replacement
+that hangs in bootstrap keep its slot out of service for that long before the
+failure is counted.
 
 An execution timeout is deliberately *not* charged to the slot's
 infrastructure failure history, so repeated slow requests cannot walk a slot
@@ -433,7 +489,10 @@ invalid or duplicate normalized location paths; unknown handlers; missing or
 unexpected handler fields; invalid pool bounds; static roots that cannot be
 canonicalized or are not directories; PHP executable/script paths that are
 missing or not files; and proxy upstreams that are not `http://host[:port]`,
-cannot be resolved, or carry out-of-range timeouts or `max_idle`. Errors identify the field plus the host/location index or
+cannot be resolved, or carry out-of-range timeouts or `max_idle`; and FastCGI
+locations without a root or `servers`, with nonnumeric, duplicate or port-0
+servers, out-of-range `concurrency` or timeouts, or an `index` that is not a
+relative `.php` path inside the root. Errors identify the field plus the host/location index or
 name where applicable. No dangerous input is silently repaired, and PHP is not
 searched from `PATH`.
 

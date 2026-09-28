@@ -38,6 +38,13 @@ A replacement becomes dispatchable only after a valid READY handshake.
 Initial startup remains all-or-nothing. A replacement bootstrap failure affects
 only its slot and re-enters per-slot backoff; it does not stop the running pool.
 
+Amendment (2026-09-28, working tree, awaiting Owner review): the READY budget,
+fixed at 5 s when this contract was accepted, is now the per-pool
+`php.startup_timeout` (1-300 s, default 5). Initial and replacement
+generations use the same value. Nothing else in this contract changes. The
+reason is measured cold starts on Windows that exceed 5 s; see
+`doc/CONFIGURATION.md`.
+
 ## Idle Channel Ownership
 
 An `idle_tx` sender may be owned only by a live generation task or a pending

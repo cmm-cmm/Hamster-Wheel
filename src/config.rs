@@ -12,10 +12,17 @@ use std::{
 use serde::Deserialize;
 
 use crate::body_budget::BodyBudget;
+use crate::fastcgi::{
+    DEFAULT_CONNECT_TIMEOUT as FASTCGI_DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_INDEX as FASTCGI_DEFAULT_INDEX,
+    DEFAULT_RESPONSE_TIMEOUT as FASTCGI_DEFAULT_RESPONSE_TIMEOUT, FastCgiBackend, FastCgiConfig,
+    MAX_CONCURRENCY as FASTCGI_MAX_CONCURRENCY, MAX_SERVERS as FASTCGI_MAX_SERVERS,
+};
 use crate::php_worker::{
-    DEFAULT_REQUEST_TIMEOUT, MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY, MAX_REQUEST_TIMEOUT,
-    MAX_WORKERS, MIN_REQUEST_TIMEOUT, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool,
-    PhpWorkerPoolConfig, WorkerStart,
+    DEFAULT_REQUEST_TIMEOUT, DEFAULT_STARTUP_TIMEOUT, MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY,
+    MAX_REQUEST_TIMEOUT, MAX_STARTUP_TIMEOUT, MAX_WORKERS, MIN_REQUEST_TIMEOUT,
+    MIN_STARTUP_TIMEOUT, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool, PhpWorkerPoolConfig,
+    WorkerStart,
 };
 use crate::proxy::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_IDLE, DEFAULT_PROGRESS_TIMEOUT,
@@ -147,6 +154,17 @@ struct RawLocation {
     root: Option<PathBuf>,
     php: Option<RawPhpWorker>,
     proxy: Option<RawProxy>,
+    fastcgi: Option<RawFastCgi>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFastCgi {
+    servers: Vec<String>,
+    concurrency: Option<usize>,
+    index: Option<String>,
+    connect_timeout: Option<u64>,
+    response_timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +188,7 @@ struct RawPhpWorker {
     workers: usize,
     queue_capacity: Option<usize>,
     request_timeout: Option<u64>,
+    startup_timeout: Option<u64>,
     max_requests: Option<u64>,
     max_worker_age: Option<u64>,
     /// Extra environment for the worker process. The server never interprets
@@ -190,6 +209,7 @@ pub struct RuntimeConfig {
     router: Arc<HostRouter>,
     php_pools: Vec<Arc<PhpWorkerPool>>,
     upstreams: Vec<Arc<Upstream>>,
+    fastcgi_backends: Vec<Arc<FastCgiBackend>>,
 }
 
 #[derive(Debug)]
@@ -435,6 +455,11 @@ impl RuntimeConfig {
         &self.upstreams
     }
 
+    /// Every FastCGI location's backend, in configuration order.
+    pub fn fastcgi_backends(&self) -> &[Arc<FastCgiBackend>] {
+        &self.fastcgi_backends
+    }
+
     pub fn php_workers(&self) -> &[Arc<PhpWorkerPool>] {
         &self.php_pools
     }
@@ -577,6 +602,7 @@ fn builtin_raw_config() -> RawConfig {
                     root: None,
                     php: None,
                     proxy: None,
+                    fastcgi: None,
                 },
                 RawLocation {
                     path: "/".to_owned(),
@@ -584,6 +610,7 @@ fn builtin_raw_config() -> RawConfig {
                     root: Some(PathBuf::from(DEFAULT_DOCUMENT_ROOT)),
                     php: None,
                     proxy: None,
+                    fastcgi: None,
                 },
             ],
         }],
@@ -643,6 +670,7 @@ enum ValidatedHandler {
         workers: usize,
         queue_capacity: usize,
         request_timeout: Duration,
+        startup_timeout: Duration,
         max_requests: Option<u64>,
         max_worker_age: Option<Duration>,
         env: BTreeMap<String, String>,
@@ -657,6 +685,14 @@ enum ValidatedHandler {
         idle_timeout: Duration,
         max_idle: usize,
         preserve_host: bool,
+    },
+    FastCgi {
+        resolved_root: PathBuf,
+        servers: Vec<SocketAddr>,
+        concurrency: usize,
+        index: String,
+        connect_timeout: Duration,
+        response_timeout: Duration,
     },
 }
 
@@ -794,6 +830,12 @@ pub(crate) fn validate_raw(
                     location.path
                 )));
             }
+            if location.fastcgi.is_some() && location.handler != "fastcgi" {
+                return Err(ConfigError::Validation(format!(
+                    "{context}.fastcgi is not valid for handler {:?}",
+                    location.handler
+                )));
+            }
             let handler = match location.handler.as_str() {
                 "static" => {
                     if location.php.is_some() {
@@ -894,6 +936,20 @@ pub(crate) fn validate_raw(
                             configured
                         }
                     };
+                    let startup_timeout = match php.startup_timeout {
+                        None => DEFAULT_STARTUP_TIMEOUT,
+                        Some(seconds) => {
+                            let configured = Duration::from_secs(seconds);
+                            if !(MIN_STARTUP_TIMEOUT..=MAX_STARTUP_TIMEOUT).contains(&configured) {
+                                return Err(ConfigError::Validation(format!(
+                                    "{context}.php.startup_timeout must be between {} and {} seconds",
+                                    MIN_STARTUP_TIMEOUT.as_secs(),
+                                    MAX_STARTUP_TIMEOUT.as_secs()
+                                )));
+                            }
+                            configured
+                        }
+                    };
                     if php.max_requests == Some(0) {
                         return Err(ConfigError::Validation(format!(
                             "{context}.php.max_requests must be at least 1 when configured"
@@ -929,6 +985,7 @@ pub(crate) fn validate_raw(
                         workers: php.workers,
                         queue_capacity,
                         request_timeout,
+                        startup_timeout,
                         max_requests: php.max_requests,
                         max_worker_age: php.max_worker_age.map(Duration::from_secs),
                         env: php.env,
@@ -952,9 +1009,42 @@ pub(crate) fn validate_raw(
                     })?;
                     validate_proxy(proxy, &context)?
                 }
+                "fastcgi" => {
+                    if location.php.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php is not valid for handler \"fastcgi\""
+                        )));
+                    }
+                    if location.proxy.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.proxy is not valid for handler \"fastcgi\""
+                        )));
+                    }
+                    let root = location.root.ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "{context}.root is required for handler \"fastcgi\""
+                        ))
+                    })?;
+                    if root.as_os_str().is_empty() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.root must not be empty"
+                        )));
+                    }
+                    let resolved_root = if root.is_absolute() {
+                        root
+                    } else {
+                        base_directory.join(root)
+                    };
+                    let fastcgi = location.fastcgi.ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "{context}.fastcgi is required for handler \"fastcgi\""
+                        ))
+                    })?;
+                    validate_fastcgi(fastcgi, resolved_root, &context)?
+                }
                 handler => {
                     return Err(ConfigError::Validation(format!(
-                        "{context}.handler {handler:?} is unknown; expected \"static\", \"not_found\", \"php_worker\", or \"proxy\""
+                        "{context}.handler {handler:?} is unknown; expected \"static\", \"not_found\", \"php_worker\", \"proxy\", or \"fastcgi\""
                     )));
                 }
             };
@@ -972,6 +1062,87 @@ pub(crate) fn validate_raw(
         tls,
         http_limits,
         hosts,
+    })
+}
+
+/// Validates a `fastcgi` location without touching the filesystem or the
+/// network: the root is canonicalized and the servers are used only at
+/// compilation and request time.
+fn validate_fastcgi(
+    fastcgi: RawFastCgi,
+    resolved_root: PathBuf,
+    context: &str,
+) -> Result<ValidatedHandler, ConfigError> {
+    if fastcgi.servers.is_empty() || fastcgi.servers.len() > FASTCGI_MAX_SERVERS {
+        return Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.servers must list between 1 and {FASTCGI_MAX_SERVERS} addresses"
+        )));
+    }
+    let mut servers = Vec::with_capacity(fastcgi.servers.len());
+    for (index, server) in fastcgi.servers.iter().enumerate() {
+        let field = format!("{context}.fastcgi.servers[{index}]");
+        let address = server.parse::<SocketAddr>().map_err(|error| {
+            ConfigError::Validation(format!(
+                "{field} {server:?} is not a numeric IP socket address: {error}"
+            ))
+        })?;
+        if address.port() == 0 {
+            return Err(ConfigError::Validation(format!(
+                "{field} {server:?} must name a port"
+            )));
+        }
+        if servers.contains(&address) {
+            return Err(ConfigError::Validation(format!(
+                "{field} {server:?} is listed twice"
+            )));
+        }
+        servers.push(address);
+    }
+    let concurrency = fastcgi.concurrency.unwrap_or(1);
+    if !(1..=FASTCGI_MAX_CONCURRENCY).contains(&concurrency) {
+        return Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.concurrency must be between 1 and {FASTCGI_MAX_CONCURRENCY}"
+        )));
+    }
+    let index = fastcgi
+        .index
+        .unwrap_or_else(|| FASTCGI_DEFAULT_INDEX.to_owned());
+    let plain_segments = !index.is_empty()
+        && !index.starts_with('/')
+        && index.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && !segment.contains(['\\', ':', '\0'])
+        });
+    let script = index.len() > 4 && index[index.len() - 4..].eq_ignore_ascii_case(".php");
+    if !plain_segments || !script {
+        return Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.index {index:?} must be a relative path to a .php script inside the root"
+        )));
+    }
+    let seconds = |value: Option<u64>, default: Duration, name: &str| match value {
+        None => Ok(default),
+        Some(value @ 1..=3600) => Ok(Duration::from_secs(value)),
+        Some(_) => Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.{name} must be between 1 and 3600 seconds"
+        ))),
+    };
+    Ok(ValidatedHandler::FastCgi {
+        resolved_root,
+        servers,
+        concurrency,
+        index,
+        connect_timeout: seconds(
+            fastcgi.connect_timeout,
+            FASTCGI_DEFAULT_CONNECT_TIMEOUT,
+            "connect_timeout",
+        )?,
+        response_timeout: seconds(
+            fastcgi.response_timeout,
+            FASTCGI_DEFAULT_RESPONSE_TIMEOUT,
+            "response_timeout",
+        )?,
     })
 }
 
@@ -1216,6 +1387,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
     let mut virtual_hosts = Vec::new();
     let mut php_pools = Vec::new();
     let mut upstreams = Vec::new();
+    let mut fastcgi_backends = Vec::new();
     // One budget for the whole process. Every PHP pool shares it, because the
     // resource it protects is this process's memory, not a pool's queue.
     let body_budget = BodyBudget::new(validated.http_limits.max_body_memory());
@@ -1224,28 +1396,41 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         for (location_index, location) in host.locations.into_iter().enumerate() {
             let handler = match location.handler {
                 ValidatedHandler::Static { resolved_root } => {
-                    let canonical_root = fs::canonicalize(&resolved_root).map_err(|error| {
-                        ConfigError::Compile(format!(
-                            "hosts[{host_index}] ({:?}).locations[{location_index}].root {} cannot be canonicalized: {error}",
-                            host.name,
-                            resolved_root.display()
-                        ))
-                    })?;
-                    let metadata = fs::metadata(&canonical_root).map_err(|error| {
-                        ConfigError::Compile(format!(
-                            "hosts[{host_index}] ({:?}).locations[{location_index}].root {} cannot be inspected: {error}",
-                            host.name,
-                            canonical_root.display()
-                        ))
-                    })?;
-                    if !metadata.is_dir() {
-                        return Err(ConfigError::Compile(format!(
-                            "hosts[{host_index}] ({:?}).locations[{location_index}].root {} is not a directory",
-                            host.name,
-                            canonical_root.display()
-                        )));
-                    }
+                    let canonical_root = canonical_directory(
+                        &resolved_root,
+                        &format!(
+                            "hosts[{host_index}] ({:?}).locations[{location_index}].root",
+                            host.name
+                        ),
+                    )?;
                     Handler::static_files(Arc::new(canonical_root))
+                }
+                ValidatedHandler::FastCgi {
+                    resolved_root,
+                    servers,
+                    concurrency,
+                    index,
+                    connect_timeout,
+                    response_timeout,
+                } => {
+                    let document_root = canonical_directory(
+                        &resolved_root,
+                        &format!(
+                            "hosts[{host_index}] ({:?}).locations[{location_index}].root",
+                            host.name
+                        ),
+                    )?;
+                    let backend = FastCgiBackend::new(FastCgiConfig {
+                        label: Arc::from(format!("{}{}", host.name, location.path).as_str()),
+                        document_root,
+                        index,
+                        servers,
+                        concurrency,
+                        connect_timeout,
+                        response_timeout,
+                    });
+                    fastcgi_backends.push(Arc::clone(&backend));
+                    Handler::fastcgi(backend)
                 }
                 ValidatedHandler::NotFound => Handler::not_found(),
                 ValidatedHandler::PhpWorker {
@@ -1254,6 +1439,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     workers,
                     queue_capacity,
                     request_timeout,
+                    startup_timeout,
                     max_requests,
                     max_worker_age,
                     env,
@@ -1287,6 +1473,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         workers,
                         queue_capacity,
                         request_timeout,
+                        startup_timeout,
                         max_requests,
                         max_worker_age,
                         body_budget: Arc::clone(&body_budget),
@@ -1358,7 +1545,30 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         router: Arc::new(router),
         php_pools,
         upstreams,
+        fastcgi_backends,
     })
+}
+
+fn canonical_directory(path: &Path, field: &str) -> Result<PathBuf, ConfigError> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        ConfigError::Compile(format!(
+            "{field} {} cannot be canonicalized: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        ConfigError::Compile(format!(
+            "{field} {} cannot be inspected: {error}",
+            canonical.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(ConfigError::Compile(format!(
+            "{field} {} is not a directory",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 fn canonical_file(path: &Path, field: &str) -> Result<PathBuf, ConfigError> {

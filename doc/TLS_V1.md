@@ -503,7 +503,10 @@ was boxed).
   a reset that can destroy the response. A client that uses
   `Expect: 100-continue` receives it reliably. Bytes buffered before a
   response body fails mid-stream may not be flushed. Reproduced with the
-  pre-TLS build; see Verification.
+  pre-TLS build; see Verification. (Early refusals: fixed on 2026-09-28 by
+  lingering close after .NET's HttpClient lost the 413 in 10 of 10 uploads;
+  see `doc/PHP_APPLICATION_COMPATIBILITY.md`. The mid-body flush limit is
+  unchanged.)
 - **One private key per certificate entry, first key in the file.** Additional
   keys in the same PEM file are ignored.
 - **Handshake counters are not exported**; they are visible only through the
@@ -531,7 +534,9 @@ The Owner keeps the HTTP listener serving every configured host at this
 milestone. No per-host HTTPS-only policy or redirect is added. Early refusals
 continue to close the connection after the response; a client that keeps
 sending can observe a reset instead of the status. Lingering close is deferred
-until evidence from a real client warrants it.
+until evidence from a real client warrants it. (That evidence arrived on
+2026-09-28 -- .NET's HttpClient saw a reset in 10 of 10 oversized uploads --
+and lingering close was implemented in `src/lingering_close.rs`.)
 
 The final source review found two TLS startup defects: a bare leaf with
 client-auth-only EKU previously passed because EKU was checked only during

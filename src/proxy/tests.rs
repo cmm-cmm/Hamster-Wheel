@@ -1538,9 +1538,7 @@ async fn an_upstream_that_crashes_mid_response_never_yields_a_clean_short_respon
 
 #[tokio::test]
 async fn a_refused_connection_is_a_bad_gateway() {
-    let unused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let address = unused.local_addr().unwrap();
-    drop(unused);
+    let address = crate::test_ports::unused_outside_dynamic_range();
     // Windows reports a refused loopback connect only after retrying the SYN;
     // the connect budget must outlast that for the refusal, rather than the
     // timeout, to be what is observed.
@@ -1818,9 +1816,7 @@ async fn graceful_shutdown_bounds_an_active_proxied_stream() {
 
 #[tokio::test]
 async fn upstreams_of_different_hosts_are_independent() {
-    let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let dead_address = dead.local_addr().unwrap();
-    drop(dead);
+    let dead_address = crate::test_ports::unused_outside_dynamic_range();
     let listener = upstream_listener(None).await;
     let broken = upstream_with(dead_address, |config| {
         config.connect_timeout = Duration::from_secs(8);

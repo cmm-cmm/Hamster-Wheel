@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod common;
+
 use hamster_wheel::{
     config,
     php_worker::{PoolSnapshot, WorkerLifecycleState, WorkerSpawnReason},
@@ -529,7 +531,7 @@ async fn laravel_octane_adapter_stages_response_until_cleanup_commit() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("10 checks passed"),
+        String::from_utf8_lossy(&output.stdout).contains("12 checks passed"),
         "the check script must report every verified boundary"
     );
 }
@@ -2765,6 +2767,13 @@ fn ctrl_c_helper_entry() {
         return;
     };
     let target = target.parse::<u32>().unwrap();
+    // 0 is CTRL_C_EVENT, 1 is CTRL_BREAK_EVENT.
+    let event = std::env::var("HAMSTER_CTRL_EVENT").map_or(0, |event| event.parse().unwrap());
+    // The helper is attached to the same console, so it receives the event
+    // too. A null handler would ignore only Ctrl+C; this ignores both.
+    unsafe extern "system" fn ignore_console_event(_: u32) -> i32 {
+        1
+    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn FreeConsole() -> i32;
@@ -2778,8 +2787,8 @@ fn ctrl_c_helper_entry() {
     unsafe {
         FreeConsole();
         assert_ne!(AttachConsole(target), 0);
-        assert_ne!(SetConsoleCtrlHandler(None, 1), 0);
-        assert_ne!(GenerateConsoleCtrlEvent(0, 0), 0);
+        assert_ne!(SetConsoleCtrlHandler(Some(ignore_console_event), 1), 0);
+        assert_ne!(GenerateConsoleCtrlEvent(event, 0), 0);
     }
     std::thread::sleep(Duration::from_millis(200));
 }
@@ -2830,6 +2839,7 @@ async fn ctrl_c_stops_server_and_reaps_pool() {
     );
     tokio::fs::write(&config_path, source).await.unwrap();
 
+    common::end_children_with_this_process();
     let mut command = tokio::process::Command::new(executable);
     command
         .arg("--config")
@@ -2889,6 +2899,532 @@ async fn ctrl_c_stops_server_and_reaps_pool() {
         "unexpected diagnostics: {diagnostics:?}"
     );
     let _ = tokio::fs::remove_file(config_path).await;
+}
+
+/// A server in its own console with both standard streams piped, which is how
+/// a supervisor or log shipper runs it. The tests below close one of those
+/// pipes while the server runs and then check that Hamster keeps its normal
+/// failure and shutdown behavior instead of dying on the next output line.
+#[cfg(windows)]
+struct ConsoleServer {
+    child: tokio::process::Child,
+    pid: u32,
+    address: SocketAddr,
+    workers: Vec<WorkerProcess>,
+    stdout: Option<tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>>,
+    stderr: Option<tokio::process::ChildStderr>,
+    config_path: PathBuf,
+}
+
+#[cfg(windows)]
+impl ConsoleServer {
+    /// `None` when there is no console to create a child console from. With
+    /// `tls`, an HTTPS listener is added beside the cleartext one, which is
+    /// what makes the server handle Ctrl+Break as a certificate reload.
+    async fn start(name: &str, workers: usize, tls: bool) -> Option<Self> {
+        use std::{os::windows::process::CommandExt, process::Stdio};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetConsoleCP() -> u32;
+            fn SetConsoleCtrlHandler(
+                handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                add: i32,
+            ) -> i32;
+        }
+        if unsafe { GetConsoleCP() } == 0 {
+            eprintln!("SKIPPED: {name} requires an attached Windows console");
+            return None;
+        }
+        // See ctrl_c_stops_server_and_reaps_pool: an inherited ignore-Ctrl+C
+        // attribute would otherwise reach the server.
+        // SAFETY: clears only this process's own ignore attribute.
+        unsafe { SetConsoleCtrlHandler(None, 0) };
+
+        let config_path = marker_path(name).with_extension("toml");
+        let php = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
+        let tls_section = if tls {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            let cert_path = config_path.with_extension("pem");
+            let key_path = config_path.with_extension("key");
+            tokio::fs::write(&cert_path, cert.pem()).await.unwrap();
+            tokio::fs::write(&key_path, key.serialize_pem())
+                .await
+                .unwrap();
+            format!(
+                "\n[server.tls]\nlisten = \"127.0.0.2:0\"\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\ndefault = true\n",
+                toml_literal(&cert_path),
+                toml_literal(&key_path)
+            )
+        } else {
+            String::new()
+        };
+        let source = format!(
+            "[server]\nlisten = \"127.0.0.1:0\"\n{tls_section}\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = {workers}\nqueue_capacity = 8\n",
+            toml_literal(&php),
+            toml_literal(&script)
+        );
+        tokio::fs::write(&config_path, source).await.unwrap();
+
+        common::end_children_with_this_process();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_hamster-wheel"));
+        command
+            .arg("--config")
+            .arg(&config_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command.as_std_mut().creation_flags(CREATE_NEW_CONSOLE);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr = child.stderr.take();
+
+        let mut worker_pids = Vec::new();
+        let address = tokio::time::timeout(Duration::from_secs(10), async {
+            // Listening lines are printed cleartext first, then HTTPS.
+            let mut cleartext = None;
+            while let Some(line) = stdout.next_line().await.unwrap() {
+                if let Some(rest) = line.rsplit(" worker ").next()
+                    && line.contains(" ready after ")
+                {
+                    worker_pids.push(rest.split(' ').next().unwrap().parse::<u32>().unwrap());
+                }
+                if let Some(address) = line.strip_prefix("Hamster Wheel listening on http://") {
+                    cleartext = Some(address.parse::<SocketAddr>().unwrap());
+                    if !tls {
+                        return cleartext.unwrap();
+                    }
+                }
+                if line.starts_with("Hamster Wheel listening on https://") {
+                    return cleartext.expect("cleartext listener printed first");
+                }
+            }
+            panic!("server exited before listening");
+        })
+        .await
+        .expect("server should become ready");
+        assert_eq!(worker_pids.len(), workers, "one ready line per worker");
+
+        Some(Self {
+            child,
+            pid,
+            address,
+            workers: worker_pids.into_iter().map(WorkerProcess::open).collect(),
+            stdout: Some(stdout),
+            stderr,
+            config_path,
+        })
+    }
+
+    async fn get(&self, path: &str) -> String {
+        console_get(self.address, path).await
+    }
+
+    /// Delivers a console control event to every process attached to the
+    /// server's console, as a key press in that console would.
+    async fn console_event(&self, event: u32) {
+        let helper = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("ctrl_c_helper_entry")
+            .env("HAMSTER_CTRL_C_TARGET", self.pid.to_string())
+            .env("HAMSTER_CTRL_EVENT", event.to_string())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            helper.status.success(),
+            "console event helper failed: {}{}",
+            String::from_utf8_lossy(&helper.stdout),
+            String::from_utf8_lossy(&helper.stderr)
+        );
+    }
+
+    /// Sends Ctrl+C and waits for the process to exit.
+    async fn ctrl_c(&mut self) -> std::process::ExitStatus {
+        self.console_event(0).await;
+        match tokio::time::timeout(Duration::from_secs(10), self.child.wait()).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                self.child.kill().await.unwrap();
+                panic!("server did not stop after Ctrl+C");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleServer {
+    fn drop(&mut self) {
+        for extension in ["toml", "pem", "key"] {
+            let _ = std::fs::remove_file(self.config_path.with_extension(extension));
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn console_get(address: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream.write_all(&close_request(path)).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("response within ten seconds")
+        .unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// Starts a slow request and returns once PHP is executing it, so a console
+/// event sent next arrives while the request is in flight.
+#[cfg(windows)]
+async fn start_in_flight(address: SocketAddr, name: &str) -> JoinHandle<String> {
+    let marker = marker_path(name);
+    let path = format!("/delay?ms=1500&start_marker={}", url_encode(&marker));
+    let request = tokio::spawn(async move { console_get(address, &path).await });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "the slow request never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = std::fs::remove_file(&marker);
+    request
+}
+
+/// A handle to a live worker, opened while it is known to be running. Unlike a
+/// PID, which Windows reuses quickly while a parallel suite spawns php.exe, the
+/// handle keeps naming this process after it exits and reports its exit code:
+/// the fixture exits 0 after SHUTDOWN_ACK, while a kill reports 1.
+#[cfg(windows)]
+struct WorkerProcess {
+    pid: u32,
+    handle: isize,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+    fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(handle: isize, exit_code: *mut u32) -> i32;
+    fn CloseHandle(handle: isize) -> i32;
+}
+
+#[cfg(windows)]
+impl WorkerProcess {
+    fn open(pid: u32) -> Self {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        // SAFETY: plain Win32 call; a null result is checked below.
+        let handle =
+            unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert_ne!(handle, 0, "open worker {pid} while it is running");
+        Self { pid, handle }
+    }
+
+    fn is_running(&self) -> bool {
+        const WAIT_TIMEOUT: u32 = 0x0000_0102;
+        // SAFETY: the handle is owned by self and open.
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
+    }
+
+    /// The exit code, once the process has exited within five seconds.
+    fn exit_code(&self) -> u32 {
+        const WAIT_OBJECT_0: u32 = 0;
+        // SAFETY: the handle is owned by self and open.
+        let waited = unsafe { WaitForSingleObject(self.handle, 5_000) };
+        assert_eq!(
+            waited, WAIT_OBJECT_0,
+            "worker {} is still running",
+            self.pid
+        );
+        let mut code = 0;
+        // SAFETY: as above; `code` outlives the call.
+        assert_ne!(unsafe { GetExitCodeProcess(self.handle, &mut code) }, 0);
+        code
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by self and closed exactly once.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(windows)]
+fn collect_lines<R>(pipe: R) -> JoinHandle<Vec<String>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(pipe).lines();
+        let mut output = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            output.push(line);
+        }
+        output
+    })
+}
+
+/// A supervisor that stops reading and closes the server's stdout must not
+/// turn the next operational line, here the shutdown line, into a panic that
+/// skips the orderly worker shutdown.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe and a Windows console"]
+async fn a_closed_stdout_does_not_turn_ctrl_c_into_a_panic() {
+    let Some(mut server) = ConsoleServer::start("stdout-closed", 2, false).await else {
+        return;
+    };
+    let diagnostics = collect_lines(server.stderr.take().unwrap());
+    drop(server.stdout.take());
+
+    let response = server.get("/").await;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+
+    let status = server.ctrl_c().await;
+    let diagnostics = diagnostics.await.unwrap();
+    assert!(
+        status.success(),
+        "exit {status:?}, diagnostics: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+    for worker in &server.workers {
+        assert_eq!(
+            worker.exit_code(),
+            0,
+            "worker {} was not shut down",
+            worker.pid
+        );
+    }
+}
+
+/// Diagnostics go to stderr from the connection tasks, the generation tasks
+/// and the pool supervisor. With stderr closed, a worker crash must still be
+/// answered, replaced and shut down exactly as it is with stderr open.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe and a Windows console"]
+async fn a_closed_stderr_does_not_stop_a_crashed_worker_from_being_replaced() {
+    let Some(mut server) = ConsoleServer::start("stderr-closed", 1, false).await else {
+        return;
+    };
+    let output = collect_lines(server.stdout.take().unwrap().into_inner());
+    drop(server.stderr.take());
+
+    let first = server.get("/state").await;
+    assert!(first.starts_with("HTTP/1.1 200 OK\r\n"), "{first}");
+    let crashed = server.get("/crash").await;
+    assert!(crashed.starts_with("HTTP/1.1 502 "), "{crashed}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let replacement = loop {
+        let response = server.get("/state").await;
+        if response.starts_with("HTTP/1.1 200 OK\r\n") {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no replacement worker served within ten seconds: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let replacement_pid = replacement
+        .split("\"pid\":")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .expect("state response carries the worker pid");
+    assert_ne!(
+        server.workers[0].pid, replacement_pid,
+        "the crashed worker cannot still be serving"
+    );
+    let replacement = WorkerProcess::open(replacement_pid);
+
+    let status = server.ctrl_c().await;
+    let output = output.await.unwrap();
+    assert!(status.success(), "exit {status:?}, stdout: {output:?}");
+    assert!(
+        output.iter().any(|line| line == "Hamster Wheel stopped"),
+        "{output:?}"
+    );
+    assert_eq!(server.workers[0].exit_code(), 42, "the crashed worker");
+    assert_eq!(
+        replacement.exit_code(),
+        0,
+        "the replacement was not shut down"
+    );
+}
+
+/// Ctrl+C in the server's console is Hamster's stop request. Shutdown drains
+/// accepted PHP work and then stops each worker with SHUTDOWN, so the console
+/// event must reach Hamster only: a worker sharing the console would be ended
+/// by the same key press, taking its in-flight request with it.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe and a Windows console"]
+async fn ctrl_c_drains_an_in_flight_php_request() {
+    let Some(mut server) = ConsoleServer::start("ctrl-c-drain", 1, false).await else {
+        return;
+    };
+    let diagnostics = collect_lines(server.stderr.take().unwrap());
+    let _output = collect_lines(server.stdout.take().unwrap().into_inner());
+
+    let in_flight = start_in_flight(server.address, "ctrl-c-drain-start").await;
+    let status = server.ctrl_c().await;
+    let response = in_flight.await.unwrap();
+    let diagnostics = diagnostics.await.unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n") && response.ends_with("delayed"),
+        "the in-flight request must complete: {response:?}, diagnostics: {diagnostics:?}"
+    );
+    assert!(
+        status.success(),
+        "exit {status:?}, diagnostics: {diagnostics:?}"
+    );
+    assert_eq!(
+        server.workers[0].exit_code(),
+        0,
+        "the worker must stop through SHUTDOWN, not the console event"
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+}
+
+/// Ctrl+Break in the server's console reloads TLS certificates and nothing
+/// else. PHP workers must keep serving across it, including the request in
+/// flight when it arrives.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires repository php/8.5/php.exe and a Windows console"]
+async fn ctrl_break_reload_leaves_php_workers_serving() {
+    let Some(mut server) = ConsoleServer::start("ctrl-break-php", 2, true).await else {
+        return;
+    };
+    let diagnostics = collect_lines(server.stderr.take().unwrap());
+    let output = collect_lines(server.stdout.take().unwrap().into_inner());
+
+    let in_flight = start_in_flight(server.address, "ctrl-break-start").await;
+    server.console_event(1).await;
+    let response = in_flight.await.unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n") && response.ends_with("delayed"),
+        "the in-flight request must complete across a reload: {response:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for worker in &server.workers {
+        assert!(
+            worker.is_running(),
+            "worker {} ended on Ctrl+Break with {:#x}",
+            worker.pid,
+            worker.exit_code()
+        );
+    }
+    let state = server.get("/state").await;
+    assert!(state.starts_with("HTTP/1.1 200 OK\r\n"), "{state}");
+
+    let status = server.ctrl_c().await;
+    let output = output.await.unwrap();
+    let diagnostics = diagnostics.await.unwrap();
+    assert!(
+        output
+            .iter()
+            .any(|line| line.starts_with("TLS certificate reload succeeded")),
+        "the reload must have run: {output:?}"
+    );
+    assert!(
+        status.success(),
+        "exit {status:?}, diagnostics: {diagnostics:?}"
+    );
+    for worker in &server.workers {
+        assert_eq!(
+            worker.exit_code(),
+            0,
+            "worker {} was not shut down",
+            worker.pid
+        );
+    }
+    assert!(
+        diagnostics.is_empty(),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+}
+
+/// A pool whose bootstrap outlasts the default five-second READY budget, as a
+/// first start does when the machine has not opened the application's files
+/// recently, fails to start by default and starts with `startup_timeout`. The
+/// same budget applies to a replacement generation, which must not be killed
+/// at five seconds either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires repository php/8.5/php.exe"]
+async fn startup_timeout_admits_a_bootstrap_slower_than_the_default_budget() {
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/delayed_ready.php");
+    let runtime = |extra: &str| {
+        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+        let source = format!(
+            "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 8\n{extra}\n[hosts.locations.php.env]\nHAMSTER_READY_DELAY_MS = \"6500\"\n",
+            toml_literal(&executable),
+            toml_literal(&script)
+        );
+        Arc::new(
+            config::compile_str(&source, Path::new(env!("CARGO_MANIFEST_DIR")))
+                .expect("config compiles"),
+        )
+    };
+
+    let default_budget = runtime("");
+    let started = Instant::now();
+    let error = default_budget
+        .start_workers()
+        .await
+        .expect_err("a 6.5 s bootstrap exceeds the default five seconds");
+    assert!(error.to_string().contains("READY timeout"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    default_budget.shutdown_workers().await.unwrap();
+
+    let server = TestServer::start_runtime(runtime("startup_timeout = 12\n")).await;
+    let pool = server.runtime.php_worker().unwrap();
+    assert_eq!(pool.startup_timeout(), Duration::from_secs(12));
+    let response = server.request(&close_request("/")).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+    // The replacement boots just as slowly and must be given the same budget.
+    let crashed = server.request(&close_request("/crash")).await;
+    assert!(crashed.starts_with(b"HTTP/1.1 502 "));
+    let replaced = wait_for_pool(pool, |snapshot| {
+        snapshot.workers[0].generation == 2 && snapshot.live_workers == 1
+    })
+    .await;
+    assert_eq!(
+        replaced.workers[0].consecutive_failures, 1,
+        "the replacement itself must not have failed at five seconds"
+    );
+    let response = server.request(&close_request("/")).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    server.stop().await;
 }
 
 /// The worker environment is how a worker script is told which application it
@@ -3071,7 +3607,16 @@ async fn execution_timeouts_never_enter_the_infrastructure_backoff_ladder() {
         let (_, body) = split_response(&response);
         assert_eq!(body, b"PHP Worker Execution Timeout", "round {round}");
 
-        let snapshot = pool.snapshot();
+        // The 502 is sent by the generation task before that generation exits,
+        // and the supervisor records the timeout only when it joins the exit,
+        // so a snapshot taken the moment the response arrives can precede it
+        // (seen once in six parallel suite runs). Wait for the record, then
+        // require that it counted this timeout exactly once. The slot counter is
+        // written after the pool total, so waiting on it covers both.
+        let snapshot = wait_for_pool(pool, |snapshot| {
+            snapshot.workers[0].execution_timeouts >= u64::from(round)
+        })
+        .await;
         assert_eq!(
             snapshot.workers[0].consecutive_failures, 0,
             "an execution timeout is not an infrastructure failure (round {round})"

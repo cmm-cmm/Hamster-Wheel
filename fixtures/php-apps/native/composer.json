@@ -1,0 +1,14 @@
+{
+    "name": "hamster/native-app",
+    "description": "Framework-free persistent PHP application used to test Hamster Wheel. Not a product.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "NativeApp\\": "src/"
+        }
+    }
+}

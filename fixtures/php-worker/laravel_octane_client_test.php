@@ -65,8 +65,7 @@ namespace Laravel\Octane\Contracts {
 
 namespace {
     require __DIR__ . '/protocol.php';
-
-    const HAMSTER_FORBIDDEN_RESPONSE_HEADERS = [];
+    require __DIR__ . '/adapter_support.php';
 
     function hamster_response_headers($response): array
     {
@@ -139,6 +138,20 @@ namespace {
     $client->stop();
     check('retiring client leaves staged response invisible', ftell($retired), 0);
     check('stopped client retires generation', $client->shouldStop(), true);
+
+    $large = fopen('php://memory', 'w+b');
+    $client = new HamsterOctaneClient($large);
+    $client->respond($context, new \Laravel\Octane\OctaneResponse(
+        new \Symfony\Component\HttpFoundation\Response(str_repeat('x', HAMSTER_MAX_FRAME))
+    ));
+    $client->markCleanupCompleted();
+    $client->flushResponse();
+    rewind($large);
+    $length = unpack('Nlength', fread($large, 4))['length'];
+    $payload = fread($large, $length);
+    $offset = 9;
+    check('an oversized response is answered 500', hamster_u16($payload, $offset), 500);
+    check('the replacement frame fits the protocol', $length <= HAMSTER_MAX_FRAME, true);
 
     if ($failures > 0) {
         fwrite(STDERR, "{$failures} of {$checks} checks failed\n");

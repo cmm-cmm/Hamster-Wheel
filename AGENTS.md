@@ -9,10 +9,11 @@ document in `doc/` (`ROUTING.md`, `CONFIGURATION.md`, `PHP_WORKER.md`, `BENCHMAR
 `doc/WORKER_LIFECYCLE_0_3.md`.
 
 `src/` holds `main.rs`, `lib.rs`, and the runtime modules `server`, `config`, `router`, `handler`,
-`static_files`, `php_worker`, and `php_protocol`. The `*_profile.rs` modules plus `profiling.rs` are
+`static_files`, `php_worker`, `php_protocol`, `proxy`, `tls`, `fastcgi` (FastCGI to operator-started
+`php-cgi`, see `doc/FASTCGI_V1.md`) and their helpers. The `*_profile.rs` modules plus `profiling.rs` are
 `#[cfg(feature = "profiling")]` measurement code and must not affect the default build. Integration
 tests live in `tests/`, unit tests beside their modules, Cargo benches in `benches/`, PowerShell load
-drivers and their configs in `benchmarks/`, PHP worker fixtures in `fixtures/php-worker/`, and the
+drivers and their configs in `benchmarks/`, PHP worker fixtures in `fixtures/php-worker/`, FastCGI fixtures in `fixtures/php-cgi/`, and the
 static document root in `public/`. Keep it a single package until a subsystem has a concrete reason
 to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`).
 
@@ -27,6 +28,8 @@ integration tests can run.
 - `cargo build --release --target x86_64-pc-windows-msvc` creates the only build suitable for
   performance comparisons.
 - `cargo test` runs unit and integration tests; `cargo test -- --ignored` adds the PHP worker tests.
+  The Laravel tests need `HAMSTER_LARAVEL_TEST_PATH` and the application tests `HAMSTER_PHP_APPS`;
+  both workspaces are built by scripts described in `doc/LOCAL_TEST_APPLICATIONS.md`.
 - `cargo test --test static_files` or `cargo test rejects_path_traversal` runs one file or one test.
 - `cargo fmt --all -- --check` verifies standard Rust formatting.
 - `cargo clippy --all-targets --all-features -- -D warnings` rejects lint warnings.
@@ -52,6 +55,11 @@ runtime configuration parsing. Configuration is parsed, validated, and compiled 
 immutable `RuntimeConfig`; request handling uses only the already-compiled router and handler graph.
 Add dependencies and abstractions only for an active milestone. Document non-obvious choices with an
 ADR or research note, and update the relevant `doc/` file in the same change.
+
+Operational output in `src/` goes through `outln!` and `errln!` (`src/output.rs`), never `println!`
+or `eprintln!`: the standard macros panic once a supervisor or log shipper closes the pipe, and a
+panic on the main task, in a pool supervisor or in the reload task ends shutdown, replacement or
+signal handling. Tests and benches keep the standard macros.
 
 ## Testing Guidelines
 

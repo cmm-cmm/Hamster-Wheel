@@ -12,7 +12,7 @@ use tokio::{
     io::{AsyncRead, ReadBuf},
 };
 
-use crate::proxy::ProxyBody;
+use crate::{fastcgi::FastCgiBody, proxy::ProxyBody};
 
 /// Maximum application buffer produced for one static-file body frame.
 ///
@@ -35,6 +35,7 @@ pub(crate) enum ResponseBody {
     Buffered(Full<Bytes>),
     File(FileBody),
     Proxy(Box<ProxyBody>),
+    FastCgi(Box<FastCgiBody>),
 }
 
 impl ResponseBody {
@@ -44,6 +45,10 @@ impl ResponseBody {
 
     pub(crate) fn proxy(body: ProxyBody) -> Self {
         Self::Proxy(Box::new(body))
+    }
+
+    pub(crate) fn fastcgi(body: FastCgiBody) -> Self {
+        Self::FastCgi(Box::new(body))
     }
 
     pub(crate) fn file(mut file: File, length: u64) -> Self {
@@ -74,6 +79,7 @@ impl Body for ResponseBody {
             },
             Self::File(body) => Pin::new(body).poll_frame(cx),
             Self::Proxy(body) => Pin::new(body.as_mut()).poll_frame(cx),
+            Self::FastCgi(body) => Pin::new(body.as_mut()).poll_frame(cx),
         }
     }
 
@@ -82,6 +88,7 @@ impl Body for ResponseBody {
             Self::Buffered(body) => body.is_end_stream(),
             Self::File(body) => body.is_end_stream(),
             Self::Proxy(body) => body.is_end_stream(),
+            Self::FastCgi(body) => body.is_end_stream(),
         }
     }
 
@@ -90,6 +97,7 @@ impl Body for ResponseBody {
             Self::Buffered(body) => body.size_hint(),
             Self::File(body) => body.size_hint(),
             Self::Proxy(body) => body.size_hint(),
+            Self::FastCgi(body) => body.size_hint(),
         }
     }
 }

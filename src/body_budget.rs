@@ -154,7 +154,7 @@ impl BodyBudget {
         if !self.claim_refusal_notice(elapsed_ms) {
             return;
         }
-        eprintln!(
+        errln!(
             "body memory budget exhausted: {refused} request(s) refused with 503 since start (server.max_body_memory = {} bytes); reported at most once per {} s",
             self.limit,
             REFUSAL_NOTICE_PERIOD_MS / 1_000
