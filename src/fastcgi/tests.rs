@@ -792,6 +792,32 @@ async fn a_refused_connection_moves_to_the_next_server_and_all_refused_is_a_bad_
 }
 
 #[tokio::test]
+async fn operator_managed_endpoint_recovers_without_restarting_hamster() {
+    let address = crate::test_ports::unused_outside_dynamic_range();
+    let server = Server::start(vec![address], |_| {}).await;
+
+    // A FastCGI endpoint is operator-owned: its absence must not prevent the
+    // HTTP listener from starting, and a refused connect must not poison the
+    // configured endpoint for later requests.
+    assert_eq!(exchange(server.address, GET).await.status, 502);
+    assert_eq!(server.backend.snapshot().active_exchanges, 0);
+
+    let listener = TcpListener::bind(address).await.unwrap();
+    let backend = tokio::spawn(one_reply(
+        listener,
+        records(&[(STDOUT, b"Status: 200 OK\r\n\r\nrecovered")], true),
+    ));
+    let answer = exchange(server.address, GET).await;
+    assert_eq!(
+        (answer.status, answer.body.as_slice()),
+        (200, &b"recovered"[..])
+    );
+    backend.await.unwrap();
+    assert_eq!(server.backend.snapshot().active_exchanges, 0);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn slots_bound_concurrency_and_a_request_that_cannot_get_one_is_refused() {
     let (listener, address) = fake().await;
     let server = Server::start(vec![address], |config| {

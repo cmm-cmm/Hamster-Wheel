@@ -1,5 +1,34 @@
 # AI Handoff
 
+## Windows handoff audit (2026-10-04)
+
+This pass began from a clean `dev` checkout at `6e8fd34` (`origin/dev`); the
+older sections below describe their own historical uncommitted state, not the
+current Git baseline. No commit, tag, push, merge or release was made here.
+TCP SYN-blackhole behavior is **NOT VERIFIED** because no isolated Windows VM
+was available. The host firewall and unrelated services were not changed.
+
+The highest-value confirmed handoff gap was operational ambiguity, not a new
+FastCGI throughput issue. `server::run` binds and prints `listening` after
+Hamster-owned PHP workers reach READY, but external FastCGI and proxy
+endpoints are not startup-probed. A new FastCGI regression confirms an absent
+operator-managed endpoint answers 502 and a later-started endpoint answers
+200 without restarting Hamster. `doc/WINDOWS_OPERATIONS.md` now states startup,
+backend ownership, readiness checks, private-file policy, Windows signals,
+shutdown and qualification boundaries. `doc/CONFIGURATION.md` no longer says
+TLS certificates cannot reload: Ctrl+Break reloads only the configured
+certificate/key files in an attached Windows console. General config reload
+and headless certificate reload remain unavailable.
+
+Windows verification at this checkout: fmt, strict MSVC Clippy, default tests
+(180 library tests passed), release build, profiling bench link, eight real
+`php-cgi` integration tests, four exact-process abnormal-parent containment
+tests, Ctrl+C worker reap and in-flight drain, and Ctrl+Break TLS reload with
+rollback all passed. No throughput benchmark was run because production
+hot-path code was unchanged. Native Linux is still NOT VERIFIED. Windows
+Service operation and packaging are not implemented; an operator must own
+external FastCGI processes and their containment/restart policy.
+
 ## Windows FastCGI blocking-pool saturation correction (2026-10-04)
 
 Still uncommitted on `dev`; preserve all earlier working-tree changes. A

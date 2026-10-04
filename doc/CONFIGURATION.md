@@ -1,5 +1,8 @@
 # Runtime Configuration
 
+For startup, backend ownership, readiness and signal procedures on Windows,
+see `doc/WINDOWS_OPERATIONS.md`.
+
 ## Design Goals
 
 Milestone 0.0.4 parses, validates, and compiles configuration once before the
@@ -194,9 +197,11 @@ the leaf to the last one in the file are `Compile` errors naming the field and
 path. Key contents never appear in a diagnostic. A file holding only a leaf
 whose issuer is not included starts with a printed note, because only clients
 know which issuers they trust; startup also prints each certificate's expiry
-date, since certificates are not reloaded. TLS 1.2 and 1.3 use rustls's defaults with the
+date. Configured certificate/key files can later be reloaded transactionally
+with Ctrl+Break in an attached Windows console; listeners, names and other
+configuration do not reload. TLS 1.2 and 1.3 use rustls's defaults with the
 aws-lc-rs provider, and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md`
-for the full semantics.
+and `doc/TLS_CERTIFICATE_RELOAD.md` for the full semantics.
 
 On Windows, the presence of any `php_worker` location also requires process
 containment to be established before worker startup. Hamster creates and fully

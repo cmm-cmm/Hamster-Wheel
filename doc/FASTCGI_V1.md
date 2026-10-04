@@ -1,8 +1,9 @@
 # FastCGI v1 (Windows, operator-managed endpoints)
 
-Status: v1 is in `dev` at `6fd830d`; the private-file policy and measurements
-below are a later uncommitted corrective pass. Windows
-`x86_64-pc-windows-msvc` only. Native Linux: NOT VERIFIED.
+Status: v1 and its Windows corrective pass are in `dev` at `6e8fd34`.
+Operator-managed endpoints only; see `doc/WINDOWS_OPERATIONS.md` for the
+deployment boundary. Windows `x86_64-pc-windows-msvc` only. Native Linux:
+NOT VERIFIED.
 
 ## Why
 
