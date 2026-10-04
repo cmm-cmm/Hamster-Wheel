@@ -1,5 +1,44 @@
 # AI Handoff
 
+## Windows headless process rehearsal (2026-10-04)
+
+Current `dev` checkout was clean at `0b7fbbe` before this pass. Added the
+ignored, self-cleaning `tests/windows_headless.rs` process rehearsal and
+updated `doc/WINDOWS_OPERATIONS.md`; no production code was changed. The test
+starts Hamster with `DETACHED_PROCESS` and redirected logs, one PHP worker,
+and a separately started `php-cgi`. Both routes served successfully. A
+separate process could not attach to Hamster's console. On exact Hamster
+`TerminateProcess` (PID 18936), the already-open handle for worker PID 17268
+signaled exit in 2 ms; operator-owned `php-cgi` PID 6388 stayed alive. A new
+Hamster PID 17612 and worker PID 20012 served both routes through the same
+endpoint. These PIDs are evidence from one run, not stable IDs. The test
+cleaned up all processes and temporary files it created.
+
+An initial `CREATE_NO_WINDOW` attempt inherited the test harness console and
+was rejected as a headless test. The passing `DETACHED_PROCESS` probe observed
+`AttachConsole` fail with `ERROR_INVALID_HANDLE`.
+The unignored TLS headless test replaced the configured certificate/key and
+confirmed a new TLS handshake still presented the old loaded leaf; there is
+no implicit file-watch reload.
+
+WinSW is a **candidate** Service wrapper because its official configuration
+supports restart on failure, logs, service accounts and stop timeouts. No
+Windows Service was installed or run: this checkout lacks an isolated Service
+test environment and the current user is not elevated. WinSW
+`hidewindow=true` gives `CreateNoWindow`, not the tested `DETACHED_PROCESS`;
+its documented stop fallback is forced termination if Ctrl+C cannot be
+delivered. Hamster currently has only console Ctrl+C/Ctrl+Break for graceful
+stop/certificate reload. Console-free graceful stop and live cert reload are
+**NOT IMPLEMENTED**. Actual WinSW restart/log rotation and external
+`php-cgi` containment/restart are **NOT VERIFIED**. An isolated VM Service
+rehearsal and a deliberate
+console-free control-path design are the next operational decisions; do not
+integrate a Service wrapper merely on the process-level rehearsal.
+
+TCP SYN-blackhole remains **NOT VERIFIED**; no host firewall or unrelated
+service was changed. Native Linux remains **NOT VERIFIED**. No commit, tag,
+push, merge or release was made in this pass.
+
 ## Windows handoff audit (2026-10-04)
 
 This pass began from a clean `dev` checkout at `6e8fd34` (`origin/dev`); the
