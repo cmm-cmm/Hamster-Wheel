@@ -49,6 +49,7 @@ use tokio::{
 };
 
 use crate::{
+    access::{AccessPolicy, is_php_source},
     config::SERVER_NAME,
     handler::{HandlerResponse, simple_response},
     response_body::ResponseBody,
@@ -76,6 +77,8 @@ const RESPONDER: u16 = 1;
 const REQUEST_ID: u16 = 1;
 const MAX_CONTENT: usize = 65_535;
 const FAILURE_NOTICE_PERIOD_MS: u64 = 60_000;
+#[cfg(windows)]
+const MAX_BLOCKING_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Compiled, immutable configuration of one `fastcgi` location.
 #[derive(Clone, Debug)]
@@ -127,9 +130,17 @@ pub struct FastCgiBackend {
     /// Windows canonicalization adds.
     document_root_param: String,
     slots: Arc<Semaphore>,
+    /// Bounds closures queued in Tokio's blocking pool even after their HTTP
+    /// waiters have released exchange slots.
+    #[cfg(windows)]
+    blocking_connect_slots: Arc<Semaphore>,
     in_flight: Box<[AtomicUsize]>,
     next: AtomicUsize,
     counters: Counters,
+    #[cfg(feature = "profiling")]
+    profile: crate::fastcgi_profile::FastCgiProfile,
+    #[cfg(feature = "profiling")]
+    profile_async_connect: std::sync::atomic::AtomicBool,
     started: std::time::Instant,
     next_notice_ms: AtomicU64,
 }
@@ -150,9 +161,15 @@ impl FastCgiBackend {
         Arc::new(Self {
             document_root_param: display_path(&config.document_root),
             slots: Arc::new(Semaphore::new(permits)),
+            #[cfg(windows)]
+            blocking_connect_slots: Arc::new(Semaphore::new(permits)),
             in_flight: config.servers.iter().map(|_| AtomicUsize::new(0)).collect(),
             next: AtomicUsize::new(0),
             counters: Counters::default(),
+            #[cfg(feature = "profiling")]
+            profile: crate::fastcgi_profile::FastCgiProfile::default(),
+            #[cfg(feature = "profiling")]
+            profile_async_connect: std::sync::atomic::AtomicBool::new(false),
             started: std::time::Instant::now(),
             next_notice_ms: AtomicU64::new(0),
             config,
@@ -178,6 +195,16 @@ impl FastCgiBackend {
             timeouts: counters.timeouts.load(Ordering::Relaxed),
             backend_failures: counters.backend_failures.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(feature = "profiling")]
+    pub fn take_profile(&self) -> Vec<crate::fastcgi_profile::FastCgiStageTiming> {
+        self.profile.take()
+    }
+
+    #[cfg(feature = "profiling")]
+    pub fn set_profile_async_connect(&self, enabled: bool) {
+        self.profile_async_connect.store(enabled, Ordering::Release);
     }
 
     /// Claims one exchange on a server not in `tried`. The caller holds a
@@ -236,20 +263,184 @@ impl FastCgiBackend {
     }
 }
 
+/// The permit owns the active-exchange count, including while a Windows
+/// blocking connect continues after its HTTP waiter is canceled or times out.
+struct ExchangePermit {
+    backend: Arc<FastCgiBackend>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ExchangePermit {
+    fn drop(&mut self) {
+        self.backend
+            .counters
+            .active_exchanges
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One exchange slot: a semaphore permit and the server it was claimed on.
 struct Slot {
     backend: Arc<FastCgiBackend>,
     server: usize,
-    _permit: OwnedSemaphorePermit,
+    _permit: ExchangePermit,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         self.backend.release_server(self.server);
-        self.backend
-            .counters
-            .active_exchanges
-            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Carries both ownership claims into a connect operation. If the HTTP task
+/// vanishes, a detached blocking connect still holds the bounded permit and
+/// server claim until the connect task exits, and sends no FastCGI request bytes.
+struct ConnectAttempt {
+    backend: Arc<FastCgiBackend>,
+    server: Option<usize>,
+    permit: Option<ExchangePermit>,
+}
+
+impl ConnectAttempt {
+    fn new(backend: &Arc<FastCgiBackend>, server: usize, permit: ExchangePermit) -> Self {
+        Self {
+            backend: Arc::clone(backend),
+            server: Some(server),
+            permit: Some(permit),
+        }
+    }
+
+    fn into_slot(mut self) -> Slot {
+        Slot {
+            backend: Arc::clone(&self.backend),
+            server: self.server.take().expect("claimed server"),
+            _permit: self.permit.take().expect("exchange permit"),
+        }
+    }
+
+    fn into_permit(mut self) -> ExchangePermit {
+        self.permit.take().expect("exchange permit")
+    }
+}
+
+impl Drop for ConnectAttempt {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            self.backend.release_server(server);
+        }
+    }
+}
+
+enum ConnectOutcome {
+    Connected(ConnectAttempt, TcpStream),
+    Failed(ConnectAttempt, io::Error),
+    /// The spawned connect still owns the claims, or dropped them on panic.
+    Detached(io::Error),
+}
+
+/// A per-connect ownership handoff. Aborting a queued `spawn_blocking` task
+/// does not promptly drop its captured values, so the HTTP waiter must be
+/// able to reclaim an attempt that the blocking closure has not taken yet.
+/// Once taken, only that closure owns the attempt until connect returns.
+#[cfg(windows)]
+struct PendingConnect {
+    claim: Arc<std::sync::Mutex<Option<ConnectAttempt>>>,
+    task: JoinHandle<Option<(ConnectAttempt, io::Result<std::net::TcpStream>)>>,
+}
+
+#[cfg(windows)]
+impl Drop for PendingConnect {
+    fn drop(&mut self) {
+        self.claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        self.task.abort();
+    }
+}
+
+async fn connect_server(
+    backend: &FastCgiBackend,
+    address: SocketAddr,
+    attempt: ConnectAttempt,
+) -> ConnectOutcome {
+    let duration = backend.config.connect_timeout;
+    #[cfg(windows)]
+    {
+        // The blocking path is for Windows php-cgi: one exchange per endpoint.
+        // A multiplexing endpoint or a long connect deadline could otherwise
+        // occupy many non-cancelable blocking tasks during an outage or delay
+        // runtime shutdown, so those cases retain cancellable async I/O.
+        if backend.config.concurrency != 1 || duration > MAX_BLOCKING_CONNECT_TIMEOUT {
+            return async_connect(address, duration, attempt).await;
+        }
+        #[cfg(feature = "profiling")]
+        if backend.profile_async_connect.load(Ordering::Acquire) {
+            return async_connect(address, duration, attempt).await;
+        }
+        // A canceled queued closure can outlive its exchange claim until a
+        // blocking thread dequeues it. Do not enqueue an unbounded number of
+        // such closures while the blocking pool is saturated.
+        let Ok(blocking_permit) = Arc::clone(&backend.blocking_connect_slots).try_acquire_owned()
+        else {
+            return async_connect(address, duration, attempt).await;
+        };
+        let deadline = std::time::Instant::now() + duration;
+        let claim = Arc::new(std::sync::Mutex::new(Some(attempt)));
+        let worker_claim = Arc::clone(&claim);
+        let mut pending = PendingConnect {
+            claim,
+            task: tokio::task::spawn_blocking(move || {
+                let _blocking_permit = blocking_permit;
+                let attempt = worker_claim
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()?;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let result = if remaining.is_zero() {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "connect deadline elapsed",
+                    ))
+                } else {
+                    std::net::TcpStream::connect_timeout(&address, remaining).and_then(|stream| {
+                        stream.set_nonblocking(true)?;
+                        Ok(stream)
+                    })
+                };
+                Some((attempt, result))
+            }),
+        };
+        match timeout_at(Instant::from_std(deadline), &mut pending.task).await {
+            Ok(Ok(Some((attempt, Ok(stream))))) => match TcpStream::from_std(stream) {
+                Ok(stream) => ConnectOutcome::Connected(attempt, stream),
+                Err(error) => ConnectOutcome::Failed(attempt, error),
+            },
+            Ok(Ok(Some((attempt, Err(error))))) => ConnectOutcome::Failed(attempt, error),
+            Ok(Ok(None)) => ConnectOutcome::Detached(io::Error::other("connect was canceled")),
+            Ok(Err(error)) => ConnectOutcome::Detached(io::Error::other(error)),
+            Err(_) => ConnectOutcome::Detached(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connect deadline elapsed",
+            )),
+        }
+    }
+    #[cfg(not(windows))]
+    async_connect(address, duration, attempt).await
+}
+
+async fn async_connect(
+    address: SocketAddr,
+    duration: Duration,
+    attempt: ConnectAttempt,
+) -> ConnectOutcome {
+    match timeout(duration, TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => ConnectOutcome::Connected(attempt, stream),
+        Ok(Err(error)) => ConnectOutcome::Failed(attempt, error),
+        Err(_) => ConnectOutcome::Failed(
+            attempt,
+            io::Error::new(io::ErrorKind::TimedOut, "connect deadline elapsed"),
+        ),
     }
 }
 
@@ -367,7 +558,9 @@ fn script(document_root: &Path, filename: PathBuf, rest: &[String]) -> Target {
 }
 
 fn is_php_name(name: &str) -> bool {
-    name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".php")
+    name.as_bytes()
+        .get(name.len().saturating_sub(4)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".php"))
 }
 
 fn is_php_path(path: &Path) -> bool {
@@ -503,6 +696,7 @@ type BackendStream = WriteProgressTimeout<TcpStream>;
 /// before the backend's response head is accepted.
 pub(crate) async fn serve(
     backend: &Arc<FastCgiBackend>,
+    access: &AccessPolicy,
     request: Request<Incoming>,
     connection: ConnectionInfo,
     body_read_timeout: Duration,
@@ -536,6 +730,11 @@ pub(crate) async fn serve(
         Target::Forbidden => simple_response(StatusCode::FORBIDDEN, "Forbidden"),
         Target::NotFound => simple_response(StatusCode::NOT_FOUND, "Not Found"),
         Target::Static { path, file, length } => {
+            if access.denies_final_path(&backend.config.document_root, &path)
+                || is_php_source(&path)
+            {
+                return simple_response(StatusCode::NOT_FOUND, "Not Found");
+            }
             backend
                 .counters
                 .static_files
@@ -547,6 +746,9 @@ pub(crate) async fn serve(
             script_name,
             path_info,
         } => {
+            if access.denies_final_path(&backend.config.document_root, &filename) {
+                return simple_response(StatusCode::NOT_FOUND, "Not Found");
+            }
             backend.counters.scripts.fetch_add(1, Ordering::Relaxed);
             let params = cgi_params(
                 backend,
@@ -698,6 +900,8 @@ async fn run_script(
     params: Vec<u8>,
     body_read_timeout: Duration,
 ) -> HandlerResponse {
+    #[cfg(feature = "profiling")]
+    let slot_started = std::time::Instant::now();
     let has_body = !request.body().is_end_stream();
     if has_body && !request.headers().contains_key(header::CONTENT_LENGTH) {
         // PHP needs CONTENT_LENGTH before it reads the body, and a chunked
@@ -719,6 +923,8 @@ async fn run_script(
         );
         return simple_response(StatusCode::SERVICE_UNAVAILABLE, "FastCGI Busy");
     };
+    #[cfg(feature = "profiling")]
+    let slot_acquired = std::time::Instant::now();
     backend
         .counters
         .active_exchanges
@@ -727,43 +933,46 @@ async fn run_script(
     // Connecting is the only step that may move to another server: until the
     // first record is written, the backend has seen nothing.
     let mut tried = Vec::new();
-    let mut permit = Some(permit);
+    let mut permit = Some(ExchangePermit {
+        backend: Arc::clone(backend),
+        _permit: permit,
+    });
+    #[cfg(feature = "profiling")]
+    let connect_started = std::time::Instant::now();
     let (slot, stream) = loop {
         let Some(server) = backend.claim_server(&tried) else {
-            backend
-                .counters
-                .active_exchanges
-                .fetch_sub(1, Ordering::AcqRel);
             return simple_response(StatusCode::BAD_GATEWAY, "FastCGI Unavailable");
         };
         tried.push(server);
         let address = backend.config.servers[server];
-        match timeout(backend.config.connect_timeout, TcpStream::connect(address)).await {
-            Ok(Ok(stream)) => {
+        let attempt = ConnectAttempt::new(
+            backend,
+            server,
+            permit.take().expect("one permit per exchange"),
+        );
+        match connect_server(backend, address, attempt).await {
+            ConnectOutcome::Connected(attempt, stream) => {
                 let _ = stream.set_nodelay(true);
-                let slot = Slot {
-                    backend: Arc::clone(backend),
-                    server,
-                    _permit: permit.take().expect("one permit per exchange"),
-                };
-                break (slot, stream);
+                break (attempt.into_slot(), stream);
             }
-            Ok(Err(error)) => {
-                backend.release_server(server);
+            ConnectOutcome::Failed(attempt, error) => {
+                permit = Some(attempt.into_permit());
                 backend.record_failure(
                     &backend.counters.connect_failures,
                     format_args!("connecting to {address} failed: {error}"),
                 );
             }
-            Err(_) => {
-                backend.release_server(server);
+            ConnectOutcome::Detached(error) => {
                 backend.record_failure(
                     &backend.counters.connect_failures,
-                    format_args!("connecting to {address} timed out"),
+                    format_args!("connecting to {address} failed: {error}"),
                 );
+                return simple_response(StatusCode::BAD_GATEWAY, "FastCGI Unavailable");
             }
         }
     };
+    #[cfg(feature = "profiling")]
+    let connected = std::time::Instant::now();
 
     let stream = WriteProgressTimeout::new(stream, backend.config.response_timeout);
     let (reader, mut writer) = tokio::io::split(stream);
@@ -787,6 +996,8 @@ async fn run_script(
         drop(slot);
         return simple_response(StatusCode::BAD_GATEWAY, "FastCGI Error");
     }
+    #[cfg(feature = "profiling")]
+    let written = std::time::Instant::now();
 
     let mut writer_task = if has_body {
         Some(tokio::spawn(write_body(
@@ -801,6 +1012,17 @@ async fn run_script(
 
     let mut reader = RecordReader::new(reader);
     let head = read_head(backend, &mut reader, &mut writer_task).await;
+    #[cfg(feature = "profiling")]
+    if head.is_ok() {
+        backend
+            .profile
+            .record(crate::fastcgi_profile::FastCgiStageTiming {
+                slot_wait: slot_acquired.duration_since(slot_started),
+                tcp_connect: connected.duration_since(connect_started),
+                preamble_write: written.duration_since(connected),
+                backend_head: std::time::Instant::now().duration_since(written),
+            });
+    }
     match head {
         Ok((head, rest)) => match parse_head(&head) {
             Ok(mut response) => {

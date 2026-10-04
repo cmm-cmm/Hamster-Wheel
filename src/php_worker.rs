@@ -1316,16 +1316,12 @@ impl PhpWorkerPool {
                 errln!("PHP worker request failed: {error}");
                 simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Unavailable")
             }
-            // 502, not 504, by owner decision. The request is already
-            // started and may already have had side effects, and 504 invites
-            // the idempotent-retry heuristics that clients and proxies apply
-            // to a "slow upstream". Hamster will not replay a possibly-started
-            // request, so it must not advertise a status that encourages a peer
-            // to. The body is what distinguishes this condition, exactly as the
-            // body budget's 503 does. See `doc/EXECUTION_TIMEOUT_POLICY.md`.
+            // The worker did not return within the configured deadline. A 504
+            // describes that cause; it says nothing about whether PHP already
+            // made side effects. The actor never replays this transaction.
             Err(PoolExecuteError::ExecutionTimeout(error)) => {
                 errln!("PHP worker execution timeout: {error}");
-                simple_response(StatusCode::BAD_GATEWAY, "PHP Worker Execution Timeout")
+                simple_response(StatusCode::GATEWAY_TIMEOUT, "PHP Worker Execution Timeout")
             }
         }
     }

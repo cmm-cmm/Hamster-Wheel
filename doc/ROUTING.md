@@ -56,10 +56,11 @@ and currently supplies the `/api` placeholder and routing errors.
 `FastCgi` holds a per-location backend (document root, index, servers and slots)
 and decides per request, on the file actually opened, whether the path runs a
 script, is served as a static file or goes to the front controller
-(`doc/FASTCGI_V1.md`). Longest-prefix matching is what closes an application's
-private directories: a `not_found` location at `/data` wins over a `fastcgi`
-location at `/` for `/data/...`, which is how Apache deny rules that Hamster
-does not read are replaced.
+(`doc/FASTCGI_V1.md`). Host-wide `deny_paths` and
+`deny_names` are checked before any location handler, so overlapping static
+and FastCGI locations cannot accidentally override private-path policy;
+filesystem handlers also check the final opened-file location. Hamster does
+not read Apache `.htaccess` rules. See `doc/FASTCGI_V1.md`.
 
 The router is built once, shared by `Arc`, and never mutated. Request routing
 does not parse configuration, canonicalize the document root, rebuild tables,

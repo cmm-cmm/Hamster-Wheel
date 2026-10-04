@@ -1,7 +1,7 @@
 # FastCGI v1 (Windows, operator-managed endpoints)
 
-Status: implemented in the working tree on top of `7ca716f`, 2026-09-28. Not
-committed, tagged or released; the Owner decides acceptance. Windows
+Status: v1 is in `dev` at `6fd830d`; the private-file policy and measurements
+below are a later uncommitted corrective pass. Windows
 `x86_64-pc-windows-msvc` only. Native Linux: NOT VERIFIED.
 
 ## Why
@@ -64,20 +64,38 @@ junction for example, is `403`. Because the canonical root is a verbatim
 `\\?\` path, `app.php.` and `app.php%20` name no file (Windows does not strip
 the dot or space beneath such a path) and go to the front controller.
 
-**The root is served.** Hamster has no `.htaccess`. An application that relies
-on Apache deny rules for directories under its root (DokuWiki's `data/`,
-`conf/`, `inc/`, `bin/`, `vendor/`) must have them closed with `not_found`
-locations, which win by longest prefix:
+**The root is otherwise served.** Hamster has no `.htaccess`. An application
+that relies on Apache deny rules needs an explicit host-wide file access
+policy. For DokuWiki:
 
 ```toml
-[[hosts.locations]]
-path = "/data"
-handler = "not_found"
+[[hosts]]
+name = "wiki.example"
+deny_paths = ["/data", "/conf", "/inc", "/bin", "/vendor"]
+deny_names = ["composer.json", "composer.lock"]
 ```
 
-Measured with DokuWiki: without such locations `/data/pages/wiki/dokuwiki.txt`
-was served as text; with them it is `404`. Pointing `root` at a public
-directory, as Laravel and Symfony lay out, avoids the question.
+The policy runs before location selection, including overlapping FastCGI and
+static locations. Whole path components are ASCII case-insensitive and URI
+percent-decoded before comparison. Thus `/data`, `/DATA`, and `/%64ata` are
+denied, but `/database` is not. File handlers also deny dotfiles at any depth
+(except public root `/.well-known`) and never serve `.php`, `.phtml`, `.phar`,
+`.phps` or the other blocked PHP-source extensions as static bytes. They
+recheck the final location of the opened file, preventing an in-root junction
+alias to a private subtree from evading the rule. A denied path receives 404,
+without revealing its filesystem location. Configure each application's own
+private paths; the defaults cannot infer them. Pointing `root` at a public
+directory, as Laravel and Symfony lay out, remains preferable when possible.
+For scripts, Hamster checks an opened handle but passes a pathname to the
+operator-managed FastCGI endpoint; the endpoint later opens that pathname.
+Thus the static-byte path has opened-handle consistency, while script-path
+handoff cannot make an object-identity guarantee under concurrent namespace
+replacement. Do not grant an untrusted actor filesystem write access to the
+application's PHP tree.
+For FlatPress, deny `/fp-defaults`, `/fp-includes`, `/setup` and the private
+`/fp-content/{config,users,content,cache,compile,index}` trees. Leave
+`/setup.php` available only during installation; remove it or add it to
+`deny_paths` after setup. The public `fp-content/images` tree remains usable.
 
 CGI/1.1 variables (RFC 3875) sent: `GATEWAY_INTERFACE`, `SERVER_SOFTWARE`,
 `SERVER_PROTOCOL`, `REQUEST_METHOD`, `REQUEST_URI` (the target as received),
@@ -102,6 +120,25 @@ input cannot deadlock against Hamster. A request body needs `Content-Length`
 buffered and has no Hamster size limit (PHP's `post_max_size` applies). The
 client body gets `body_read_timeout` in total.
 
+On Windows, a single-exchange endpoint (`concurrency = 1`) with
+`connect_timeout <= 5` uses a bounded blocking-pool TCP connect. Controlled
+release measurements found a long tail in Tokio async connect on this
+two-hop path; this change does **not** reuse TCP connections or alter FastCGI
+framing. A per-connect ownership handoff lets cancellation reclaim the
+exchange permit and exact server claim immediately if the blocking closure
+has not started. If it has started, the closure retains both until connect
+returns; it never sends a FastCGI frame itself. A separate, per-location
+semaphore bounds queued/running blocking connect closures to the configured
+endpoint-slot count. When that cap is occupied, new connects use cancellable
+async I/O rather than enqueue more blocking work.
+Multiplexing endpoints and longer connect timeouts retain cancellable async
+connect; their Windows throughput was not qualified by the new A/B. A running
+blocking connect remains non-cancelable until the OS call returns. Tokio can
+also delay when a queued closure runs, so the 5 s configuration cap is not an
+absolute process-shutdown deadline; unrelated stalled blocking work can delay
+runtime teardown. A connect-only task cannot initiate a new FastCGI request
+after its HTTP waiter disappears; this does not roll back work already sent.
+
 The response head is the CGI header block (at most 64 KiB, else `502`):
 `Status:` sets the status, `Location:` without `Status:` is `302`, headers
 repeat as PHP sent them (both `Set-Cookie` lines survive), and hop-by-hop
@@ -116,6 +153,7 @@ Failures:
 |---|---|
 | Every slot busy for `connect_timeout` | `503 FastCGI Busy`, the backend never contacted |
 | A server refuses or times out the connection | the next free server is tried; nothing was sent, so this is safe |
+| A Windows blocking connect's HTTP waiter expires before the connect task returns | `502 FastCGI Unavailable`; a queued attempt releases its exchange slot immediately, a running attempt after connect returns; no FastCGI request was sent and no unsafe replay occurs |
 | Every server tried and refused | `502 FastCGI Unavailable` |
 | No response bytes within `response_timeout` before the head | `504 FastCGI Response Timeout` |
 | Empty, malformed or oversized head | `502 FastCGI Error` |
@@ -130,9 +168,30 @@ it waited behind a 3 s script). Failure notices are rate limited to one per
 other connection. Each location has its own slots and servers; nothing is
 shared between locations or hosts.
 
+On Windows, a single `php-cgi -b` process handles only one exchange at a time.
+When HTTP concurrency exceeds the available endpoint slots, requests wait up
+to `connect_timeout`, then receive 503 without contacting PHP. An exchange
+that timed out after being sent can still finish inside PHP or remain queued
+in that endpoint's TCP backlog; 504 is **not** proof that an application-side
+effect was rolled back. Do not retry such requests automatically. In the
+follow-up release probe (`doc/BENCHMARKS.md`), one endpoint at HTTP C32 had
+~143 median RPS and ~230 ms P50 despite zero HTTP errors: queue latency can
+be material well before a 503 appears.
+
+The distinction is cause-based: an application response timeout is 504;
+invalid or failed backend protocol is 502; no exchange slot is 503; a client
+body deadline is 408. A status code does not mean replay is safe. If the
+response head has already gone to the client, a later timeout or backend
+failure only ends the body/connection; Hamster cannot replace that response
+with a new 502 or 504.
+
+The path resolver also accepts valid UTF-8 names without panicking when
+checking for a `.php` suffix; a regression covers a multibyte character at
+the former byte-slice boundary. This changes no PHP file access policy.
+
 ## Evidence
 
-Unit tests, `src/fastcgi/tests.rs` (18, a scripted FastCGI server behind a real
+Unit tests, `src/fastcgi/tests.rs` (a scripted FastCGI server behind a real
 Hamster listener, and real directories): path resolution, front controller,
 `PATH_INFO`, missing scripts, static fallback, letter case, trailing dot and
 space, stream syntax, traversal, junction containment; CGI variables, body,
@@ -144,14 +203,15 @@ failover; slot exhaustion; `411`; a backend answering before reading its input;
 before reading, slot never released, containment ignored, `Location` not a
 redirect, backend `Content-Length` trusted) were each caught.
 
-Integration, `tests/php_cgi.rs` (9 ignored; repository PHP 8.5.10
-`php-cgi.exe`, started by the test as an operator would), passing 3 of 3 runs
-in parallel mode:
+The original v1 integration set had 9 ignored tests; the corrective pass adds
+an independent FlatPress test. `php-cgi.exe` is started by the test as an
+operator would:
 
 | Application | Origin | Verified |
 |---|---|---|
 | `fixtures/php-cgi` | fixture, this repository | superglobals (`$_GET` arrays, `$_POST`, `$_COOKIE`), `$_FILES` with `is_uploaded_file()`/`move_uploaded_file()` of a 300 KB binary, `PATH_INFO` and `PHP_SELF`, `HTTP_PROXY` absent, `http_response_code(201)`, two `setcookie()`, repeated `header()`, `Location` redirect, native sessions shared by two php-cgi processes and never crossing clients, `flush()` streaming (first chunk well before the end), a 20 MiB response byte-exact, a fatal error as PHP's `500`, `exit`, source never served under `.`/space/case spellings, `404` for a missing script, static CSS, two endpoints in parallel and a third request waiting, an endpoint killed (skipped) and all killed (`502`) and restarted (used again), `504` at `response_timeout`, two hosts with separate roots and endpoints, shutdown draining a running script |
-| DokuWiki 2026-07-14c "Mort" | external, the release tarball unmodified | pages through the `doku.php` front controller, template assets served statically, its `DokuWiki` session cookie, a page edited through its form and read by another client, a PNG uploaded through its media manager and served back byte-exact by `lib/exe/fetch.php`, `data/`, `conf/`, `inc/` closed with `not_found` locations |
+| DokuWiki 2026-07-14c "Mort" | external, the release tarball unmodified | pages through the `doku.php` front controller, template assets served statically, its `DokuWiki` session cookie, a page edited through its form and read by another client, a PNG uploaded through its media manager and served back byte-exact by `lib/exe/fetch.php`; private directories closed by host-wide rules, including case/percent-encoded variants |
+| FlatPress 1.5.1 | external, pinned source tag unmodified | fresh installer over FastCGI, resulting public home page, private config/user/content paths denied; tested with two operator-managed endpoints |
 
 No real PMS, MySQL or Redis was used.
 
@@ -160,14 +220,16 @@ No real PMS, MySQL or Redis was used.
 - Endpoints are operator-managed: a dead `php-cgi` is skipped but never
   restarted by Hamster; `PHP_FCGI_MAX_REQUESTS` must be `0` or the process exits
   after that many requests (500 by default).
-- One connection per request; no keep-alive to the backend. Not measured.
+- One connection per request; no keep-alive to the backend. The Windows load
+  measurement is reported in `doc/BENCHMARKS.md`; its variability does not
+  isolate TCP connect overhead, so connection reuse is not justified yet.
 - Request bodies need `Content-Length`; chunked uploads are `411`.
 - A timed-out or disconnected request's script keeps running in PHP.
 - The backend's `Content-Length` is dropped, so script responses are chunked
   (HTTP/1.1) or close-delimited (HTTP/1.0).
-- No `.htaccess`, rewrite rules or per-directory PHP settings; deny rules are
-  `not_found` locations.
-- Only the applications above were run. This is not a claim that any other
+- No `.htaccess`, rewrite rules or per-directory PHP settings; use host-wide
+  `deny_paths`/`deny_names` for private content.
+- Only the applications above were run in this FastCGI integration suite. This is not a claim that any other
   application or framework works.
 
 ## Owner decisions
@@ -179,9 +241,3 @@ No real PMS, MySQL or Redis was used.
    Windows deployment one process to supervise and reuses tested lifecycle
    code, but adds process ownership to a second backend and a port-allocation
    policy; it should be its own slice with the lifecycle matrix applied.
-2. **Timeout status.** `504` follows the reverse proxy. The PHP worker answers
-   `502` for its execution timeout because the request is possibly started; the
-   same reasoning applies here. Choose one policy for all gateways.
-3. **Deny rules.** `not_found` locations work but must be written per prefix.
-   A small per-location deny list, or shipping documented recipes per
-   application, would make traditional deployments safer by default.

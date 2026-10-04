@@ -1360,3 +1360,52 @@ fn validates_and_compiles_fastcgi_locations() {
         Err(ConfigError::Compile(_))
     ));
 }
+
+#[test]
+fn validates_host_file_denials_before_runtime_start() {
+    let temporary = TestDirectory::new();
+    std::fs::create_dir(temporary.path.join("public")).unwrap();
+    let source = |rules: &str| {
+        not_found_config(&format!(
+            "\n[[hosts]]\nname = 'localhost'\n{rules}\n[[hosts.locations]]\npath = '/'\nhandler = 'static'\nroot = 'public'\n"
+        ))
+    };
+    let valid = source("deny_paths = ['/data', '/conf/private']\ndeny_names = ['composer.json']");
+    let runtime = config::compile_str(&valid, &temporary.path).unwrap();
+    for path in [
+        "/data/a.txt",
+        "/DATA/a.txt",
+        "/%64ata/a.txt",
+        "/x/composer.json",
+    ] {
+        assert!(
+            runtime.router().route(&headers("localhost"), path).is_err(),
+            "{path} must not reach a handler"
+        );
+    }
+    assert!(
+        runtime
+            .router()
+            .route(&headers("localhost"), "/database/a.txt")
+            .is_ok()
+    );
+    for rules in [
+        "deny_paths = ['/']",
+        "deny_paths = ['data']",
+        "deny_paths = ['/data/']",
+        "deny_paths = ['/data//pages']",
+        "deny_paths = ['/data/../conf']",
+        "deny_paths = ['/data', '/DATA']",
+        "deny_names = ['foo/bar']",
+        "deny_names = ['composer.json', 'COMPOSER.JSON']",
+        "deny_names = ['file%2eenv']",
+    ] {
+        assert!(
+            matches!(
+                config::compile_str(&source(rules), &temporary.path),
+                Err(ConfigError::Validation(_))
+            ),
+            "invalid access rule should fail startup: {rules}"
+        );
+    }
+}

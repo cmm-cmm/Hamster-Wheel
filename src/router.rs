@@ -8,7 +8,9 @@ use hyper::{
 
 pub use crate::handler::{Handler, HandlerKind};
 use crate::{
+    access::AccessPolicy,
     handler::{HandlerResponse, simple_response},
+    static_files::{PathError, decode_segments},
     tls::CertificateScope,
     transport::ConnectionInfo,
 };
@@ -19,16 +21,19 @@ pub enum RouteError {
     InvalidHost,
     UnknownHost,
     InvalidPath,
+    PathTraversal,
     /// The effective authority is not covered by the certificate this TLS
     /// connection presented (RFC 9110 sections 4.3.3 and 15.5.20).
     Misdirected,
+    Denied,
 }
 
 impl RouteError {
     const fn status(self) -> StatusCode {
         match self {
             Self::MissingHost | Self::InvalidHost | Self::InvalidPath => StatusCode::BAD_REQUEST,
-            Self::UnknownHost => StatusCode::NOT_FOUND,
+            Self::PathTraversal => StatusCode::FORBIDDEN,
+            Self::UnknownHost | Self::Denied => StatusCode::NOT_FOUND,
             Self::Misdirected => StatusCode::MISDIRECTED_REQUEST,
         }
     }
@@ -39,7 +44,9 @@ impl RouteError {
             Self::InvalidHost => "Invalid Host",
             Self::UnknownHost => "Unknown Host",
             Self::InvalidPath => "Invalid Path",
+            Self::PathTraversal => "Forbidden",
             Self::Misdirected => "Misdirected Request",
+            Self::Denied => "Not Found",
         }
     }
 }
@@ -71,6 +78,7 @@ impl std::error::Error for RouterBuildError {}
 pub struct LocationRouter {
     locations: Vec<Location>,
     fallback: Handler,
+    access: Arc<AccessPolicy>,
 }
 
 #[derive(Clone)]
@@ -83,6 +91,14 @@ impl LocationRouter {
     pub fn new(
         locations: Vec<(&str, Handler)>,
         fallback: Handler,
+    ) -> Result<Self, RouterBuildError> {
+        Self::with_access(locations, fallback, Arc::new(AccessPolicy::default()))
+    }
+
+    pub(crate) fn with_access(
+        locations: Vec<(&str, Handler)>,
+        fallback: Handler,
+        access: Arc<AccessPolicy>,
     ) -> Result<Self, RouterBuildError> {
         let mut compiled = Vec::<Location>::with_capacity(locations.len());
         for (prefix, handler) in locations {
@@ -102,6 +118,7 @@ impl LocationRouter {
         Ok(Self {
             locations: compiled,
             fallback,
+            access,
         })
     }
 
@@ -109,11 +126,23 @@ impl LocationRouter {
         if !path.starts_with('/') {
             return Err(RouteError::InvalidPath);
         }
-        Ok(self
+        let handler = self
             .locations
             .iter()
             .find(|location| location_matches(&location.prefix, path))
-            .map_or(&self.fallback, |location| &location.handler))
+            .map_or(&self.fallback, |location| &location.handler);
+        if self.access.has_rules() || handler.is_filesystem() {
+            let segments = decode_segments(path).map_err(|error| match error {
+                PathError::InvalidEncoding => RouteError::InvalidPath,
+                PathError::Traversal => RouteError::PathTraversal,
+            })?;
+            if self.access.denies_uri(&segments)
+                || (handler.is_filesystem() && self.access.denies_filesystem_uri(&segments))
+            {
+                return Err(RouteError::Denied);
+            }
+        }
+        Ok(handler)
     }
 }
 

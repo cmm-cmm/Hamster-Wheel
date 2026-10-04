@@ -12,7 +12,11 @@ use hyper::{
     header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, SERVER},
 };
 
-use crate::{config::SERVER_NAME, response_body::ResponseBody};
+use crate::{
+    access::{AccessPolicy, is_php_source},
+    config::SERVER_NAME,
+    response_body::ResponseBody,
+};
 
 const INDEX_FILE: &str = "index.html";
 
@@ -45,6 +49,7 @@ struct ResolvedFile {
 pub async fn serve(
     request: Request<Incoming>,
     document_root: Arc<PathBuf>,
+    access: &AccessPolicy,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let is_head = request.method() == Method::HEAD;
     if request.method() != Method::GET && !is_head {
@@ -55,14 +60,24 @@ pub async fn serve(
         return Ok(response);
     }
 
-    Ok(respond(is_head, &document_root, request.uri().path()).await)
+    Ok(respond(is_head, &document_root, request.uri().path(), access).await)
 }
 
 /// GET and HEAD share one resolution, so they reach the same containment
 /// decision for the same object. HEAD drops the validated handle after its
 /// metadata has produced the headers; GET streams that same handle.
-async fn respond(is_head: bool, document_root: &Path, uri_path: &str) -> Response<ResponseBody> {
+async fn respond(
+    is_head: bool,
+    document_root: &Path,
+    uri_path: &str,
+    access: &AccessPolicy,
+) -> Response<ResponseBody> {
     match resolve_file(document_root, uri_path).await {
+        Ok(file)
+            if access.denies_final_path(document_root, &file.path) || is_php_source(&file.path) =>
+        {
+            error_response(FileError::NotFound)
+        }
         Ok(file) if is_head => file_response(
             &file.path,
             ResponseBody::buffered(Bytes::new()),
@@ -730,7 +745,13 @@ mod windows_containment_tests {
     }
 
     async fn fetch(is_head: bool, root: &Path, uri_path: &str) -> Fetched {
-        let response = respond(is_head, root, uri_path).await;
+        let response = respond(
+            is_head,
+            root,
+            uri_path,
+            &crate::access::AccessPolicy::default(),
+        )
+        .await;
         let status = response.status();
         let content_length = response
             .headers()

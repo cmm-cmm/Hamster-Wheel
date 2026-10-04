@@ -3565,12 +3565,12 @@ async fn a_configured_request_timeout_replaces_the_worker_that_exceeded_it() {
 
     let (head, body) = split_response(&response);
     assert!(
-        String::from_utf8_lossy(head).starts_with("HTTP/1.1 502 "),
-        "an execution timeout answers 502: {}",
+        String::from_utf8_lossy(head).starts_with("HTTP/1.1 504 "),
+        "an execution timeout answers 504: {}",
         String::from_utf8_lossy(head)
     );
-    // The body, not the status, is what separates this from the pool's other
-    // 502s. Changing it changes a client-visible contract.
+    // The body keeps the specific timeout observable while 504 states the
+    // cause without implying that replay would be safe.
     assert_eq!(body, b"PHP Worker Execution Timeout");
     // The one-second configuration must be what fired, not the five-second
     // default; four seconds of application sleep would otherwise have run.
@@ -3607,7 +3607,7 @@ async fn execution_timeouts_never_enter_the_infrastructure_backoff_ladder() {
         let (_, body) = split_response(&response);
         assert_eq!(body, b"PHP Worker Execution Timeout", "round {round}");
 
-        // The 502 is sent by the generation task before that generation exits,
+        // The 504 is sent by the generation task before that generation exits,
         // and the supervisor records the timeout only when it joins the exit,
         // so a snapshot taken the moment the response arrives can precede it
         // (seen once in six parallel suite runs). Wait for the record, then

@@ -592,6 +592,114 @@ async fn a_silent_backend_is_a_gateway_timeout_and_frees_its_slot() {
 }
 
 #[tokio::test]
+async fn shutdown_waits_for_a_started_silent_exchange_to_time_out_without_replay() {
+    let (listener, address) = fake().await;
+    let mut server = Server::start(vec![address], |config| {
+        config.response_timeout = Duration::from_millis(400);
+    })
+    .await;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let backend = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        receive(&mut stream, true).await;
+        started_tx.send(()).unwrap();
+        let _ = release_rx.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "a possibly executed request was replayed"
+        );
+    });
+    let http = tokio::spawn(exchange(server.address, GET));
+    started_rx.await.unwrap();
+
+    let shutdown_started = Instant::now();
+    server.shutdown.take().unwrap().send(()).unwrap();
+    assert_eq!(http.await.unwrap().status, 504);
+    tokio::time::timeout(Duration::from_secs(5), &mut server.task)
+        .await
+        .expect("server shutdown must converge after the response deadline")
+        .unwrap()
+        .unwrap();
+    let shutdown_elapsed = shutdown_started.elapsed();
+    assert_eq!(server.backend.snapshot().active_exchanges, 0);
+    release_tx.send(()).unwrap();
+    backend.await.unwrap();
+    println!("silent endpoint: graceful shutdown completed in {shutdown_elapsed:?}");
+}
+
+#[test]
+fn unicode_path_segments_never_panic_during_php_script_detection() {
+    let root = Root::new(&[
+        ("index.php", "front"),
+        ("éabc", "ordinary"),
+        ("é.php", "script"),
+    ]);
+    assert!(is_static(&target(&root, "/%C3%A9abc")));
+    assert_eq!(script_of(target(&root, "/%C3%A9.php")).0, "/é.php");
+}
+
+#[tokio::test]
+async fn a_started_request_is_not_replayed_to_another_endpoint_after_timeout() {
+    let (first, first_address) = fake().await;
+    let (second, second_address) = fake().await;
+    let server = Server::start(vec![first_address, second_address], |config| {
+        config.response_timeout = Duration::from_millis(250);
+    })
+    .await;
+    let backend = tokio::spawn(async move {
+        let (mut stream, _) = first.accept().await.unwrap();
+        // This marks that the first endpoint received the complete request.
+        receive(&mut stream, true).await;
+        std::future::pending::<()>().await;
+    });
+    assert_eq!(exchange(server.address, GET).await.status, 504);
+    // No second endpoint may see a request that may already have executed.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), second.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.backend.snapshot().timeouts, 1);
+    backend.abort();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_started_request_is_not_replayed_after_backend_disconnect() {
+    let (first, first_address) = fake().await;
+    let (second, second_address) = fake().await;
+    let server = Server::start(vec![first_address, second_address], |_| {}).await;
+    let backend = tokio::spawn(async move {
+        let (mut stream, _) = first.accept().await.unwrap();
+        receive(&mut stream, true).await;
+        // The backend may already have committed a side effect. Closing now
+        // cannot authorize a second execution on the other endpoint.
+    });
+    assert_eq!(exchange(server.address, GET).await.status, 502);
+    backend.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), second.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(server.backend.snapshot().backend_failures, 1);
+    let fresh = tokio::spawn(one_reply(
+        second,
+        records(&[(STDOUT, b"Status: 200 OK\r\n\r\nfresh")], true),
+    ));
+    let answer = exchange(server.address, GET).await;
+    assert_eq!(
+        (answer.status, answer.body.as_slice()),
+        (200, &b"fresh"[..])
+    );
+    fresh.await.unwrap();
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn a_stall_after_the_head_ends_the_body_at_the_response_timeout() {
     let (listener, address) = fake().await;
     let server = Server::start(vec![address], |config| {
@@ -690,10 +798,13 @@ async fn slots_bound_concurrency_and_a_request_that_cannot_get_one_is_refused() 
         config.connect_timeout = Duration::from_millis(500);
     })
     .await;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
     let backend = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         receive(&mut stream, true).await;
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        started_tx.send(()).unwrap();
+        release_rx.await.unwrap();
         stream
             .write_all(&records(&[(STDOUT, b"Status: 200 OK\r\n\r\nslow")], true))
             .await
@@ -705,14 +816,234 @@ async fn slots_bound_concurrency_and_a_request_that_cannot_get_one_is_refused() 
     });
     let address = server.address;
     let holder = tokio::spawn(async move { exchange(address, GET).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    started_rx.await.unwrap();
     let refused = exchange(server.address, GET).await;
     assert_eq!(refused.status, 503);
     assert_eq!(refused.body, b"FastCGI Busy");
+    release_tx.send(()).unwrap();
     assert_eq!(holder.await.unwrap().body, b"slow");
     assert!(backend.await.unwrap(), "only one exchange at a time");
     assert_eq!(server.backend.snapshot().busy_refusals, 1);
     server.stop().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn canceled_blocking_connect_keeps_its_slot_until_the_attempt_exits() {
+    let root = Root::new(&[("index.php", "front")]);
+    let backend = FastCgiBackend::new(FastCgiConfig {
+        label: Arc::from("test/"),
+        document_root: root.path.clone(),
+        index: "index.php".to_owned(),
+        servers: vec!["127.0.0.1:32000".parse().unwrap()],
+        concurrency: 1,
+        connect_timeout: Duration::from_secs(1),
+        response_timeout: Duration::from_secs(1),
+    });
+    let permit = Arc::clone(&backend.slots).acquire_owned().await.unwrap();
+    backend
+        .counters
+        .active_exchanges
+        .fetch_add(1, AtomicOrdering::AcqRel);
+    let server = backend.claim_server(&[]).unwrap();
+    let attempt = super::ConnectAttempt::new(
+        &backend,
+        server,
+        super::ExchangePermit {
+            backend: Arc::clone(&backend),
+            _permit: permit,
+        },
+    );
+    let claim = Arc::new(std::sync::Mutex::new(Some(attempt)));
+    let worker_claim = Arc::clone(&claim);
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let pending = super::PendingConnect {
+        claim,
+        task: tokio::task::spawn_blocking(move || {
+            let attempt = worker_claim.lock().unwrap().take().unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(attempt);
+            finished_tx.send(()).unwrap();
+            None
+        }),
+    };
+    started_rx.await.unwrap();
+    drop(pending); // The closure has taken ownership, so abort cannot release it early.
+    assert_eq!(backend.slots.available_permits(), 0);
+    assert_eq!(backend.in_flight[0].load(AtomicOrdering::Acquire), 1);
+    assert_eq!(backend.snapshot().active_exchanges, 1);
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(backend.slots.available_permits(), 1);
+    assert_eq!(backend.in_flight[0].load(AtomicOrdering::Acquire), 0);
+    assert_eq!(backend.snapshot().active_exchanges, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn queued_connect_timeout_and_cancellation_release_slots_before_blocking_pool_recovers() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.await.unwrap();
+
+        let (listener, address) = fake().await;
+        let root = Root::new(&[("index.php", "front")]);
+        let backend = FastCgiBackend::new(FastCgiConfig {
+            label: Arc::from("queued-connect/"),
+            document_root: root.path.clone(),
+            index: "index.php".to_owned(),
+            servers: vec![address],
+            concurrency: 1,
+            connect_timeout: Duration::from_millis(100),
+            response_timeout: Duration::from_secs(1),
+        });
+        let permit = Arc::clone(&backend.slots).acquire_owned().await.unwrap();
+        backend
+            .counters
+            .active_exchanges
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        let server = backend.claim_server(&[]).unwrap();
+        let attempt = super::ConnectAttempt::new(
+            &backend,
+            server,
+            super::ExchangePermit {
+                backend: Arc::clone(&backend),
+                _permit: permit,
+            },
+        );
+        let started = Instant::now();
+        let outcome = super::connect_server(&backend, address, attempt).await;
+        let waiter_elapsed = started.elapsed();
+        assert!(matches!(outcome, super::ConnectOutcome::Detached(_)));
+
+        // The queued closure has not started. A canceled waiter must revoke
+        // it and release the claim without waiting for unrelated blockers.
+        let timed_out_reclaimed = tokio::time::timeout(
+            Duration::from_millis(250),
+            Arc::clone(&backend.slots).acquire_owned(),
+        )
+        .await;
+        let timeout_reclaim_elapsed = started.elapsed();
+        assert_eq!(backend.blocking_connect_slots.available_permits(), 0);
+        let Ok(permit) = timed_out_reclaimed else {
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            panic!("a timed-out queued connect retained the slot behind the blocker");
+        };
+        drop(permit);
+
+        let permit = Arc::clone(&backend.slots).acquire_owned().await.unwrap();
+        backend
+            .counters
+            .active_exchanges
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        let server = backend.claim_server(&[]).unwrap();
+        let attempt = super::ConnectAttempt::new(
+            &backend,
+            server,
+            super::ExchangePermit {
+                backend: Arc::clone(&backend),
+                _permit: permit,
+            },
+        );
+        let fallback_started = Instant::now();
+        let fallback = super::connect_server(&backend, address, attempt).await;
+        let fallback_elapsed = fallback_started.elapsed();
+        assert!(
+            !matches!(fallback, super::ConnectOutcome::Detached(_)),
+            "a full blocking-connect queue must use cancellable async I/O"
+        );
+        drop(fallback);
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        println!(
+            "queued connect: timeout waiter={waiter_elapsed:?}, timeout reclaim={timeout_reclaim_elapsed:?}, async fallback={fallback_elapsed:?}, reclaimed_before_blocker_release=true"
+        );
+        assert_eq!(backend.snapshot().active_exchanges, 0);
+        assert_eq!(backend.in_flight[0].load(AtomicOrdering::Acquire), 0);
+        let blocking_permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&backend.blocking_connect_slots).acquire_owned(),
+        )
+        .await
+        .expect("queued closure must eventually release its queue capacity")
+        .unwrap();
+        drop(blocking_permit);
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+        let second_blocker = tokio::task::spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_second_rx.recv().unwrap();
+        });
+        entered_rx.await.unwrap();
+        let permit = Arc::clone(&backend.slots).acquire_owned().await.unwrap();
+        backend
+            .counters
+            .active_exchanges
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        let server = backend.claim_server(&[]).unwrap();
+        let attempt = super::ConnectAttempt::new(
+            &backend,
+            server,
+            super::ExchangePermit {
+                backend: Arc::clone(&backend),
+                _permit: permit,
+            },
+        );
+        let queued_canceled_at = Instant::now();
+        let mut waiting = Box::pin(super::connect_server(&backend, address, attempt));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+        assert_eq!(backend.blocking_connect_slots.available_permits(), 0);
+        drop(waiting); // A client cancels before the queued closure can start.
+        let queued_cancel_reclaimed = tokio::time::timeout(
+            Duration::from_millis(250),
+            Arc::clone(&backend.slots).acquire_owned(),
+        )
+        .await;
+        let queued_cancel_elapsed = queued_canceled_at.elapsed();
+        release_second_tx.send(()).unwrap();
+        second_blocker.await.unwrap();
+        println!(
+            "queued cancellation reclaimed={queued_cancel_elapsed:?}, before_blocker_release={}",
+            queued_cancel_reclaimed.is_ok()
+        );
+        assert!(queued_cancel_reclaimed.is_ok());
+        drop(queued_cancel_reclaimed.unwrap());
+        assert_eq!(backend.snapshot().active_exchanges, 0);
+        assert_eq!(backend.in_flight[0].load(AtomicOrdering::Acquire), 0);
+
+        // An async fallback can complete a TCP handshake just as its HTTP
+        // waiter disappears. A connection is harmless; no FastCGI frame may
+        // follow cancellation, including from the queued blocking closures.
+        if let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+        {
+            let mut byte = [0];
+            let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+                .await
+                .expect("canceled connection must close")
+                .unwrap();
+            assert_eq!(read, 0, "a FastCGI frame arrived after cancellation");
+        }
+    });
 }
 
 #[tokio::test]

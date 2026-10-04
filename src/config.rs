@@ -11,6 +11,7 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::access::AccessPolicy;
 use crate::body_budget::BodyBudget;
 use crate::fastcgi::{
     DEFAULT_CONNECT_TIMEOUT as FASTCGI_DEFAULT_CONNECT_TIMEOUT,
@@ -143,6 +144,10 @@ struct RawHost {
     name: String,
     #[serde(default)]
     aliases: Vec<String>,
+    #[serde(default)]
+    deny_paths: Vec<String>,
+    #[serde(default)]
+    deny_names: Vec<String>,
     locations: Vec<RawLocation>,
 }
 
@@ -595,6 +600,8 @@ fn builtin_raw_config() -> RawConfig {
         hosts: vec![RawHost {
             name: "localhost".to_owned(),
             aliases: vec!["127.0.0.1".to_owned()],
+            deny_paths: Vec::new(),
+            deny_names: Vec::new(),
             locations: vec![
                 RawLocation {
                     path: "/api".to_owned(),
@@ -651,6 +658,7 @@ pub(crate) struct ValidatedConfig {
 struct ValidatedHost {
     name: String,
     aliases: Vec<String>,
+    access: Arc<AccessPolicy>,
     locations: Vec<ValidatedLocation>,
 }
 
@@ -784,6 +792,11 @@ pub(crate) fn validate_raw(
     let mut names = HashMap::<String, HostnameRole>::new();
     let mut hosts = Vec::with_capacity(raw.hosts.len());
     for (host_index, host) in raw.hosts.into_iter().enumerate() {
+        let access = Arc::new(
+            AccessPolicy::compile(host.deny_paths, host.deny_names).map_err(|error| {
+                ConfigError::Validation(format!("hosts[{host_index}] ({:?}): {error}", host.name))
+            })?,
+        );
         validate_hostname_field(&host.name, &format!("hosts[{host_index}].name"))?;
         register_hostname(
             &mut names,
@@ -1054,6 +1067,7 @@ pub(crate) fn validate_raw(
         hosts.push(ValidatedHost {
             name: host.name,
             aliases: host.aliases,
+            access,
             locations,
         });
     }
@@ -1403,7 +1417,10 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                             host.name
                         ),
                     )?;
-                    Handler::static_files(Arc::new(canonical_root))
+                    Handler::static_files_with_access(
+                        Arc::new(canonical_root),
+                        Arc::clone(&host.access),
+                    )
                 }
                 ValidatedHandler::FastCgi {
                     resolved_root,
@@ -1430,7 +1447,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         response_timeout,
                     });
                     fastcgi_backends.push(Arc::clone(&backend));
-                    Handler::fastcgi(backend)
+                    Handler::fastcgi_with_access(backend, Arc::clone(&host.access))
                 }
                 ValidatedHandler::NotFound => Handler::not_found(),
                 ValidatedHandler::PhpWorker {
@@ -1524,8 +1541,12 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
             .map(|(path, handler)| (path.as_str(), handler.clone()))
             .collect();
         let location_router = Arc::new(
-            LocationRouter::new(location_refs, Handler::not_found())
-                .map_err(|error| compile_router_error(&host.name, "locations", error))?,
+            LocationRouter::with_access(
+                location_refs,
+                Handler::not_found(),
+                Arc::clone(&host.access),
+            )
+            .map_err(|error| compile_router_error(&host.name, "locations", error))?,
         );
         for hostname in
             std::iter::once(host.name.as_str()).chain(host.aliases.iter().map(String::as_str))

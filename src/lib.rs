@@ -1,6 +1,7 @@
 #[macro_use]
 mod output;
 
+mod access;
 #[cfg(feature = "profiling")]
 pub mod blocking_profile;
 pub mod body_budget;
@@ -8,6 +9,8 @@ pub mod config;
 #[cfg(feature = "profiling")]
 pub mod config_profile;
 pub mod fastcgi;
+#[cfg(feature = "profiling")]
+pub mod fastcgi_profile;
 mod handler;
 mod lingering_close;
 mod php_protocol;

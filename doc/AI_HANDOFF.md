@@ -1,5 +1,187 @@
 # AI Handoff
 
+## Windows FastCGI blocking-pool saturation correction (2026-10-04)
+
+Still uncommitted on `dev`; preserve all earlier working-tree changes. A
+deterministic one-thread Tokio blocking-pool test falsified the assumption
+that dropping/aborting a queued `spawn_blocking` connect promptly releases
+its captured exchange claim. Before correction, a 100 ms connect waiter
+returned in ~114 ms but its slot remained held after ~368 ms while an
+unrelated blocking closure occupied the thread.
+
+`src/fastcgi.rs` now uses a per-connect claim handoff: cancellation or timeout
+reclaims the exact server claim and exchange permit if the blocking closure
+has not taken them; after handoff, the closure owns them until connect ends.
+The closure never writes a FastCGI frame. A second per-location semaphore
+caps queued/running blocking connect closures to the endpoint-slot count;
+when full, new attempts use cancellable async connect. This avoids replacing
+the old delayed-slot problem with an unbounded Tokio blocking queue. No
+connection reuse, endpoint lifecycle or protocol change was made.
+
+After correction, the queued timeout returned and reclaimed its slot at
+~109 ms before the blocker was released. Queued client cancellation
+reclaimed its slot in 23–102 µs across two controlled runs; async fallback
+connected locally in ~1.5 ms without waiting for the blocker. A separate
+handoff test proves a closure that already took the claim retains its slot
+until it exits despite waiter cancellation. A
+silent backend that received the complete request produced 504 and a
+graceful shutdown in ~412 ms after a 400 ms response deadline, without
+replay. A TCP SYN-blackhole was not reproduced; no system firewall was
+altered. A running blocking OS connect remains non-cancelable until return,
+and unrelated stalled blocking work can still delay Tokio runtime teardown.
+
+Default-feature release Hello C32, same .NET driver (3 fresh runs, 8 s,
+100 warm-up), produced W1 min/median/max 587/643/880 RPS and W2
+240/910/1,210, zero errors. Host variance is high; these non-interleaved
+groups do not prove a regression against the earlier 1,405/1,678 medians.
+The interleaved profiling A/B favored current blocking over async in 11/12
+W1/W2 C16/C32 pairs, with zero errors. Exact latency, CPU and RAM and
+methodology are appended to `doc/BENCHMARKS.md`.
+
+Windows fmt, clippy `-D warnings`, default tests (179 library tests passed),
+eight real-`php-cgi` integration tests, release build, profiling bench link,
+PHP fixture lint and `git diff --check` passed. A final exact-path process
+and temp-directory check found no Hamster/PHP process or new benchmark/session
+scratch directory from this pass. Earlier ignored application workspaces were
+left untouched. Do not commit or push.
+
+## Windows FastCGI connect-path corrective pass (2026-10-04)
+
+Uncommitted on `dev` at `6fd830d`; preserves all earlier working-tree changes.
+Profiling-only stage samples with real operator-started `php-cgi.exe` showed
+W1/C32 async connect mean 5–11 ms, backend-head mean <1 ms and median slot
+wait 213–371 ms. Direct FastCGI controls and END_REQUEST-vs-EOF controls
+falsified the idea that TCP close timing itself caused this. An interleaved
+async-vs-blocking connect A/B won in every one of 12 W1/W2 C16/C32 paired
+rounds; the precise Windows kernel/IOCP mechanism remains unknown.
+
+Windows now uses `std::net::TcpStream::connect_timeout` on Tokio's blocking
+pool only for FastCGI `concurrency = 1` and `connect_timeout <= 5 s`.
+`ConnectAttempt` and `ExchangePermit` carry both the server claim and bounded
+exchange permit into the blocking task. If the HTTP waiter disappears, the
+task cannot send a FastCGI frame and releases claims when it finishes. On
+connect failure before any frame, another endpoint may be tried; once a
+request may have started, no replay. Multiplexing endpoints and longer
+timeouts retain async connect. Protocol, endpoint ownership and static-file
+policy are unchanged.
+
+Independent default-feature MSVC release runs (3 fresh processes/cell, 8 s,
+100 warm-up, Hello/JSON, HTTP C16/C32, W1/W2) had zero errors. Hello W1/C32
+median 1,405 RPS versus historical 143 with the same driver but
+non-interleaved runs; W2/C32 median 1,678. JSON W1/C32 median 837 and W2/C32
+1,216. Exact min/median/max, latency, CPU and RAM are in `doc/BENCHMARKS.md`.
+The improvement direction is supported by paired A/B; do not quote an exact
+production percentage across host-drifted groups. No connection reuse was
+added. The previous timeout/intermittency and file-boundary notes remain
+below. Native Linux remains unverified.
+
+Verification for this pass: Windows fmt and clippy `-D warnings`, default
+`cargo test`, the eight real-`php-cgi` fixture tests, MSVC release build,
+profiling bench link, PHP lint and `git diff --check` passed. The manual
+release profiling controls and load A/B passed with validated responses and
+zero errors. No repository `php-cgi.exe` or Hamster process and no new
+benchmark/session temp directory remained after measurement. The prior
+ignored `target/` application workspaces remain untouched.
+
+
+## Windows FastCGI follow-up — load, failure and file-boundary review (2026-10-04)
+
+Still uncommitted on `dev` at `6fd830d`; preserve the earlier corrective
+working tree and the pre-existing research backlog. A valid UTF-8 path segment
+such as `%C3%A9abc` previously panicked in FastCGI's `.php` suffix detection
+because it sliced a Rust string at a byte offset; a failing regression proved
+it, and the suffix check now uses bytes. The full FastCGI unit group has 21/21
+passing, including deterministic slot saturation (503), backend timeout (504),
+backend disconnect (502), and no replay of a potentially executed exchange.
+
+Five parallel runs of the eight real-`php-cgi` fixture tests each passed 8/8;
+the earlier two 60 s test timeouts have not reproduced. The old host
+sleep/resume explanation remains **unproven**: Windows System event 1 reports
+a low-power interval from 2026-10-01 19:54:38 UTC to 2026-10-04 08:20:50
+UTC, but the failed test log lacks timestamps that tie it to that interval.
+No timeout was raised merely to hide it. A fresh release load probe used the
+existing driver with 3 fresh process runs/cell, 8 s measured, 100 warm-up,
+Hello/JSON, 1 or 2 operator-started endpoints and HTTP C16/C32. All validated
+responses succeeded. One endpoint at C32 fell to ~142–143 median RPS with
+~227–233 ms P50; C16 was
+~304–395 RPS with ~31–49 ms P50. Two-endpoint results had large spread;
+`doc/BENCHMARKS.md` has exact cells. This does not isolate TCP connection
+cost, so no connection reuse or endpoint-management expansion was made.
+
+File-boundary audit: host `deny_paths`/`deny_names` run before location routing
+and against final opened paths for filesystem handlers; dotfiles and PHP
+source extensions remain closed by default. Application-specific private
+trees still require explicit rules. Static bytes use the validated opened
+handle on Windows, but PHP's pathname handoff is not object-identity-atomic
+under concurrent namespace changes. No new file-boundary regression was
+found beyond the Unicode panic. Linux has not been natively verified.
+
+Windows gates after this follow-up: fmt, clippy `-D warnings`, default
+`cargo test`, MSVC release build, profiling bench link, relevant PHP lint and
+`git diff --check` all passed. No new persistent benchmark scratch artifacts
+were left; the driver removes each temporary run directory. The earlier
+ignored `target/` application workspaces listed below predate this follow-up
+and were not touched.
+
+## Current Windows corrective pass — FastCGI private files and gateway status (2026-10-04)
+
+Checkout `dev` was fast-forwarded to `origin/dev` at `6fd830d` before this
+pass. The earlier FastCGI v1 implementation is committed there; the changes
+in this section are uncommitted. Do not commit/tag/push/merge/release without
+an Owner request. The pre-existing untracked
+`doc/HAMSTER_RESEARCH_BACKLOG_2026-09-27.md` was not touched.
+
+- Host-wide `deny_paths`/`deny_names` now cover static and FastCGI routing,
+  including overlapping locations, case/percent variants and final opened
+  paths behind in-root junctions. Filesystem handlers deny dotfiles by
+  default except root `/.well-known`, and never return PHP source bytes.
+  Configure application-specific private trees; `.htaccess` is still ignored.
+- PHP worker execution deadline now answers 504 instead of 502. Timeout still
+  kills/reaps and replaces its worker, never replays the possibly-started
+  request, and remains outside infrastructure failure backoff. Initial and
+  replacement generations both use configured `php.startup_timeout` (default
+  5 s; demonstrated by the 6.5 s delayed-READY fixture with 12 s setting).
+- A new FlatPress 1.5.1 application is rebuilt from a pinned, hash-checked
+  release ZIP and installed over two operator-managed `php-cgi.exe` endpoints;
+  public home and private-tree 404 checks passed. Fresh DokuWiki integration
+  passed. The original `prepare_php_apps.ps1` reached DokuWiki and Slim but
+  Symfony's final asset-map compile timed out contacting external Iconify;
+  that incomplete workspace does not prove Symfony qualification.
+- Release FastCGI micro-workload results: 3 fresh-process runs/cell, 6 s,
+  200 warm-up, two endpoints, HTTP C1/C4/C16/C32, Hello/JSON, zero errors.
+  Median RPS ranges 186-708 Hello and 189-997 JSON, with substantial
+  C16/C32 variance; see `doc/BENCHMARKS.md`. A one-endpoint C16 comparison
+  was slower. No evidence isolates fresh TCP connection cost, so no reuse
+  optimization was made.
+- Windows fmt, clippy `-D warnings`, default cargo test, release build,
+  `cargo bench --no-run --features profiling`, relevant PHP lint and
+  `git diff --check` passed. Seven targeted PHP worker ignored regressions
+  and the cold-READY startup/replacement test passed. The full ignored
+  FastCGI suite passed 10/10 when serialized. An earlier parallel run was
+  interrupted across an apparent host sleep/resume and had two 60-second
+  client timeouts; that cause is an inference, not proven. Do not record that
+  run as passing. No `php-cgi.exe` or `hamster-wheel.exe` from this pass remains.
+  The tool policy rejected `Remove-Item` for this pass's ignored `target/`
+  scratch workspaces and benchmark JSON, so those artifacts still need exact
+  cleanup: `target/flatpress-app-20261001`,
+  `target/flatpress-rebuild-20261001`,
+  `target/flatpress-rebuild-20261001-b`,
+  `target/flatpress-suite-20261001`,
+  `target/flatpress-serial-20261004`, `target/flatpress-final-20261004`,
+  `target/php-apps-rebuild-20261001`, and
+  `target/fastcgi-bench{,-one-endpoint}-20261001.json` (use the exact
+  directory names shown by `Get-ChildItem target`). `www/`, `ssl/` and older
+  investigation directories were untouched.
+
+Next action: review this corrective diff, rerun the interrupted parallel
+FastCGI suite only if concurrency qualification is required, and remove the
+listed scratch artifacts when filesystem deletion is available. The next Windows product
+decision should be based on the operator-managed FastCGI boundary, not an
+automatic move to managed endpoints; remaining limitations include explicit
+private-tree policy, endpoint ownership by the operator, chunked upload 411,
+and the script pathname handoff under concurrent filesystem changes. Native
+Linux remains unverified.
+
 ## Current Working Scope — third pass: FastCGI v1 slice + open issues (2026-09-28)
 
 Uncommitted, on top of the second pass below. Not committed, tagged or

@@ -10,8 +10,8 @@ use hyper::{
 #[cfg(test)]
 use crate::body_budget::BodyBudget;
 use crate::{
-    config::SERVER_NAME, fastcgi::FastCgiBackend, php_worker::PhpWorkerPool, proxy::Upstream,
-    response_body::ResponseBody, static_files, transport::ConnectionInfo,
+    access::AccessPolicy, config::SERVER_NAME, fastcgi::FastCgiBackend, php_worker::PhpWorkerPool,
+    proxy::Upstream, response_body::ResponseBody, static_files, transport::ConnectionInfo,
 };
 
 pub(crate) type HandlerResponse = Response<ResponseBody>;
@@ -35,6 +35,7 @@ pub enum HandlerKind {
 pub enum Handler {
     Static {
         document_root: Arc<PathBuf>,
+        access: Arc<AccessPolicy>,
     },
     Simple {
         status: StatusCode,
@@ -48,6 +49,7 @@ pub enum Handler {
     },
     FastCgi {
         backend: Arc<FastCgiBackend>,
+        access: Arc<AccessPolicy>,
     },
     #[cfg(test)]
     TransportEcho,
@@ -72,7 +74,17 @@ pub enum Handler {
 
 impl Handler {
     pub fn static_files(document_root: Arc<PathBuf>) -> Self {
-        Self::Static { document_root }
+        Self::static_files_with_access(document_root, Arc::new(AccessPolicy::default()))
+    }
+
+    pub(crate) fn static_files_with_access(
+        document_root: Arc<PathBuf>,
+        access: Arc<AccessPolicy>,
+    ) -> Self {
+        Self::Static {
+            document_root,
+            access,
+        }
     }
 
     pub const fn simple(status: StatusCode, body: &'static str) -> Self {
@@ -92,7 +104,18 @@ impl Handler {
     }
 
     pub fn fastcgi(backend: Arc<FastCgiBackend>) -> Self {
-        Self::FastCgi { backend }
+        Self::fastcgi_with_access(backend, Arc::new(AccessPolicy::default()))
+    }
+
+    pub(crate) fn fastcgi_with_access(
+        backend: Arc<FastCgiBackend>,
+        access: Arc<AccessPolicy>,
+    ) -> Self {
+        Self::FastCgi { backend, access }
+    }
+
+    pub(crate) const fn is_filesystem(&self) -> bool {
+        matches!(self, Self::Static { .. } | Self::FastCgi { .. })
     }
 
     #[cfg(test)]
@@ -136,9 +159,10 @@ impl Handler {
         body_read_timeout: Duration,
     ) -> Result<HandlerResponse, Infallible> {
         match self {
-            Self::Static { document_root } => {
-                static_files::serve(request, Arc::clone(document_root)).await
-            }
+            Self::Static {
+                document_root,
+                access,
+            } => static_files::serve(request, Arc::clone(document_root), access).await,
             Self::Simple { status, body } => Ok(simple_response(*status, body)),
             Self::PhpWorker { pool } => Ok(pool
                 .serve_http(request, connection, body_read_timeout)
@@ -146,8 +170,11 @@ impl Handler {
             Self::Proxy { upstream } => {
                 Ok(crate::proxy::serve(upstream, request, connection).await)
             }
-            Self::FastCgi { backend } => {
-                Ok(crate::fastcgi::serve(backend, request, connection, body_read_timeout).await)
+            Self::FastCgi { backend, access } => {
+                Ok(
+                    crate::fastcgi::serve(backend, access, request, connection, body_read_timeout)
+                        .await,
+                )
             }
             #[cfg(test)]
             Self::TransportEcho => Ok(transport_response(connection)),

@@ -15,6 +15,7 @@ other application.
 |---|---|---|---|
 | Laravel stand-in (`pms-scratch`) | `fixtures/php-worker/pms/prepare_scratch_app.ps1` | Yes, in about 2.5 minutes with network access | Every Laravel test: Octane lifecycle, auth/session isolation, metadata, TLS scheme. Synthetic data only. |
 | PHP application workspace (`php-apps`): Symfony Demo 3.1.0, Slim skeleton 4.5.0 and DokuWiki 2026-07-14c, all external and unmodified, plus the simulated native application | `fixtures/php-apps/prepare_php_apps.ps1` | Yes, in about 3 minutes with network access | `tests/php_applications.rs`: other frameworks through persistent workers, request/response semantics, failures, pools side by side (`doc/PHP_APPLICATION_COMPATIBILITY.md`). `tests/php_cgi.rs`: DokuWiki as a classic SAPI application through FastCGI (`doc/FASTCGI_V1.md`). |
+| FlatPress 1.5.1, traditional database-free PHP blog | `fixtures/php-apps/prepare_flatpress.ps1` | Yes, pinned release ZIP and SHA-256 | `tests/php_cgi.rs`: fresh HTTP installation, public page, private file access policy through FastCGI. |
 | The real PMS, Octane-enabled scratch copy | A copy of the owner's PMS checkout plus Octane | No: needs the owner's source, database and Redis | PMS behavior, schema and performance. |
 | Plain PHP application (`plain-php`) | Not in the repository | No | Manual runs only; no test uses it. |
 
@@ -25,15 +26,24 @@ other application.
 $env:HAMSTER_PHP_APPS = 'D:\scratch\php-apps'
 $env:HAMSTER_LARAVEL_TEST_PATH = 'D:\scratch\pms-scratch'   # optional
 cargo test --test php_applications -- --ignored
-cargo test --test php_cgi -- --ignored        # FastCGI; needs php\8.5\php-cgi.exe
+./fixtures/php-apps/prepare_flatpress.ps1 -Target D:\scratch\flatpress
+$env:HAMSTER_FLATPRESS_TEST_PATH = 'D:\scratch\flatpress\app'
+cargo test --test php_cgi -- --ignored --test-threads=1  # needs php\8.5\php-cgi.exe
 ```
 
 `tests/php_cgi.rs` starts `php-cgi.exe -b` processes itself, as an operator
-would, on fixed loopback ports; eight of its nine tests use only
-`fixtures/php-cgi`, and the DokuWiki test needs `HAMSTER_PHP_APPS`. DokuWiki is
+would, on loopback ports selected by the test; eight fixture tests use only
+`fixtures/php-cgi`, while the DokuWiki and FlatPress tests need their prepared
+workspaces. DokuWiki is
 downloaded as the published release tarball (`download.dokuwiki.org`) and
 extracted with the Windows `tar.exe`; it needs no Composer step, and the page
 and media file the test writes stay in the workspace's `dokuwiki/data`.
+FlatPress is installed by the test, so use a newly prepared target for each
+run. All application changes stay there. The 2026-10-01 fresh `php-apps`
+rebuild reached DokuWiki and Slim but failed at Symfony's final
+`asset-map:compile` when the external Iconify collections endpoint timed out;
+DokuWiki's independent FastCGI integration passed from that workspace. This
+does not qualify the incomplete Symfony workspace for its own tests.
 
 Composer runs on the repository PHP through `composer.phar` (found beside the
 `composer` command, or `-Composer <path>`), with exact package versions.

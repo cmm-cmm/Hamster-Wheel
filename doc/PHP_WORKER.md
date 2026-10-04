@@ -31,6 +31,12 @@ eleven slow requests. The respawn rate stays bounded because the deadline
 itself bounds it, at `1 / (request_timeout + bootstrap)`. See
 `doc/EXECUTION_TIMEOUT_POLICY.md`.
 
+The current HTTP answer for that execution deadline is `504 PHP Worker
+Execution Timeout`, distinguishing a missing timely application response from
+a broken/invalid worker response (`502`). Neither answer authorizes replay of
+a possibly-started transaction. Changing the status does not change worker
+ownership, cancellation safety or recovery classification.
+
 Stability is time based on purpose. Treating successful request *count* as
 proof of health would tie the respawn rate to application throughput, because
 a crash loop reaches any request threshold sooner the faster the pool serves.

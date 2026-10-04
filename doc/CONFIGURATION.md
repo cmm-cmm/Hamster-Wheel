@@ -23,6 +23,9 @@ http1_max_buffer_size = 65536
 [[hosts]]
 name = "localhost"
 aliases = ["127.0.0.1"]
+# Optional host-wide, component-aware denials applied before routing.
+deny_paths = ["/data", "/conf", "/inc", "/bin", "/vendor"]
+deny_names = ["composer.json", "composer.lock"]
 
 [[hosts.locations]]
 path = "/api"
@@ -117,9 +120,26 @@ response_timeout = 60         # seconds, 1-3600: backend inactivity
 
 `php-cgi` on Windows serves one connection at a time, so each process is one
 `servers` entry with `concurrency = 1`. Hostnames are refused rather than
-resolved. The whole root is served: an application's private directories must
-be closed with `not_found` locations, because `.htaccess` is not read. See
-`doc/FASTCGI_V1.md` for the request mapping, CGI variables and failure answers.
+resolved. On Windows, that single-exchange configuration uses a bounded
+blocking-pool TCP connect when `connect_timeout <= 5`; longer timeouts and
+multiplexing endpoints use async connect. Each request still opens a fresh
+connection. A canceled HTTP waiter cannot send a FastCGI request from a
+detached connect task. If that task has not started, its exchange slot is
+released immediately; if it has started, the slot is held until connect
+returns. Queued blocking connect work is capped per location, with async
+connect fallback when the cap is occupied. The whole
+root is otherwise served, and `.htaccess` is not read.
+Declare private directories with host-wide `deny_paths`, and sensitive file
+basenames with `deny_names`; both return 404 before any location handler sees
+the request. Paths match whole components, ignoring ASCII case, so `/data`
+blocks `/DATA/file` and `/%64ata/file` but not `/database`. Names match at any
+depth. Rules must use plain ASCII path components, without percent escapes,
+`..`, trailing dots or spaces. File handlers also deny dotfile components
+except root `/.well-known`, and never serve PHP source extensions as bytes.
+The final opened file location is checked again, so a junction alias inside
+the same root does not bypass a rule. These defaults do not identify every
+application-specific private directory: configure those explicitly. See
+`doc/FASTCGI_V1.md` for examples and the remaining script-path handoff limit.
 
 An optional HTTPS listener terminates TLS in front of the same hosts. Only
 `listen` and at least one certificate are required; the example shows the
@@ -245,11 +265,11 @@ application's own observed request latency plus headroom: measure the routes
 this location actually serves, take a high percentile rather than an average,
 and leave room for a cold cache and a slow dependency. A value below the
 application's real p99 converts ordinary slow requests into killed workers and
-`502`s.
+`504`s.
 
 Exceeding it is not an ordinary request failure. Protocol v1 has no cancel
 frame, so the only way to reclaim a worker that is still mid-transaction is to
-kill it; the request is answered `502` with the body
+kill it; the request is answered `504` with the body
 `PHP Worker Execution Timeout`, the child is killed and reaped, and a
 replacement is started immediately. The request is never dispatched again,
 because a deadline that expires says nothing about how far PHP already got.
@@ -286,9 +306,10 @@ infrastructure failure history, so repeated slow requests cannot walk a slot
 into the replacement backoff ladder or its cooldown band. Crashes, I/O faults
 and protocol faults still are. Both counts are visible in the pool snapshot,
 and each timeout writes one line to standard error naming the condition. The
-status is deliberately `502` rather than `504`: the request is already started
-and may already have had side effects, and `504` more readily invites the
-external retry that Hamster itself refuses to perform. See
+status is `504` because the upstream application did not respond before the
+deadline; `502` remains for a broken/invalid worker response. This status
+does not authorize a retry: the request may already have had side effects,
+and Hamster never replays it. See
 `doc/EXECUTION_TIMEOUT_POLICY.md` for the measured failure this separation
 fixes.
 

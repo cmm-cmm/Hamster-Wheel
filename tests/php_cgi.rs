@@ -25,6 +25,16 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(feature = "profiling")]
+use {
+    bytes::Bytes,
+    hamster_wheel::fastcgi_profile::FastCgiStageTiming,
+    http_body_util::{BodyExt, Empty},
+    hyper::{Request, client::conn::http1::SendRequest},
+    hyper_util::rt::TokioIo,
+    tokio::sync::Barrier,
+};
+
 fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -57,10 +67,15 @@ struct PhpCgi {
     addresses: Vec<SocketAddr>,
     children: Vec<Option<Child>>,
     sessions: PathBuf,
+    ini: Option<PathBuf>,
 }
 
 impl PhpCgi {
     fn start(count: usize) -> Self {
+        Self::start_with_ini(count, None)
+    }
+
+    fn start_with_ini(count: usize, ini: Option<PathBuf>) -> Self {
         common::end_children_with_this_process();
         let sessions = std::env::temp_dir().join(format!(
             "hamster-cgi-sessions-{}-{}",
@@ -72,6 +87,7 @@ impl PhpCgi {
             addresses: Vec::new(),
             children: Vec::new(),
             sessions,
+            ini,
         };
         for _ in 0..count {
             let address = free_port();
@@ -84,7 +100,11 @@ impl PhpCgi {
 
     fn launch(&mut self, index: usize) {
         let address = self.addresses[index];
-        let child = Command::new(repository().join("php/8.5/php-cgi.exe"))
+        let mut command = Command::new(repository().join("php/8.5/php-cgi.exe"));
+        if let Some(ini) = &self.ini {
+            command.arg("-c").arg(ini);
+        }
+        let child = command
             .arg("-b")
             .arg(address.to_string())
             .args([
@@ -137,8 +157,8 @@ struct Location<'a> {
     root: PathBuf,
     servers: &'a [SocketAddr],
     extra: &'a str,
-    /// Path prefixes answered 404 instead of reaching the root, as an
-    /// application's own `.htaccess` deny rules would under Apache.
+    /// Host-wide private paths, applied before either FastCGI or static
+    /// dispatch and again to the opened file's final location.
     deny: &'a [&'a str],
 }
 
@@ -160,10 +180,14 @@ impl AppServer {
                 .collect::<Vec<_>>()
                 .join(", ");
             source.push_str(&format!("\n[[hosts]]\nname = \"{}\"\n", location.host));
-            for prefix in location.deny {
-                source.push_str(&format!(
-                    "\n[[hosts.locations]]\npath = \"{prefix}\"\nhandler = \"not_found\"\n"
-                ));
+            if !location.deny.is_empty() {
+                let paths = location
+                    .deny
+                    .iter()
+                    .map(|path| format!("\"{path}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                source.push_str(&format!("deny_paths = [{paths}]\n"));
             }
             source.push_str(&format!(
                 "\n[[hosts.locations]]\npath = \"/\"\nhandler = \"fastcgi\"\nroot = {}\n\n[hosts.locations.fastcgi]\nservers = [{servers}]\n{}\n",
@@ -312,6 +336,416 @@ async fn exchange(address: SocketAddr, request: &[u8]) -> Reply {
         .expect("a reply within a minute")
         .unwrap();
     parse(&bytes)
+}
+
+#[cfg(feature = "profiling")]
+async fn profile_send(sender: &mut SendRequest<Empty<Bytes>>) -> bool {
+    sender.ready().await.unwrap();
+    let request = Request::builder()
+        .uri("/bench.php?workload=hello")
+        .header("Host", "localhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    status == 200 && body.as_ref() == b"Hello from PHP"
+}
+
+#[cfg(feature = "profiling")]
+async fn profile_lane(
+    address: SocketAddr,
+    barrier: Arc<Barrier>,
+    duration: Duration,
+    warmup: bool,
+) -> (usize, Vec<f64>) {
+    let stream = TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    if warmup {
+        for _ in 0..100 {
+            assert!(profile_send(&mut sender).await);
+        }
+        connection.abort();
+        return (100, Vec::new());
+    }
+    barrier.wait().await;
+    let deadline = Instant::now() + duration;
+    let mut latencies = Vec::new();
+    let mut errors = 0;
+    while Instant::now() < deadline {
+        let started = Instant::now();
+        if profile_send(&mut sender).await {
+            latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
+        } else {
+            errors += 1;
+        }
+    }
+    connection.abort();
+    (errors, latencies)
+}
+
+#[cfg(feature = "profiling")]
+fn profile_percentile(mut values: Vec<f64>, fraction: f64) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[((values.len() - 1) as f64 * fraction) as usize]
+}
+
+#[cfg(feature = "profiling")]
+fn profile_stage(
+    samples: &[FastCgiStageTiming],
+    field: impl Fn(&FastCgiStageTiming) -> Duration,
+) -> String {
+    let mut values = samples
+        .iter()
+        .map(|sample| field(sample).as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values.sort_by(f64::total_cmp);
+    let percentile = |fraction: f64| values[((values.len() - 1) as f64 * fraction) as usize];
+    format!(
+        "{mean:.3}/{:.3}/{:.3}/{:.3}",
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99)
+    )
+}
+
+/// Release-only stage probe: the endpoint process is real php-cgi, each HTTP
+/// lane reuses its connection, and every cell starts new PHP/server processes.
+#[cfg(feature = "profiling")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual MSVC release FastCGI stage measurement; requires php/8.5/php-cgi.exe"]
+async fn profile_fastcgi_slot_connect_and_backend_head() {
+    for (endpoints, concurrency) in [(1, 1), (1, 16), (1, 32), (2, 16), (2, 32)] {
+        for run in 1..=3 {
+            let cgi = PhpCgi::start(endpoints);
+            let server = AppServer::start(&[Location {
+                host: "localhost",
+                root: fixture_root(),
+                servers: &cgi.addresses,
+                extra: "connect_timeout = 2\nresponse_timeout = 10",
+                deny: &[],
+            }])
+            .await;
+            profile_lane(
+                server.address,
+                Arc::new(Barrier::new(1)),
+                Duration::ZERO,
+                true,
+            )
+            .await;
+            server.backend(0).take_profile();
+            let barrier = Arc::new(Barrier::new(concurrency + 1));
+            let tasks = (0..concurrency)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    tokio::spawn(profile_lane(
+                        server.address,
+                        barrier,
+                        Duration::from_secs(6),
+                        false,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            barrier.wait().await;
+            let started = Instant::now();
+            let mut errors = 0;
+            let mut latencies = Vec::new();
+            for task in tasks {
+                let (lane_errors, mut lane_latencies) = task.await.unwrap();
+                errors += lane_errors;
+                latencies.append(&mut lane_latencies);
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            let samples = server.backend(0).take_profile();
+            assert_eq!(samples.len(), latencies.len());
+            let slot = profile_stage(&samples, |sample| sample.slot_wait);
+            let connect = profile_stage(&samples, |sample| sample.tcp_connect);
+            let write = profile_stage(&samples, |sample| sample.preamble_write);
+            let backend = profile_stage(&samples, |sample| sample.backend_head);
+            println!(
+                "FASTCGI_STAGE endpoints={endpoints} concurrency={concurrency} run={run} requests={} errors={errors} seconds={elapsed:.3} rps={:.1} http_p50_ms={:.3} stage_mean_p50_p95_p99_ms slot={slot} connect={connect} write={write} backend_head={backend}",
+                latencies.len(),
+                latencies.len() as f64 / elapsed,
+                profile_percentile(latencies, 0.50),
+            );
+            assert_eq!(errors, 0);
+            server.stop().await;
+        }
+    }
+}
+
+#[cfg(feature = "profiling")]
+fn direct_record(kind: u8, content: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&[1, kind, 0, 1]);
+    out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(content);
+}
+
+#[cfg(feature = "profiling")]
+fn direct_param(name: &str, value: &str, out: &mut Vec<u8>) {
+    for length in [name.len(), value.len()] {
+        if length < 128 {
+            out.push(length as u8);
+        } else {
+            out.extend_from_slice(&((length as u32) | 0x8000_0000).to_be_bytes());
+        }
+    }
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+#[cfg(feature = "profiling")]
+fn direct_request() -> Vec<u8> {
+    let root = fixture_root();
+    let script = root.join("bench.php");
+    let mut params = Vec::new();
+    for (name, value) in [
+        ("GATEWAY_INTERFACE", "CGI/1.1"),
+        ("SERVER_SOFTWARE", "Hamster Wheel"),
+        ("SERVER_PROTOCOL", "HTTP/1.1"),
+        ("REQUEST_METHOD", "GET"),
+        ("REQUEST_URI", "/bench.php?workload=hello"),
+        ("QUERY_STRING", "workload=hello"),
+        ("DOCUMENT_ROOT", root.to_str().unwrap()),
+        ("SCRIPT_FILENAME", script.to_str().unwrap()),
+        ("SCRIPT_NAME", "/bench.php"),
+        ("REMOTE_ADDR", "127.0.0.1"),
+        ("REMOTE_PORT", "32000"),
+        ("SERVER_ADDR", "127.0.0.1"),
+        ("SERVER_PORT", "8080"),
+        ("SERVER_NAME", "localhost"),
+        ("REQUEST_SCHEME", "http"),
+        ("REDIRECT_STATUS", "200"),
+        ("HTTP_HOST", "localhost"),
+    ] {
+        direct_param(name, value, &mut params);
+    }
+    let mut request = Vec::new();
+    direct_record(1, &[0, 1, 0, 0, 0, 0, 0, 0], &mut request);
+    direct_record(4, &params, &mut request);
+    direct_record(4, &[], &mut request);
+    direct_record(5, &[], &mut request);
+    request
+}
+
+#[cfg(feature = "profiling")]
+async fn direct_sample(address: SocketAddr, request: &[u8], until_eof: bool) -> (f64, f64) {
+    let before = Instant::now();
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let connected = Instant::now();
+    stream.write_all(request).await.unwrap();
+    let written = Instant::now();
+    let mut response = Vec::new();
+    if until_eof {
+        stream.read_to_end(&mut response).await.unwrap();
+    } else {
+        loop {
+            let mut header = [0_u8; 8];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 1);
+            let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+            let mut content = vec![0_u8; length + header[6] as usize];
+            stream.read_exact(&mut content).await.unwrap();
+            response.extend_from_slice(&content[..length]);
+            if header[1] == 3 {
+                break;
+            }
+        }
+    }
+    assert!(
+        response
+            .windows(b"Hello from PHP".len())
+            .any(|bytes| bytes == b"Hello from PHP"),
+        "unexpected direct PHP response: {response:?}"
+    );
+    (
+        connected.duration_since(before).as_secs_f64() * 1_000.0,
+        written.elapsed().as_secs_f64() * 1_000.0,
+    )
+}
+
+#[cfg(feature = "profiling")]
+async fn direct_burst(address: SocketAddr, request: &[u8], duration: Duration) -> (f64, Vec<f64>) {
+    let started = Instant::now();
+    let mut connect = Vec::new();
+    while started.elapsed() < duration {
+        let (sample, _) = direct_sample(address, request, false).await;
+        connect.push(sample);
+    }
+    (started.elapsed().as_secs_f64(), connect)
+}
+
+/// Direct PHP control removes Hamster's routing, slot and HTTP path while
+/// preserving the same fresh TCP connection and one FastCGI exchange.
+#[cfg(feature = "profiling")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual MSVC release direct php-cgi connection control"]
+async fn profile_direct_php_cgi_connect_control() {
+    let request = direct_request();
+    for (run, until_eof) in (1..=3).flat_map(|run| [(run, true), (run, false)]) {
+        let cgi = PhpCgi::start(1);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(6);
+        let mut connect = Vec::new();
+        let mut backend = Vec::new();
+        while Instant::now() < deadline {
+            let (one_connect, one_backend) =
+                direct_sample(cgi.addresses[0], &request, until_eof).await;
+            connect.push(one_connect);
+            backend.push(one_backend);
+        }
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        println!(
+            "FASTCGI_DIRECT run={run} until_eof={until_eof} requests={} seconds={:.3} rps={:.1} connect_mean_p50_p95_ms={:.3}/{:.3}/{:.3} backend_mean_p50_p95_ms={:.3}/{:.3}/{:.3}",
+            connect.len(),
+            started.elapsed().as_secs_f64(),
+            connect.len() as f64 / started.elapsed().as_secs_f64(),
+            mean(&connect),
+            profile_percentile(connect.clone(), 0.50),
+            profile_percentile(connect, 0.95),
+            mean(&backend),
+            profile_percentile(backend.clone(), 0.50),
+            profile_percentile(backend, 0.95),
+        );
+    }
+}
+
+/// Same PHP endpoint and test runtime across direct/Hamster/direct windows;
+/// this distinguishes a Hamster-path effect from process or host drift.
+#[cfg(feature = "profiling")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual MSVC release interleaved FastCGI connection control"]
+async fn profile_interleaved_direct_and_hamster_connect() {
+    let cgi = PhpCgi::start(1);
+    let server = AppServer::start(&[Location {
+        host: "localhost",
+        root: fixture_root(),
+        servers: &cgi.addresses,
+        extra: "connect_timeout = 2\nresponse_timeout = 10",
+        deny: &[],
+    }])
+    .await;
+    let request = direct_request();
+    for round in 1..=3 {
+        let (before_seconds, before) =
+            direct_burst(cgi.addresses[0], &request, Duration::from_secs(3)).await;
+        let styles = if round % 2 == 1 {
+            [("async", false), ("blocking", true)]
+        } else {
+            [("blocking", true), ("async", false)]
+        };
+        for (style, blocking) in styles {
+            server.backend(0).set_profile_async_connect(!blocking);
+            server.backend(0).take_profile();
+            let barrier = Arc::new(Barrier::new(2));
+            let task = tokio::spawn(profile_lane(
+                server.address,
+                Arc::clone(&barrier),
+                Duration::from_secs(3),
+                false,
+            ));
+            barrier.wait().await;
+            let started = Instant::now();
+            let (errors, latencies) = task.await.unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            let samples = server.backend(0).take_profile();
+            assert_eq!(errors, 0);
+            assert_eq!(samples.len(), latencies.len());
+            let hamster_connect = profile_stage(&samples, |sample| sample.tcp_connect);
+            println!(
+                "FASTCGI_INTERLEAVED round={round} style={style} hamster_rps={:.1} hamster_connect_mean_p50_p95_p99_ms={hamster_connect}",
+                samples.len() as f64 / elapsed,
+            );
+        }
+        let (after_seconds, after) =
+            direct_burst(cgi.addresses[0], &request, Duration::from_secs(3)).await;
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        println!(
+            "FASTCGI_INTERLEAVED round={round} direct_before_rps={:.1} direct_before_connect_mean_p95_ms={:.3}/{:.3} direct_after_rps={:.1} direct_after_connect_mean_p95_ms={:.3}/{:.3}",
+            before.len() as f64 / before_seconds,
+            mean(&before),
+            profile_percentile(before, 0.95),
+            after.len() as f64 / after_seconds,
+            mean(&after),
+            profile_percentile(after, 0.95),
+        );
+    }
+    server.stop().await;
+}
+
+#[cfg(feature = "profiling")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual MSVC release FastCGI connect A/B under load"]
+async fn profile_fastcgi_connect_styles_under_load() {
+    for (endpoints, concurrency) in [(1, 16), (1, 32), (2, 16), (2, 32)] {
+        let cgi = PhpCgi::start(endpoints);
+        let server = AppServer::start(&[Location {
+            host: "localhost",
+            root: fixture_root(),
+            servers: &cgi.addresses,
+            extra: "connect_timeout = 2\nresponse_timeout = 10",
+            deny: &[],
+        }])
+        .await;
+        profile_lane(
+            server.address,
+            Arc::new(Barrier::new(1)),
+            Duration::ZERO,
+            true,
+        )
+        .await;
+        server.backend(0).take_profile();
+        for round in 1..=3 {
+            let styles = if round % 2 == 1 {
+                [("async", false), ("blocking", true)]
+            } else {
+                [("blocking", true), ("async", false)]
+            };
+            for (style, blocking) in styles {
+                server.backend(0).set_profile_async_connect(!blocking);
+                server.backend(0).take_profile();
+                let barrier = Arc::new(Barrier::new(concurrency + 1));
+                let tasks = (0..concurrency)
+                    .map(|_| {
+                        tokio::spawn(profile_lane(
+                            server.address,
+                            Arc::clone(&barrier),
+                            Duration::from_secs(3),
+                            false,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                barrier.wait().await;
+                let started = Instant::now();
+                let mut errors = 0;
+                let mut latencies = Vec::new();
+                for task in tasks {
+                    let (one_errors, mut one_latencies) = task.await.unwrap();
+                    errors += one_errors;
+                    latencies.append(&mut one_latencies);
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                let samples = server.backend(0).take_profile();
+                assert_eq!(samples.len(), latencies.len());
+                let slot = profile_stage(&samples, |sample| sample.slot_wait);
+                let connect = profile_stage(&samples, |sample| sample.tcp_connect);
+                let backend = profile_stage(&samples, |sample| sample.backend_head);
+                println!(
+                    "FASTCGI_CONNECT_AB endpoints={endpoints} concurrency={concurrency} round={round} style={style} requests={} errors={errors} seconds={elapsed:.3} rps={:.1} http_p50_ms={:.3} slot_mean_p50_p95_p99_ms={slot} connect_mean_p50_p95_p99_ms={connect} backend_head_mean_p50_p95_p99_ms={backend}",
+                    latencies.len(),
+                    latencies.len() as f64 / elapsed,
+                    profile_percentile(latencies, 0.50),
+                );
+                assert_eq!(errors, 0);
+            }
+        }
+        server.stop().await;
+    }
 }
 
 fn parse(bytes: &[u8]) -> Reply {
@@ -838,7 +1272,7 @@ fn url_encode(value: &str) -> String {
 /// endpoints: pages, its static assets, its native session cookie, an edit
 /// saved through its form and read back, and a media upload it stores with
 /// move_uploaded_file() and serves again. Its data and configuration
-/// directories are closed with `not_found` locations, as its `.htaccess`
+/// directories are closed with host access rules, as its `.htaccess`
 /// files close them under Apache; without them `/data/pages/*.txt` is served.
 /// Needs HAMSTER_PHP_APPS (fixtures/php-apps/prepare_php_apps.ps1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -877,8 +1311,11 @@ async fn dokuwiki_runs_unmodified_through_fastcgi() {
     assert_eq!(logo.all("content-type"), ["image/png"]);
     for private in [
         "/data/pages/wiki/dokuwiki.txt",
+        "/DATA/pages/wiki/dokuwiki.txt",
+        "/%64ata/pages/wiki/dokuwiki.txt",
         "/conf/dokuwiki.php",
         "/inc/init.php",
+        "/data/.htaccess",
     ] {
         assert_eq!(editor.get(private).await.status, 404, "{private}");
     }
@@ -979,4 +1416,116 @@ async fn dokuwiki_runs_unmodified_through_fastcgi() {
     );
     server.stop().await;
     let _ = std::fs::remove_file(wiki.join("data/media/hamster").join(&name));
+}
+
+/// FlatPress 1.5.1 is a second, independently developed, database-free PHP
+/// application. Install from its untouched release in a fresh scratch root,
+/// then verify the public page and the operator's private-path policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires HAMSTER_FLATPRESS_TEST_PATH and repository php/8.5/php-cgi.exe"]
+async fn flatpress_installs_and_serves_public_pages() {
+    let app = PathBuf::from(
+        std::env::var_os("HAMSTER_FLATPRESS_TEST_PATH")
+            .expect("prepare FlatPress in a fresh target directory first"),
+    );
+    let ini = app.parent().unwrap().join("php.ini");
+    assert!(app.join("setup.php").is_file());
+    assert!(ini.is_file());
+    let cgi = PhpCgi::start_with_ini(2, Some(ini));
+    let deny = [
+        "/fp-content/config",
+        "/fp-content/users",
+        "/fp-content/content",
+        "/fp-content/cache",
+        "/fp-content/compile",
+        "/fp-content/index",
+        "/fp-defaults",
+        "/fp-includes",
+        "/setup",
+    ];
+    let server = AppServer::start(&[Location {
+        host: "flatpress.test",
+        root: app.clone(),
+        servers: &cgi.addresses,
+        extra: "index = \"index.php\"",
+        deny: &deny,
+    }])
+    .await;
+    let mut client = Client::new(server.address, "flatpress.test");
+    let first = client.get("/setup.php").await;
+    assert_eq!(first.status, 200, "{}", first.text());
+    let setup_id = form_value(&first.text(), "setupid");
+    assert!(!setup_id.is_empty(), "setup ID in installer response");
+    let start = format!("setupid={}&start=Next", url_encode(&setup_id));
+    let second = client
+        .send(
+            "POST",
+            "/setup.php",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            start.as_bytes(),
+        )
+        .await;
+    assert_eq!(second.status, 200, "{}", second.text());
+    assert!(
+        second.text().contains("name=\"fpuser\""),
+        "{}",
+        second.text()
+    );
+    let setup_id = form_value(&second.text(), "setupid");
+    let fields = [
+        ("setupid", setup_id.as_str()),
+        ("language", "en-us"),
+        ("fpuser", "hamstertest"),
+        ("fppwd", "hamsterTest123"),
+        ("fppwd2", "hamsterTest123"),
+        ("email", "hamster@example.test"),
+        ("www", "http://localhost/"),
+        ("start", "Next"),
+    ];
+    let body = fields
+        .iter()
+        .map(|(name, value)| format!("{}={}", url_encode(name), url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let installed = client
+        .send(
+            "POST",
+            "/setup.php",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(installed.status, 200, "{}", installed.text());
+    assert!(app.join("fp-content/config/settings.conf.php").is_file());
+    let home = client.get("/").await;
+    assert_eq!(home.status, 200, "{}", home.text());
+    assert!(home.text().contains("FlatPress"));
+    for private in [
+        "/fp-content/config/settings.conf.php",
+        "/FP-CONTENT/config/settings.conf.php",
+        "/fp-content/users/hamstertest.php",
+        "/fp-defaults/config.php",
+        "/fp-includes/core/core.main.php",
+        "/setup/main.php",
+    ] {
+        assert_eq!(client.get(private).await.status, 404, "{private}");
+    }
+    server.stop().await;
+
+    // Installation needs setup.php, but a production config closes it once
+    // the installer has finished without taking the public blog offline.
+    let mut sealed = deny.to_vec();
+    sealed.push("/setup.php");
+    let sealed_server = AppServer::start(&[Location {
+        host: "flatpress.test",
+        root: app,
+        servers: &cgi.addresses,
+        extra: "index = \"index.php\"",
+        deny: &sealed,
+    }])
+    .await;
+    let mut client = Client::new(sealed_server.address, "flatpress.test");
+    assert_eq!(client.get("/setup.php").await.status, 404);
+    assert_eq!(client.get("/").await.status, 200);
+    sealed_server.stop().await;
 }
