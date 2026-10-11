@@ -1,5 +1,152 @@
 # AI Handoff
 
+## Control overload bound and WinSW stop contract (2026-10-11, current pass)
+
+This pass preserved the pre-existing uncommitted control-path, configuration,
+test and documentation changes. No commit, tag, push, merge, release, Service
+installation, firewall change or unrelated process cleanup was performed.
+
+FACT: the four-exchange semaphore did not bound refusal tasks. Each refused
+client could hold a spawned task and pipe handle for the five-second peer-close
+deadline. An ignored, process-level Windows regression (`tests/windows_control.rs`)
+held 96 refusal peers open: exact Hamster PID handle count grew from 112 to
+211 and the new resource-bound assertion failed. A separate eight-permit
+refusal budget now caps those waits. Under the same two-burst probe the count
+was 112 baseline / 127 peak / 112 after the deadline, then `status` and
+`stop` succeeded. Three subsequent repetitions passed with peaks 124–127;
+Windows may surface either a closed-pipe write error or incomplete-frame read
+for an excess client, and neither is command success. When both budgets are
+full, the server closes excess pipes
+without attempting an unbounded `ERR busy` task. The client now rejects an
+empty or incomplete response frame rather than reporting false command
+success. Its reply exchange shares the same overall five-second deadline as
+pipe-open and `ERR busy` retries.
+
+FACT: the WinSW v2.11.0 candidate XML is
+`examples/winsw/HamsterWheelService.xml`. It uses `startarguments` for the
+server and `stoparguments` for `--control stop`, with a sample 120-second
+graceful deadline, log rolling and restart-on-failure. WinSW's XML contract
+says it waits for both the stop helper and main process to exit; Hamster's
+`OK stopping=true` only acknowledges receipt. The runbook now requires an
+exact process-exit check and treats forced termination as the last resort.
+The sample uses `LocalService`; the pipe DACL admits only owner/System, so a
+different operator account cannot directly reload TLS without a reviewed
+same-account procedure or a deliberate ACL decision.
+The XML parsed locally, but WinSW and a real Service were **NOT VERIFIED**:
+no isolated VM or VM command was available. Service-account/operator ACLs,
+SCM stop timing, crash restart and log rotation remain VM qualification work.
+The operator-managed `php-cgi` endpoint still needs separate supervision.
+
+Verification: Windows `cargo fmt --all -- --check`, strict MSVC Clippy,
+default suite, ignored control suite (9/9), ignored headless suite (2/2),
+ignored containment suite (4/4), MSVC release build, profiling bench link and
+`git diff --check` passed. The
+100-client-style bound probe was run before (failed, 112→211) and after
+(passed, 112→127); its exact process was reaped. Linux remains **NOT
+VERIFIED**. TCP SYN-blackhole remains **NOT VERIFIED**.
+
+Next: run the isolated WinSW Service rehearsal from `doc/WINDOWS_OPERATIONS.md`,
+then decide whether a service integration is necessary. Do not infer Service
+readiness from detached-process tests or the WinSW XML alone.
+
+## Control-path verification gaps closed (2026-10-11, second pass)
+
+This pass continues from the section below, at the committed `e902c78` with the
+control endpoint already in place, and closes the verification gaps that
+section left open: connection overload and recovery after `ERR busy`,
+timeout/cancellation of an incomplete request, and a compile check of the
+non-Windows configuration. Nothing was committed, tagged, pushed, merged or
+released. No firewall or service on this machine was changed.
+
+FACT: three real defects were found by building those checks, and all three are
+fixed with regression tests.
+
+1. The pipe's instance ceiling was `MAX_CONCURRENT_EXCHANGES + 1`. At
+   saturation the next instance could not be created, the accept loop treated
+   that as fatal and returned, and **the control endpoint was then dead for the
+   rest of the process life** — a server an operator could no longer stop
+   gracefully. The ceiling is now high (254) because the work bound is the
+   semaphore, not the instance count; the waiting instance is ensured at the
+   top of the accept loop with a short retry, a failure is reported once
+   through `errln!` instead of ending the loop, and the instance is restored
+   immediately after an accept so a client arriving during the handoff is not
+   met with a bare `ERROR_PIPE_BUSY`.
+2. `OK` answers carried no terminating blank line. `Response::ok` appended one
+   newline to a detail block that sometimes already ended with one, so `ping`
+   answered `OK\npid=N\n`. This was invisible while the client read to
+   end of stream, and became a hard fault the moment the server waited for
+   the client to close first: every command then cost the full five-second
+   exchange deadline, and three rehearsals failed with
+   `control request timed out`. The terminator is now normalised in
+   `Response::ok`, so the documented frame is real for every command.
+3. A refusal was written on the accept loop and the pipe was dropped straight
+   after. A client that never read it could delay later accepts, and Windows
+   can discard bytes an unread client leaves behind when the server closes
+   first. Refusals are now spawned off the accept loop, and both refusals and
+   answers wait — bounded by the exchange deadline — for the client to close,
+   which is the proof it read the answer.
+
+FACT: the client now treats contention as contention rather than as an error.
+`ERROR_PIPE_BUSY` on open is retried every 25 ms, and an `ERR busy` answer is
+retried after 100 ms, both inside the same five-second budget.
+
+FACT (new rehearsals in `tests/windows_control.rs`, all `#[ignore]`, real
+detached servers): four held connections make a raw fifth read
+`ERR busy\nmessage=too many control connections\n\n`, and after the
+holders are released the shipped client recovers and the endpoint still
+answers `ping` and `stop`; a request line written without its newline is
+never executed — even though its text is `stop` — is released well inside
+15 s, leaves the server running and the endpoint serving; and every answer
+(`ping`, `status`, an unknown command) arrives framed with its blank line in
+under a second while the connection is still open. The framing test was
+verified to bite: with the terminator removed it fails with
+`"ping\n" was answered without its frame`.
+
+FACT: the suite is now stable rather than intermittent. Before the framing fix
+`an_overloaded_endpoint_refuses_and_then_recovers` failed in roughly two of
+five runs; after it, nine consecutive runs of
+`cargo test --test windows_control -- --ignored --test-threads=1` passed (six
+at 7 tests, then three at 8 with the framing test added), each in 11.8–13.9 s.
+The flake had one cause, not two: an answer that was only complete when the
+server closed made every exchange a race with that close.
+
+FACT: the non-Windows configuration is now compile-checked by substitute. A
+scratch copy of `src/` with the platform `cfg` attributes flipped to the
+non-Windows arrangement (Windows-only items excluded, `not(windows)` items
+always compiled, tokio's unix signal syscalls stubbed because they do not exist
+on this target) first produced **ten dead-code errors** under
+`cargo clippy --lib --bins --all-features -- -D warnings`: the protocol
+constants, `PIPE_SDDL`, `Response` and its four associated functions,
+`single_line`, `execute`, `status_details` and `reload_certificates`. A Linux
+gate would have failed on them. `src/control.rs` was restructured: the shared
+`Command` and `validate_name`, which configuration and the CLI need on every
+platform, stay unconditional, and everything else moved into
+`#[cfg(windows)] mod protocol`. The same flipped check now lints clean. This
+corrects the sentence in the section below that the non-Windows path is "not
+compile-checked"; it is checked at compile level, which is still not Linux
+operation.
+
+Windows gates at this working tree: `cargo fmt --all -- --check`; strict MSVC
+Clippy `--all-targets --all-features -D warnings`; the default suite (189
+library plus every integration file, 0 failed); ignored rehearsals
+`windows_control` 8/8, `windows_headless` 2/2, `windows_containment` 4/4,
+`tls_reload_process` 3/3; MSVC release build; `cargo bench --no-run --features
+profiling` linking all 11 bench executables; and a manual probe of the release
+binary itself — control endpoint line in its log, `ping` and `status` in
+114–131 ms, HTTP 200 on its listener, `stop` answered `OK ... stopping=true`
+with the process gone. No benchmark was run: nothing on the request path
+changed.
+
+Still **NOT VERIFIED**, unchanged: anything under a real Windows Service
+account, cross-account denial with a second real user, and native Linux. A
+supervisor rehearsal with `--control stop` needs an isolated Windows VM, which
+was not available: there is no WSL, no Docker, no C toolchain for a Linux
+cross-build (`aws-lc-sys` still needs `x86_64-linux-gnu-gcc`) and this shell is
+not elevated, so no service was installed and no firewall rule was touched.
+The owner decision named below — whether a Service wrapper's stop command
+should be `--control stop` — is still open, and the runbook still only
+recommends it.
+
 ## Console-free control endpoint (2026-10-11)
 
 This pass began from a clean `dev` checkout at `f5eaa76` (`origin/dev`) and

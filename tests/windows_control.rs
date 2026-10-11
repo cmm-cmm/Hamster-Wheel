@@ -31,6 +31,7 @@ use tokio_rustls::{
 
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const SYNCHRONIZE: u32 = 0x0010_0000;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const WAIT_OBJECT_0: u32 = 0;
 const ERROR_ACCESS_DENIED: i32 = 5;
 
@@ -52,6 +53,7 @@ unsafe extern "system" {
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn GetCurrentProcess() -> *mut c_void;
+    fn GetProcessHandleCount(process: *mut c_void, count: *mut u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -139,6 +141,16 @@ fn pipe_path(name: &str) -> String {
     format!(r"\\.\pipe\hamster-wheel-control-{name}")
 }
 
+fn process_handle_count(pid: u32) -> u32 {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    assert!(!handle.is_null(), "cannot inspect Hamster PID {pid}");
+    let mut count = 0;
+    let result = unsafe { GetProcessHandleCount(handle, &mut count) };
+    unsafe { CloseHandle(handle) };
+    assert_ne!(result, 0, "cannot count handles for Hamster PID {pid}");
+    count
+}
+
 fn reserve_address() -> SocketAddr {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
@@ -174,6 +186,8 @@ fn spawn_detached(config: &Path, stdout: &Path, stderr: &Path) -> OwnedChild {
 
 /// Runs the shipped control client, which is how an operator reaches a
 /// console-free server.
+/// The server's answer is on stdout and the client's own diagnosis on stderr;
+/// a failure needs both to be explainable.
 fn control(config: &Path, command: &str) -> (bool, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_hamster-wheel"))
         .arg("--config")
@@ -182,24 +196,59 @@ fn control(config: &Path, command: &str) -> (bool, String) {
         .arg(command)
         .output()
         .unwrap();
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-    )
+    let mut reported = String::from_utf8_lossy(&output.stdout).into_owned();
+    let diagnosis = String::from_utf8_lossy(&output.stderr);
+    if !diagnosis.trim().is_empty() {
+        reported.push_str("[stderr] ");
+        reported.push_str(diagnosis.trim());
+    }
+    (output.status.success(), reported)
+}
+
+/// Opens the endpoint the way any raw client has to: every instance can be
+/// occupied, and Windows then refuses the open instead of queueing it.
+fn open_endpoint(name: &str) -> File {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_path(name))
+        {
+            Ok(pipe) => return pipe,
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("cannot open the control endpoint: {error}"),
+        }
+    }
 }
 
 /// One raw exchange, for protocol-level cases the client cannot express.
 fn raw_exchange(name: &str, request: &str) -> String {
-    let mut pipe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_path(name))
-        .unwrap();
+    let mut pipe = open_endpoint(name);
     pipe.write_all(request.as_bytes()).unwrap();
     pipe.flush().unwrap();
-    let mut response = String::new();
-    pipe.read_to_string(&mut response).unwrap();
-    response
+    // Every answer ends with a blank line, so a client stops there and closes
+    // first; reading to end of stream would wait for a server that is itself
+    // waiting for this client to close.
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 256];
+    while !response.ends_with(b"\n\n") {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+        }
+    }
+    String::from_utf8(response).expect("the control endpoint answered with text")
+}
+
+/// Opens a connection and leaves it silent, holding one exchange slot.
+fn hold_a_slot(name: &str) -> File {
+    open_endpoint(name)
 }
 
 /// Not ignored, and deliberately cheap: wiring the control stop into the
@@ -648,6 +697,264 @@ async fn reload_certificates_swaps_the_served_leaf_and_keeps_the_old_set_on_fail
     assert!(wait_for_exit(server_pid, Duration::from_secs(10)));
     assert_eq!(server.exited(), Some(0));
     eprintln!("control evidence: reload adopted a new leaf, then rolled back and kept serving it");
+}
+
+#[test]
+#[ignore = "starts a detached server and saturates its control endpoint"]
+fn an_overloaded_endpoint_refuses_and_then_recovers() {
+    let scratch = Scratch::new("overload");
+    let name = control_name("overload");
+    let address = reserve_address();
+    let config = scratch.file("server.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\n\
+             handler = \"not_found\"\n"
+        ),
+    )
+    .unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+
+    // Hold every exchange slot with connections that never send a request.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(hold_a_slot(&name));
+        thread::sleep(Duration::from_millis(60));
+    }
+
+    // One more raw connection must be answered, not silently dropped: closing
+    // a named pipe with unread bytes can discard them.
+    let refused = raw_exchange(&name, "status\n");
+    assert!(
+        refused.starts_with("ERR busy\n"),
+        "an over-the-ceiling connection must be refused in words: {refused:?}"
+    );
+    assert!(refused.ends_with("\n\n"), "{refused:?}");
+
+    // The shipped client retries a refusal inside its own budget, so an
+    // operator survives a burst instead of having to run the command again.
+    let released = thread::spawn({
+        let name = name.clone();
+        move || {
+            thread::sleep(Duration::from_millis(400));
+            drop(held);
+            // Keep the endpoint reachable for the assertion below.
+            drop(name);
+        }
+    });
+    let (ok, status) = control(&config, "status");
+    released.join().unwrap();
+    assert!(
+        ok,
+        "the client did not recover after the slots were released: {status}"
+    );
+    assert!(status.starts_with("OK\n"), "{status}");
+
+    // Fully recovered: a further command needs no retry at all.
+    let (ok, ping) = control(&config, "ping");
+    assert!(ok, "{ping}");
+
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "{stopped}");
+    let server_pid = server.id();
+    assert!(wait_for_exit(server_pid, Duration::from_secs(10)));
+    assert_eq!(server.exited(), Some(0));
+    eprintln!("control evidence: ERR busy at the ceiling, then the client recovered: {refused:?}");
+}
+
+#[test]
+#[ignore = "starts a detached server and holds a sustained burst of refused control connections"]
+fn refused_connections_have_a_bounded_handle_envelope() {
+    let scratch = Scratch::new("refusal-bound");
+    let name = control_name("refusal-bound");
+    let address = reserve_address();
+    let config = scratch.file("server.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\n\
+             handler = \"not_found\"\n"
+        ),
+    )
+    .unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+
+    let baseline = process_handle_count(server.id());
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(hold_a_slot(&name));
+    }
+    for _ in 0..8 {
+        held.push(open_endpoint(&name));
+    }
+    wait_until("the eight held refusal handles", || {
+        process_handle_count(server.id()) >= baseline + 12
+    });
+    let (accepted, diagnosis) = control(&config, "ping");
+    assert!(
+        !accepted,
+        "a saturated endpoint must not report a command as successful: {diagnosis}"
+    );
+    let mut peak = baseline;
+    // These clients deliberately never read or close: refused exchanges must
+    // not create one five-second server task/handle per connecting client.
+    for _ in 0..88 {
+        held.push(open_endpoint(&name));
+        peak = peak.max(process_handle_count(server.id()));
+    }
+    assert!(
+        peak <= baseline + 32,
+        "refused clients grew Hamster handles from {baseline} to {peak}"
+    );
+
+    // Keep the first burst open beyond the server's five-second exchange
+    // deadline, then renew pressure. Both generations must remain bounded.
+    thread::sleep(Duration::from_secs(6));
+    let after_deadline = process_handle_count(server.id());
+    assert!(
+        after_deadline <= baseline + 32,
+        "timed-out refusals retained handles: {after_deadline} vs {baseline}"
+    );
+    for _ in 0..96 {
+        held.push(open_endpoint(&name));
+        peak = peak.max(process_handle_count(server.id()));
+    }
+    assert!(
+        peak <= baseline + 32,
+        "renewed overload grew Hamster handles from {baseline} to {peak}"
+    );
+
+    drop(held);
+    let (ok, status) = control(&config, "status");
+    assert!(ok, "endpoint did not recover after burst: {status}");
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "{stopped}");
+    assert!(wait_for_exit(server.id(), Duration::from_secs(10)));
+    assert_eq!(server.exited(), Some(0));
+    eprintln!(
+        "control refusal evidence: handles baseline={baseline}, peak={peak}, after_deadline={after_deadline}; recovered and stopped"
+    );
+}
+
+#[test]
+#[ignore = "starts a detached server and sends a request line that never ends"]
+fn a_partial_request_line_is_released_by_the_exchange_deadline() {
+    let scratch = Scratch::new("partial");
+    let name = control_name("partial");
+    let address = reserve_address();
+    let config = scratch.file("server.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\n\
+             handler = \"not_found\"\n"
+        ),
+    )
+    .unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+
+    // A command with no newline is not a request yet, so it must not be run,
+    // and it must not hold its slot for longer than the exchange deadline.
+    let mut partial = hold_a_slot(&name);
+    partial.write_all(b"stop").unwrap();
+    partial.flush().unwrap();
+    let started = Instant::now();
+    let mut answered = String::new();
+    partial.read_to_string(&mut answered).unwrap_or_default();
+    let waited = started.elapsed();
+    assert!(
+        answered.is_empty(),
+        "an unterminated line was run: {answered:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(15),
+        "the deadline did not release an unterminated request: {waited:?}"
+    );
+    assert_eq!(
+        server.exited(),
+        None,
+        "the partial `stop` text must not have stopped the server"
+    );
+
+    let (ok, status) = control(&config, "status");
+    assert!(ok, "the endpoint did not recover: {status}");
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "{stopped}");
+    let server_pid = server.id();
+    assert!(wait_for_exit(server_pid, Duration::from_secs(10)));
+    assert_eq!(server.exited(), Some(0));
+    eprintln!("control evidence: unterminated request released after {waited:?}, never executed");
+}
+
+#[test]
+#[ignore = "starts a detached server and reads every answer at protocol level"]
+fn every_answer_is_framed_before_the_server_closes_the_connection() {
+    let scratch = Scratch::new("frame");
+    let name = control_name("frame");
+    let address = reserve_address();
+    let config = scratch.file("server.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\n\
+             handler = \"not_found\"\n"
+        ),
+    )
+    .unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+
+    // An answer must be complete and framed while the connection is still
+    // open. A client that had to wait for the server to close would be held
+    // for the exchange deadline on every command, and bytes a client has not
+    // read when the server closes can be discarded by Windows.
+    for request in ["ping\n", "status\n", "nonsense\n"] {
+        let started = Instant::now();
+        let answer = raw_exchange(&name, request);
+        let waited = started.elapsed();
+        assert!(
+            answer.ends_with("\n\n"),
+            "{request:?} was answered without its frame: {answer:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "{request:?} was only framed by a deadline after {waited:?}"
+        );
+    }
+
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "{stopped}");
+    assert!(wait_for_exit(server.id(), Duration::from_secs(10)));
+    assert_eq!(server.exited(), Some(0));
+    eprintln!("control evidence: every answer framed with a blank line before close");
 }
 
 async fn served_leaf(connector: &TlsConnector, address: SocketAddr) -> CertificateDer<'static> {

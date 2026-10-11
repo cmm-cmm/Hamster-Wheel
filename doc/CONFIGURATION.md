@@ -220,6 +220,12 @@ set at creation and protected: LocalSystem and the pipe's owner, which is the
 account the server runs as, have full access and nobody else has any; remote
 clients are rejected. Anyone who can open it can stop the server.
 
+There is no concurrency key: the endpoint handles four exchanges at once, and a
+connection beyond that is answered `ERR busy` and released, which the client
+retries inside its own five-second budget. These commands are administrative
+and rare, so the ceiling bounds what a client with pipe access can queue
+without crowding out the one command an operator typed.
+
 The same binary is the client, and needs the same configuration file because
 that file names the endpoint:
 `hamster-wheel --config hamster.toml --control status|ping|stop|reload-certificates`.

@@ -33,33 +33,6 @@
 //! The endpoint is off unless `[server.control]` names it. It is a control
 //! surface, so it exists only when an operator asks for one.
 
-use std::{
-    fmt::Write as _,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-use crate::config::RuntimeConfig;
-
-/// Deadline for one control exchange, from connect to the written response.
-///
-/// A client that connects and sends nothing must not hold a pipe instance, and
-/// must never delay shutdown.
-pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Longest request line accepted, including its newline.
-const MAX_REQUEST_BYTES: usize = 256;
-
-/// Control connections handled at once.
-///
-/// The commands are administrative and rare. A small ceiling bounds the work a
-/// client with pipe access can queue without rejecting the one request an
-/// operator actually makes.
-const MAX_CONCURRENT_EXCHANGES: usize = 4;
-
-/// Security descriptor for the control pipe: LocalSystem and the owner only.
-const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Ping,
@@ -117,187 +90,279 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The full pipe path for a configured name.
-pub fn pipe_path(name: &str) -> String {
-    format!(r"\\.\pipe\hamster-wheel-control-{name}")
-}
+/// The command semantics and their wire form.
+///
+/// This is the server half of the exchange, so it exists only where the
+/// transport does. A target without the named pipe still needs `Command` and
+/// `validate_name` above, because configuration and argument parsing use them
+/// on every platform.
+#[cfg(windows)]
+mod protocol {
+    use std::{
+        fmt::Write as _,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
-/// What a command produced, ready to be written to a client.
-pub(crate) struct Response {
-    pub(crate) body: String,
-    pub(crate) stop_requested: bool,
-}
+    use super::Command;
+    use crate::config::RuntimeConfig;
 
-impl Response {
-    fn ok(details: String) -> Self {
-        Self {
-            body: format!("OK\n{details}\n"),
-            stop_requested: false,
+    /// Deadline for one control exchange, from connect to the written response.
+    ///
+    /// A client that connects and sends nothing must not hold a pipe instance, and
+    /// must never delay shutdown.
+    pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Longest request line accepted, including its newline.
+    pub(crate) const MAX_REQUEST_BYTES: usize = 256;
+
+    /// Control connections handled at once.
+    ///
+    /// The commands are administrative and rare. A small ceiling bounds the work a
+    /// client with pipe access can queue without rejecting the one request an
+    /// operator actually makes.
+    pub(crate) const MAX_CONCURRENT_EXCHANGES: usize = 4;
+    /// Refusals wait briefly for the peer to read their answer. Bound those
+    /// waits separately so sustained overload cannot accumulate one task and
+    /// pipe handle per client for the full exchange deadline.
+    pub(crate) const MAX_CONCURRENT_REFUSALS: usize = 8;
+
+    /// Security descriptor for the control pipe: LocalSystem and the owner only.
+    pub(crate) const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
+
+    pub fn pipe_path(name: &str) -> String {
+        format!(r"\\.\pipe\hamster-wheel-control-{name}")
+    }
+
+    /// What a command produced, ready to be written to a client.
+    pub(crate) struct Response {
+        pub(crate) body: String,
+        pub(crate) stop_requested: bool,
+    }
+
+    impl Response {
+        fn ok(details: String) -> Self {
+            // Every answer ends with a blank line, which is the frame a client
+            // stops reading at. Detail blocks are built both with and without a
+            // trailing newline, so the terminator is normalised here rather
+            // than trusted from each caller.
+            let mut body = format!("OK\n{}", details.trim_end_matches('\n'));
+            body.push_str("\n\n");
+            Self {
+                body,
+                stop_requested: false,
+            }
+        }
+
+        fn error(code: &str, message: &str) -> Self {
+            Self {
+                body: format!("ERR {code}\nmessage={}\n\n", single_line(message)),
+                stop_requested: false,
+            }
+        }
+
+        pub(crate) fn unknown_command() -> Self {
+            let names = Command::ALL
+                .iter()
+                .map(|command| command.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Self::error("unknown_command", &format!("known commands: {names}"))
+        }
+
+        pub(crate) fn request_too_long() -> Self {
+            Self::error(
+                "request_too_long",
+                &format!("a request line may be at most {MAX_REQUEST_BYTES} bytes"),
+            )
         }
     }
 
-    fn error(code: &str, message: &str) -> Self {
-        Self {
-            body: format!("ERR {code}\nmessage={}\n\n", single_line(message)),
-            stop_requested: false,
+    /// Detail values are single-line by construction, so a value can never be read
+    /// as another key or as the end of the response.
+    fn single_line(value: &str) -> String {
+        value.replace(['\r', '\n'], " ")
+    }
+
+    /// Runs one command against the live server.
+    pub(crate) async fn execute(
+        command: Command,
+        config: &Arc<RuntimeConfig>,
+        started: Instant,
+    ) -> Response {
+        match command {
+            Command::Ping => Response::ok(format!("pid={}", std::process::id())),
+            Command::Status => Response::ok(status_details(config, started)),
+            Command::Stop => Response {
+                // Answered before the shutdown is triggered, so the client learns
+                // the request was accepted even though the pipe is about to close.
+                body: format!("OK\npid={}\nstopping=true\n\n", std::process::id()),
+                stop_requested: true,
+            },
+            Command::ReloadCertificates => reload_certificates(config).await,
         }
     }
 
-    pub(crate) fn unknown_command() -> Self {
-        let names = Command::ALL
-            .iter()
-            .map(|command| command.name())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Self::error("unknown_command", &format!("known commands: {names}"))
-    }
-
-    pub(crate) fn request_too_long() -> Self {
-        Self::error(
-            "request_too_long",
-            &format!("a request line may be at most {MAX_REQUEST_BYTES} bytes"),
-        )
-    }
-}
-
-/// Detail values are single-line by construction, so a value can never be read
-/// as another key or as the end of the response.
-fn single_line(value: &str) -> String {
-    value.replace(['\r', '\n'], " ")
-}
-
-/// Runs one command against the live server.
-pub(crate) async fn execute(
-    command: Command,
-    config: &Arc<RuntimeConfig>,
-    started: Instant,
-) -> Response {
-    match command {
-        Command::Ping => Response::ok(format!("pid={}", std::process::id())),
-        Command::Status => Response::ok(status_details(config, started)),
-        Command::Stop => Response {
-            // Answered before the shutdown is triggered, so the client learns
-            // the request was accepted even though the pipe is about to close.
-            body: format!("OK\npid={}\nstopping=true\n\n", std::process::id()),
-            stop_requested: true,
-        },
-        Command::ReloadCertificates => reload_certificates(config).await,
-    }
-}
-
-fn status_details(config: &Arc<RuntimeConfig>, started: Instant) -> String {
-    let mut details = String::new();
-    let _ = writeln!(details, "pid={}", std::process::id());
-    let _ = writeln!(
-        details,
-        "uptime_seconds={:.3}",
-        started.elapsed().as_secs_f64()
-    );
-    if let Some(address) = config.listen_address() {
-        let _ = writeln!(details, "listener=http://{address}");
-    }
-    if let Some(tls) = config.tls() {
-        let _ = writeln!(details, "listener=https://{}", tls.address());
-        let certificates = tls.certificates();
-        let _ = writeln!(details, "certificates={}", certificates.len());
-        for certificate in certificates.iter() {
+    fn status_details(config: &Arc<RuntimeConfig>, started: Instant) -> String {
+        let mut details = String::new();
+        let _ = writeln!(details, "pid={}", std::process::id());
+        let _ = writeln!(
+            details,
+            "uptime_seconds={:.3}",
+            started.elapsed().as_secs_f64()
+        );
+        if let Some(address) = config.listen_address() {
+            let _ = writeln!(details, "listener=http://{address}");
+        }
+        if let Some(tls) = config.tls() {
+            let _ = writeln!(details, "listener=https://{}", tls.address());
+            let certificates = tls.certificates();
+            let _ = writeln!(details, "certificates={}", certificates.len());
+            for certificate in certificates.iter() {
+                let _ = writeln!(
+                    details,
+                    "certificate={} names={} not_after={} days_left={}",
+                    single_line(&certificate.field),
+                    single_line(&certificate.names),
+                    single_line(&certificate.not_after),
+                    certificate.days_left
+                );
+            }
             let _ = writeln!(
                 details,
-                "certificate={} names={} not_after={} days_left={}",
-                single_line(&certificate.field),
-                single_line(&certificate.names),
-                single_line(&certificate.not_after),
-                certificate.days_left
+                "handshakes_timed_out={}",
+                tls.handshakes_timed_out()
             );
         }
         let _ = writeln!(
             details,
-            "handshakes_timed_out={}",
-            tls.handshakes_timed_out()
+            "max_connections={}",
+            config.http_limits().max_connections()
         );
+        for pool in config.php_workers() {
+            let snapshot = pool.snapshot();
+            let _ = writeln!(
+                details,
+                "php_pool={} target={} live={} ready={}",
+                single_line(pool.label()),
+                snapshot.target_workers,
+                snapshot.live_workers,
+                snapshot.ready_workers
+            );
+        }
+        for upstream in config.upstreams() {
+            let _ = writeln!(
+                details,
+                "proxy_upstream={} address={}",
+                single_line(upstream.label()),
+                upstream.address()
+            );
+        }
+        for backend in config.fastcgi_backends() {
+            let servers = backend
+                .servers()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(
+                details,
+                "fastcgi={} servers={servers}",
+                single_line(backend.label())
+            );
+        }
+        details.pop();
+        details
     }
-    let _ = writeln!(
-        details,
-        "max_connections={}",
-        config.http_limits().max_connections()
-    );
-    for pool in config.php_workers() {
-        let snapshot = pool.snapshot();
-        let _ = writeln!(
-            details,
-            "php_pool={} target={} live={} ready={}",
-            single_line(pool.label()),
-            snapshot.target_workers,
-            snapshot.live_workers,
-            snapshot.ready_workers
-        );
-    }
-    for upstream in config.upstreams() {
-        let _ = writeln!(
-            details,
-            "proxy_upstream={} address={}",
-            single_line(upstream.label()),
-            upstream.address()
-        );
-    }
-    for backend in config.fastcgi_backends() {
-        let servers = backend
-            .servers()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let _ = writeln!(
-            details,
-            "fastcgi={} servers={servers}",
-            single_line(backend.label())
-        );
-    }
-    details.pop();
-    details
-}
 
-async fn reload_certificates(config: &Arc<RuntimeConfig>) -> Response {
-    let Some(tls) = config.tls() else {
-        return Response::error(
-            "no_tls_listener",
-            "this server has no [server.tls] listener to reload",
-        );
-    };
-    // The whole replacement set is loaded and verified before one atomic swap;
-    // a failure leaves the previously loaded set serving. This endpoint reports
-    // that outcome, it does not implement it.
-    match tls.reload_certificates().await {
-        Ok(reports) => {
-            let mut details = format!("certificates={}\n", reports.len());
-            for report in reports.iter() {
-                let _ = writeln!(
-                    details,
-                    "certificate={} names={} not_after={} days_left={}",
-                    single_line(&report.field),
-                    single_line(&report.names),
-                    single_line(&report.not_after),
-                    report.days_left
-                );
-                if let Some(note) = report.note {
+    async fn reload_certificates(config: &Arc<RuntimeConfig>) -> Response {
+        let Some(tls) = config.tls() else {
+            return Response::error(
+                "no_tls_listener",
+                "this server has no [server.tls] listener to reload",
+            );
+        };
+        // The whole replacement set is loaded and verified before one atomic swap;
+        // a failure leaves the previously loaded set serving. This endpoint reports
+        // that outcome, it does not implement it.
+        match tls.reload_certificates().await {
+            Ok(reports) => {
+                let mut details = format!("certificates={}\n", reports.len());
+                for report in reports.iter() {
                     let _ = writeln!(
                         details,
-                        "note={} {}",
+                        "certificate={} names={} not_after={} days_left={}",
                         single_line(&report.field),
-                        single_line(note)
+                        single_line(&report.names),
+                        single_line(&report.not_after),
+                        report.days_left
                     );
+                    if let Some(note) = report.note {
+                        let _ = writeln!(
+                            details,
+                            "note={} {}",
+                            single_line(&report.field),
+                            single_line(note)
+                        );
+                    }
                 }
+                details.pop();
+                Response::ok(details)
             }
-            details.pop();
-            Response::ok(details)
+            Err(error) => Response {
+                body: format!(
+                    "ERR reload_failed\nmessage={}\nactive_set=previous\n\n",
+                    single_line(&error)
+                ),
+                stop_requested: false,
+            },
         }
-        Err(error) => Response {
-            body: format!(
-                "ERR reload_failed\nmessage={}\nactive_set=previous\n\n",
-                single_line(&error)
-            ),
-            stop_requested: false,
-        },
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pipe_path_is_local_and_namespaced() {
+            assert_eq!(
+                pipe_path("default"),
+                r"\\.\pipe\hamster-wheel-control-default"
+            );
+        }
+
+        #[test]
+        fn responses_end_with_a_blank_line_and_never_leak_a_newline_into_a_value() {
+            let response = Response::error("reload_failed", "line one\nline two\rline three");
+            assert!(response.body.starts_with("ERR reload_failed\n"));
+            assert!(response.body.ends_with("\n\n"));
+            assert_eq!(response.body.matches('\n').count(), 3);
+            assert!(response.body.contains("line one line two line three"));
+            assert!(!response.stop_requested);
+        }
+
+        #[test]
+        fn an_ok_answer_is_framed_whether_or_not_its_details_end_with_a_newline() {
+            // A client stops reading at the blank line, so an answer without
+            // one leaves it waiting for the server to close while the server
+            // waits for the client: both would only be freed by a deadline.
+            for details in ["pid=1", "pid=1\nlistener=http://127.0.0.1:1\n"] {
+                let response = Response::ok(details.to_owned());
+                assert!(response.body.starts_with("OK\n"), "{details:?}");
+                assert!(response.body.ends_with("\n\n"), "{details:?}");
+                assert!(!response.body.ends_with("\n\n\n"), "{details:?}");
+                assert!(!response.stop_requested);
+            }
+        }
+
+        #[test]
+        fn unknown_command_names_the_commands_that_exist() {
+            let response = Response::unknown_command();
+            assert!(response.body.starts_with("ERR unknown_command\n"));
+            for command in Command::ALL {
+                assert!(response.body.contains(command.name()), "{}", command.name());
+            }
+        }
     }
 }
 
@@ -312,19 +377,22 @@ mod windows {
         os::windows::ffi::OsStrExt,
         ptr,
         sync::Arc,
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
         sync::{Semaphore, mpsc},
-        time::timeout,
+        time::{timeout, timeout_at},
     };
 
     use super::{
-        Command, EXCHANGE_TIMEOUT, MAX_CONCURRENT_EXCHANGES, MAX_REQUEST_BYTES, PIPE_SDDL,
-        Response, execute, pipe_path,
+        Command,
+        protocol::{
+            EXCHANGE_TIMEOUT, MAX_CONCURRENT_EXCHANGES, MAX_CONCURRENT_REFUSALS, MAX_REQUEST_BYTES,
+            PIPE_SDDL, Response, execute, pipe_path,
+        },
     };
     use crate::config::RuntimeConfig;
 
@@ -432,11 +500,34 @@ mod windows {
             stop_tx: mpsc::Sender<()>,
         ) {
             let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EXCHANGES));
+            let refusal_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REFUSALS));
+            let mut renewal_reported = false;
             loop {
+                // The waiting instance is created here rather than right after
+                // an accept, so a creation that cannot succeed yet is retried
+                // instead of ending the endpoint for the rest of this process.
+                // Windows refuses it while every instance is occupied, which a
+                // burst of control connections reaches legitimately.
+                if self.server.is_none() {
+                    match create_instance(&self.path, &self.descriptor, false) {
+                        Ok(next) => {
+                            self.server = Some(next);
+                            renewal_reported = false;
+                        }
+                        Err(error) => {
+                            if !renewal_reported {
+                                errln!("control endpoint cannot accept for now: {error}");
+                                renewal_reported = true;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    }
+                }
                 let waiting = self
                     .server
                     .as_mut()
-                    .expect("a control instance is always waiting between accepts");
+                    .expect("an instance was just ensured above");
                 if let Err(error) = waiting.connect().await {
                     errln!("control endpoint accept failed: {error}");
                     return;
@@ -445,29 +536,30 @@ mod windows {
                     .server
                     .take()
                     .expect("the waiting instance is the connected one");
-                match create_instance(&self.path, &self.descriptor, false) {
-                    Ok(next) => self.server = Some(next),
-                    Err(error) => {
-                        // Without a further instance no client can connect
-                        // again. Answer this one, then stop accepting rather
-                        // than spin on the same failure.
-                        errln!("control endpoint cannot be renewed: {error}");
-                        handle(connected, &config, started, &stop_tx).await;
-                        return;
-                    }
+                // Restore the waiting instance before doing anything with the
+                // connection, so a client that arrives during the handoff is
+                // not refused by Windows with a bare `ERROR_PIPE_BUSY`. A
+                // failure here is not fatal: the top of the loop retries.
+                if let Ok(next) = create_instance(&self.path, &self.descriptor, false) {
+                    self.server = Some(next);
+                    renewal_reported = false;
                 }
                 let permit = match Arc::clone(&limit).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
                         // Over the ceiling: refuse this one instead of queueing
-                        // work a client could keep adding to.
-                        let mut connected = connected;
-                        let _ = timeout(
-                            EXCHANGE_TIMEOUT,
-                            connected
-                                .write_all(b"ERR busy\nmessage=too many control connections\n\n"),
-                        )
-                        .await;
+                        // work a client could keep adding to. The refusal is
+                        // written off the accept loop, because a client that
+                        // never reads it would otherwise hold every later
+                        // connection behind its own write deadline. Once the
+                        // refusal budget is full, close immediately: a bare
+                        // pipe error is preferable to unbounded server tasks.
+                        if let Ok(permit) = Arc::clone(&refusal_limit).try_acquire_owned() {
+                            tokio::spawn(async move {
+                                refuse(connected).await;
+                                drop(permit);
+                            });
+                        }
                         continue;
                     }
                 };
@@ -495,7 +587,10 @@ mod windows {
         options
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .max_instances(MAX_CONCURRENT_EXCHANGES + 1);
+            // Exchange and refusal semaphores bound live tasks/handles. Keep
+            // the OS instance ceiling above both so a short burst can receive
+            // an explicit refusal before the fallback pipe error.
+            .max_instances(254);
         // SAFETY: the attributes and the descriptor they point at outlive this
         // call, and the descriptor is owned by the listener for as long as any
         // instance is created from it.
@@ -503,6 +598,78 @@ mod windows {
             options
                 .create_with_security_attributes_raw(path, (&raw mut attributes).cast::<c_void>())
         }
+    }
+
+    /// Answers one over-the-ceiling connection and releases its instance.
+    ///
+    /// The refusal is flushed and the pipe is shut down before the handle is
+    /// dropped: closing a named pipe with unread bytes in it can discard them,
+    /// which would leave the client at end of stream with nothing to report.
+    async fn refuse(mut pipe: NamedPipeServer) {
+        const REFUSAL: &[u8] = b"ERR busy\nmessage=too many control connections\n\n";
+        if timeout(EXCHANGE_TIMEOUT, pipe.write_all(REFUSAL))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = pipe.flush().await;
+        await_peer_close(pipe).await;
+    }
+
+    /// Reads one answer and stops at its terminating blank line.
+    ///
+    /// A client that read to end of stream would wait for the server to close
+    /// while the server waits for the client to close, so each side would only
+    /// be released by its deadline. The blank line that ends every answer is
+    /// the frame, so the client can stop reading and close first.
+    async fn read_framed(
+        pipe: &mut tokio::net::windows::named_pipe::NamedPipeClient,
+    ) -> io::Result<String> {
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 512];
+        loop {
+            let read = pipe.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "control endpoint closed before a complete answer",
+                ));
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if response.ends_with(
+                b"
+
+",
+            ) {
+                break;
+            }
+            if response.len() >= MAX_RESPONSE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control answer exceeded its size limit",
+                ));
+            }
+        }
+        String::from_utf8(response).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the control endpoint answered with invalid UTF-8",
+            )
+        })
+    }
+
+    /// Waits for the client to close before this end does.
+    ///
+    /// Windows can discard bytes a client has not read yet when the server
+    /// handle closes first, which would turn an answered request into a bare
+    /// end of stream. A client reads the whole answer and then closes, so its
+    /// end of stream is the proof that the answer arrived. The wait is bounded
+    /// because a client that never closes must not hold a pipe instance.
+    async fn await_peer_close(mut pipe: NamedPipeServer) {
+        let mut sink = [0_u8; 1];
+        let _ = timeout(EXCHANGE_TIMEOUT, pipe.read(&mut sink)).await;
     }
 
     async fn handle(
@@ -552,28 +719,56 @@ mod windows {
             return;
         }
         let _ = pipe.flush().await;
-        // The response is on the wire before shutdown begins, so a `stop`
-        // client always sees its acknowledgement.
-        let _ = pipe.shutdown().await;
+        // The answer has been read by the client before shutdown begins, so a
+        // `stop` client always sees its acknowledgement.
+        await_peer_close(pipe).await;
         if stop_requested {
             let _ = stop_tx.send(()).await;
         }
     }
 
     /// Sends one command to a running server and returns its raw response.
+    ///
+    /// Every pipe instance can be occupied while other control connections are
+    /// in flight, and Windows then refuses the open with `ERROR_PIPE_BUSY`
+    /// rather than queueing it. An operator asked for one command, so this
+    /// waits for an instance within the same deadline the server answers in
+    /// instead of reporting a raw OS error.
     pub async fn request(name: &str, command: Command) -> io::Result<String> {
+        const ERROR_PIPE_BUSY: i32 = 231;
         let path = pipe_path(name);
-        let mut pipe = ClientOptions::new().open(&path)?;
-        timeout(EXCHANGE_TIMEOUT, async {
-            pipe.write_all(format!("{}\n", command.name()).as_bytes())
-                .await?;
-            pipe.flush().await?;
-            let mut response = String::new();
-            pipe.read_to_string(&mut response).await?;
-            Ok::<_, io::Error>(response)
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control request timed out"))?
+        let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+        loop {
+            let mut pipe = loop {
+                match ClientOptions::new().open(&path) {
+                    Ok(pipe) => break pipe,
+                    Err(error)
+                        if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let response = timeout_at(deadline, async {
+                pipe.write_all(format!("{}\n", command.name()).as_bytes())
+                    .await?;
+                pipe.flush().await?;
+                let response = read_framed(&mut pipe).await?;
+                Ok::<_, io::Error>(response)
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control request timed out"))??;
+            // A refusal means other control connections hold every slot, not
+            // that the command was wrong. Retrying inside the same budget is
+            // what makes a burst of connections survivable for the operator.
+            if response.starts_with("ERR busy") && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return Ok(response);
+        }
     }
 }
 
@@ -603,33 +798,6 @@ mod tests {
         }
         for name in ["default", "edge-1", "edge_1", "edge.1", &"x".repeat(64)] {
             assert!(validate_name(name).is_ok(), "{name}");
-        }
-    }
-
-    #[test]
-    fn pipe_path_is_local_and_namespaced() {
-        assert_eq!(
-            pipe_path("default"),
-            r"\\.\pipe\hamster-wheel-control-default"
-        );
-    }
-
-    #[test]
-    fn responses_end_with_a_blank_line_and_never_leak_a_newline_into_a_value() {
-        let response = Response::error("reload_failed", "line one\nline two\rline three");
-        assert!(response.body.starts_with("ERR reload_failed\n"));
-        assert!(response.body.ends_with("\n\n"));
-        assert_eq!(response.body.matches('\n').count(), 3);
-        assert!(response.body.contains("line one line two line three"));
-        assert!(!response.stop_requested);
-    }
-
-    #[test]
-    fn unknown_command_names_the_commands_that_exist() {
-        let response = Response::unknown_command();
-        assert!(response.body.starts_with("ERR unknown_command\n"));
-        for command in Command::ALL {
-            assert!(response.body.contains(command.name()), "{}", command.name());
         }
     }
 }

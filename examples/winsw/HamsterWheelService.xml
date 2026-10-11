@@ -1,0 +1,22 @@
+<!-- Example only: do not install without an isolated Service rehearsal. -->
+<service>
+  <id>HamsterWheel</id>
+  <name>Hamster Wheel</name>
+  <description>Hamster Wheel web/application server</description>
+  <startmode>Manual</startmode>
+  <serviceaccount>
+    <domain>NT AUTHORITY</domain>
+    <user>LocalService</user>
+  </serviceaccount>
+  <executable>%BASE%\hamster-wheel.exe</executable>
+  <startarguments>--config "%BASE%\hamster.toml"</startarguments>
+  <stopexecutable>%BASE%\hamster-wheel.exe</stopexecutable>
+  <stoparguments>--config "%BASE%\hamster.toml" --control stop</stoparguments>
+  <stoptimeout>120 sec</stoptimeout>
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+  <onfailure action="restart" delay="10 sec" />
+</service>

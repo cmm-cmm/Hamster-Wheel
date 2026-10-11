@@ -85,13 +85,32 @@ hamster-wheel.exe --config C:\hamster\hamster.toml --control stop
 |---|---|
 | `ping` | Liveness and the server's PID, with no other work |
 | `status` | PID, uptime, listeners, certificate expiry, pool readiness, upstreams, FastCGI endpoints and the connection ceiling |
-| `stop` | The same graceful drain as Ctrl+C: connections drain, workers are asked to stop and reaped, then the process exits 0 |
+| `stop` | Starts the same graceful drain as Ctrl+C; `OK stopping=true` acknowledges the command, **not** process exit. Wait for Hamster's process handle to signal before reporting shutdown complete. |
 | `reload-certificates` | The same transactional reload as Ctrl+Break |
 
 The exit code is 0 for `OK` and 1 for `ERR`, and the server's own answer is
 printed verbatim. A refused reload answers `ERR reload_failed` with
 `active_set=previous`: the previously loaded set is still serving, so a renewal
 that produced a mismatched pair does not interrupt TLS.
+
+Every answer ends with a blank line, which is its frame: a client reads up to
+that line and closes first. This is not cosmetic. If an answer were not framed,
+a client could only know it was complete when the server closed, while the
+server waits for the client to close, so both ends would be released only by
+their deadlines; and bytes a client has not read when the server closes first
+can be discarded by Windows. The frame is what makes an answer prompt and
+reliable rather than timing-dependent.
+
+The endpoint handles four exchanges at once and at most eight simultaneous
+`ERR busy` refusals. Refusals run off the accept loop, but each can wait up to
+five seconds for its peer to close. Once those eight slots fill, further
+connections are closed immediately and may see a pipe error or incomplete
+answer; they must never be reported as successful commands. The shipped client
+retries `ERROR_PIPE_BUSY` and framed `ERR busy` within one five-second deadline,
+but sustained overload can still make an operator command fail. Retry it after
+the overload subsides; do not interpret `ERR busy` as a stop acknowledgement.
+The high pipe-instance ceiling is not a task/handle budget. Silent or partial
+requests are released at the five-second exchange deadline without execution.
 
 Access is controlled by the pipe's DACL, set when the pipe is created and
 protected from inheritance: `D:P(A;;GA;;;SY)(A;;GA;;;OW)` grants LocalSystem
@@ -104,6 +123,60 @@ Only the control client reads the configuration file to learn the endpoint
 name; it never compiles the configuration, so a certificate that no longer
 loads from disk still leaves `reload-certificates` usable, which is exactly
 when it is needed.
+
+### WinSW candidate (not Service-qualified)
+
+[`examples/winsw/HamsterWheelService.xml`](../examples/winsw/HamsterWheelService.xml)
+is a reviewable WinSW configuration, **not** an installed Service. Place a
+WinSW v2.11.0 executable named `HamsterWheelService.exe` beside a copy
+of that XML with the same base name, the release `hamster-wheel.exe`, and a
+deployment `hamster.toml`. The example selects the low-privilege built-in
+`LocalService` account; create a writable `logs` directory and grant that
+account only the access it needs to the executable, configuration, application
+files, TLS keys and logs. Do not put an account password in the XML. Set a
+unique control endpoint name in `hamster.toml`; restrict config access because
+its reader can discover the endpoint and the pipe owner can issue `stop`.
+The current pipe DACL allows only its owner account and LocalSystem: an
+ordinary administrator/operator in a different account cannot directly run
+`--control reload-certificates`. A Service deployment needs a reviewed
+same-account control procedure or a separately approved ACL policy; do not
+silently broaden pipe access.
+
+WinSW v2.11.0's [XML contract](https://github.com/winsw/winsw/blob/v2.11.0/doc/xmlConfigFile.md)
+says `<stoparguments>` launches the stop command and waits for **both** it
+and the main process to exit before reporting the Service stopped. The sample
+uses `--control stop`, not a console event. `OK stopping=true` means Hamster
+accepted the command; it does not mean its connections drained or its process
+exited. The 120-second `<stoptimeout>` is a sample upper bound, not a verified
+universal value: choose it above the deployment's longest legitimate request
+and worker drain, then verify with an in-flight request. Only after that
+deadline may WinSW's forced termination act as a last resort. A failed stop
+client or an overloaded pipe is **not** proof that Hamster stopped; inspect
+the wrapper log and the exact Hamster PID. The sample's `onfailure` restart
+policy applies to crashes, not operator-managed `php-cgi` endpoints, which
+need separate supervision. Its stdout/stderr files use WinSW's
+[size-based rolling mode](https://github.com/winsw/winsw/blob/v2.11.0/doc/loggingAndErrorReporting.md)
+at 10 MiB with eight retained files; still monitor wrapper/Event Log errors.
+
+For a manual VM rehearsal, capture a process handle for the PID reported by
+`--control status` *before* issuing stop, then wait on that same process
+object. Do not infer exit from the control client's exit code alone:
+
+```powershell
+$hamsterPid = 12345 # replace with pid= from --control status
+$main = Get-Process -Id $hamsterPid
+& .\hamster-wheel.exe --config .\hamster.toml --control stop
+if (-not $main.WaitForExit(120000)) { throw 'Hamster did not exit gracefully' }
+```
+
+Before use, rehearse in an isolated Windows VM with a pinned WinSW version:
+start and confirm HTTP readiness and log capture; stop during a bounded
+in-flight request and require normal Hamster exit, worker ACK/reap and Service
+STOPPED only afterwards; terminate the exact Hamster PID and check restart;
+verify ordinary PHP descendants are reclaimed while independently managed
+`php-cgi` follows its own policy; rotate logs and reload a replacement TLS
+certificate through `--control reload-certificates`; verify Service-account
+and operator access separately. No Service was installed on this host.
 
 ## Qualification Boundary
 
@@ -118,11 +191,35 @@ mismatched key is refused with `active_set=previous` while the adopted leaf
 keeps serving; a thread impersonating a token restricted to `Everyone` is
 refused with `ERROR_ACCESS_DENIED` while the owner still has access; a client
 that connects and sends nothing is released by the exchange deadline, is never
-answered, and does not delay a later `stop`; an unknown request is answered
-`ERR unknown_command`; and a second server configured with an endpoint name
-already in use fails at startup with exit code 1 instead of silently sharing
-it. One unignored test checks the opposite case: a server with no
-`[server.control]` section keeps serving.
+answered, and does not delay a later `stop`; a request line that never ends is
+released the same way, is not executed even when its text is `stop`, and the
+endpoint still serves afterwards; four held connections make a fifth read
+`ERR busy`, and once they are released the shipped client recovers and the
+endpoint answers `ping` and `stop` normally; every answer arrives framed with
+its blank line in well under a second, while the connection is still open; an
+unknown request is answered `ERR unknown_command`; and a second server
+configured with an endpoint name already in use fails at startup with exit
+code 1 instead of silently sharing it. One unignored test checks the opposite
+case: a server with no `[server.control]` section keeps serving.
+
+Two defects were found by exactly these rehearsals and fixed here. The
+endpoint's instance ceiling had been set to the concurrency ceiling plus one,
+so at saturation the next instance could not be created and the accept loop
+returned, which killed the control endpoint for the rest of the process life;
+instance creation is now retried and reported once instead of being fatal.
+And `OK` answers were not framed with a blank line, which only worked because
+the client read to end of stream: every command therefore cost a full
+five-second deadline once the server started waiting for the client to close,
+and a refusal could be discarded unread. Both have regression tests.
+
+A later continuous-overload probe found another bound missing: 96 peers that
+kept refusal pipes open raised the exact server PID's handle count from 112
+to 211. Limiting concurrent refusal waits to eight reduced the same probe to
+112 baseline / 126 peak, with 112 after the five-second deadline; a second
+96-client burst remained bounded and `status`/`stop` then succeeded. The
+client now rejects an unframed/empty answer instead of treating a closed pipe
+as a successful command. This is a process-level resource and recovery test,
+not a Service-account or throughput qualification.
 
 ```powershell
 cargo test --target x86_64-pc-windows-msvc --test windows_control
@@ -130,7 +227,15 @@ cargo test --target x86_64-pc-windows-msvc --test windows_control -- --ignored -
 ```
 
 Not verified: behavior under a Windows Service account, cross-account denial
-with a second real user, and anything about Linux.
+with a second real user, and anything about Linux. No isolated Windows VM and
+no second account were available here, and no service or firewall on this
+machine was changed, so a supervisor rehearsal with `--control stop` under a
+real service account remains **NOT VERIFIED**. The non-Windows build of the
+control module is covered only by a substitute: a scratch copy of `src/` with
+the platform `cfg` attributes flipped to the non-Windows configuration passes
+`cargo clippy --lib --bins --all-features -- -D warnings`, which is what
+caught ten dead-code errors a Linux gate would have failed on. That is a
+compile-level check, not Linux operation.
 
 ### Headless process rehearsal (2026-10-04)
 
@@ -161,30 +266,18 @@ cargo test --target x86_64-pc-windows-msvc --test windows_headless -- --nocaptur
 cargo test --target x86_64-pc-windows-msvc --test windows_headless -- --ignored --nocapture
 ```
 
-WinSW is the candidate wrapper for a later isolated Service rehearsal because
-its [configuration reference](https://github.com/winsw/winsw/blob/v3/docs/xml-config-file.md)
-documents process restart on non-zero exit, log capture/rotation, service
-accounts, and a configurable graceful-stop timeout. Do **not** install it from
-this runbook yet. Its `hidewindow=true` uses `CreateNoWindow`, not the tested
-`DETACHED_PROCESS`; actual Service console inheritance is **NOT VERIFIED**.
-A console-free Hamster now has the control endpoint for graceful stop and
-certificate reload, so a wrapper no longer has to deliver a console event for
-either. WinSW's documented fallback after an undeliverable stop signal is
-process termination, not Hamster's connection/worker drain; configure its stop
-command to run `--control stop` instead, and keep its termination as the last
-resort. Whether WinSW with its default console behavior can deliver either
-under a real Service account is still **NOT VERIFIED**, because no Service was
-installed or run here. Operator-managed `php-cgi` requires
-its own separate supervisor policy; Hamster's Job Object must not be presented
-as protecting that endpoint.
+The WinSW sample and stop contract above are documentation-backed, not a
+Service rehearsal. Actual Service console behavior is **NOT VERIFIED**.
+Operator-managed `php-cgi` requires separate supervision; Hamster's Job Object
+does not protect that endpoint.
 
 Before approving a headless Service deployment, verify on an isolated Windows
 VM: Service start/readiness; stop with an in-flight request and normal worker
 ACK/reap; crash recovery with exact PID tracking; external endpoint
-containment/restart; log rotation; and certificate replacement/reload. A
-console-free control path for graceful stop and TLS reload remains a design
-decision, not an implemented feature. Do not work around it by force-killing
-Hamster during routine renewal.
+containment/restart; log rotation; and certificate replacement/reload. The
+console-free control path is implemented; its integration with WinSW under a
+real Service account remains **NOT VERIFIED**. Do not work around a failed
+routine renewal by force-killing Hamster.
 
 The Windows tests cover startup, graceful/abnormal PHP-worker shutdown,
 compatible nested jobs, and operator-managed FastCGI recovery. An actual TCP
