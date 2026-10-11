@@ -84,7 +84,7 @@ hamster-wheel.exe --config C:\hamster\hamster.toml --control stop
 | Command | Effect |
 |---|---|
 | `ping` | Liveness and the server's PID, with no other work |
-| `status` | PID, uptime, listeners, certificate expiry, pool readiness, upstreams, FastCGI endpoints and the connection ceiling |
+| `status` | PID, uptime, lifecycle state, listeners, certificate expiry, pool readiness with exact worker PIDs, upstreams, FastCGI endpoints and the connection ceiling |
 | `stop` | Starts the same graceful drain as Ctrl+C; `OK stopping=true` acknowledges the command, **not** process exit. Wait for Hamster's process handle to signal before reporting shutdown complete. |
 | `reload-certificates` | The same transactional reload as Ctrl+Break |
 
@@ -92,6 +92,27 @@ The exit code is 0 for `OK` and 1 for `ERR`, and the server's own answer is
 printed verbatim. A refused reload answers `ERR reload_failed` with
 `active_set=previous`: the previously loaded set is still serving, so a renewal
 that produced a mismatched pair does not interrupt TLS.
+
+An answer from the endpoint is already evidence about startup. Hamster starts
+its pools and waits for every initial worker to reach READY, then binds every
+listener, and only then creates the control pipe (`src/server.rs`, in that
+order), so a `status` that answers at all means the initial workers reached
+READY and the sockets are bound. It does not mean the pools are healthy *now*;
+that is what the live fields are for.
+
+Read health from `php_pool=<label> target= live= ready= pids=` by comparing
+`live` against `target`. `live` counts workers that exist and reached READY,
+while `ready` counts those that are READY **and idle**, so a fully healthy pool
+serving at full concurrency reports `ready=0`; do not build a degradation check
+on `ready`. `pids=` lists the exact worker PIDs taken from the same snapshot as
+the counts, so a supervisor tracking or reaping the tree Hamster owns never has
+to match process names.
+
+`state=` is `serving` or `draining`. The endpoint keeps answering while
+connections drain, so without it a health poll during a deliberate stop would
+be told the server is still serving, and a supervisor that restarts on an
+unhealthy answer could not tell "stopping on purpose" from "broken". It turns
+`draining` the moment a stop is triggered, before the drain begins.
 
 Every answer ends with a blank line, which is its frame: a client reads up to
 that line and closes first. This is not cosmetic. If an answer were not framed,
@@ -149,7 +170,9 @@ uses `--control stop`, not a console event. `OK stopping=true` means Hamster
 accepted the command; it does not mean its connections drained or its process
 exited. The 120-second `<stoptimeout>` is a sample upper bound, not a verified
 universal value: choose it above the deployment's longest legitimate request
-and worker drain, then verify with an in-flight request. Only after that
+and worker drain, **plus** the control client's own five-second retry budget,
+which it may legitimately spend waiting for a pipe instance or retrying an
+`ERR busy` answer; then verify with an in-flight request. Only after that
 deadline may WinSW's forced termination act as a last resort. A failed stop
 client or an overloaded pipe is **not** proof that Hamster stopped; inspect
 the wrapper log and the exact Hamster PID. The sample's `onfailure` restart
@@ -184,7 +207,8 @@ and operator access separately. No Service was installed on this host.
 
 `tests/windows_control.rs` starts real `DETACHED_PROCESS` servers and drives
 the shipped client against them. Verified: `status` reports the live PID,
-listener and worker readiness; `stop` ends the server with exit code 0 and its
+`state=serving`, the listener, worker readiness and the exact worker PID;
+`stop` ends the server with exit code 0 and its
 PHP worker exits with it, which `TerminateProcess` does not do; a reload adopts
 a replacement leaf that a verified TLS handshake then presents, and a
 mismatched key is refused with `active_set=previous` while the adopted leaf
@@ -211,6 +235,18 @@ And `OK` answers were not framed with a blank line, which only worked because
 the client read to end of stream: every command therefore cost a full
 five-second deadline once the server started waiting for the client to close,
 and a refusal could be discarded unread. Both have regression tests.
+
+Two further rehearsals cover what a supervisor actually polls. With a
+three-second PHP request in flight, a `stop` is acknowledged, `status` then
+reports `state=draining`, the in-flight request still completes with HTTP 200
+and the server exits 0: a health poll cannot mistake a deliberate stop for a
+healthy server, nor for a crash. And with the log reader gone — a detached
+server whose piped stdout is closed under it, which is what a wrapper rotating
+logs does — `status`, two consecutive `reload-certificates` and a graceful
+`stop` all still succeed, the server still exits 0, and nothing reaches
+stderr. That test bites: replacing the control stop's `outln!` with the
+standard `println!` makes the server stop exiting 0, which is the reason the
+`outln!`/`errln!` rule exists.
 
 A later continuous-overload probe found another bound missing: 96 peers that
 kept refusal pipes open raised the exact server PID's handle count from 112

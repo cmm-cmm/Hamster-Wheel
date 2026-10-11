@@ -369,6 +369,12 @@ fn status_and_stop_reach_a_server_with_no_console() {
         status.contains("php_pool=") && status.contains("ready=1"),
         "{status}"
     );
+    // A supervisor polling health must be able to tell a serving server from
+    // one that is deliberately draining.
+    assert!(status.contains("state=serving"), "{status}");
+    // The exact worker PID, so a supervisor never has to match process names
+    // to find or reap the tree Hamster owns.
+    assert!(status.contains(&format!("pids={worker}")), "{status}");
 
     let (ok, stopped) = control(&config, "stop");
     assert!(ok, "stop failed: {stopped}");
@@ -906,6 +912,180 @@ fn a_partial_request_line_is_released_by_the_exchange_deadline() {
     assert!(wait_for_exit(server_pid, Duration::from_secs(10)));
     assert_eq!(server.exited(), Some(0));
     eprintln!("control evidence: unterminated request released after {waited:?}, never executed");
+}
+
+/// Starts a detached server whose stdout is a pipe this test can close.
+///
+/// A Service wrapper owns and rotates these streams, so a write that fails
+/// once the reader is gone is an ordinary operating condition, not an error
+/// the server may die of.
+fn spawn_with_closable_stdout(config: &Path, stderr: &Path) -> (OwnedChild, PathBuf) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hamster-wheel"))
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(File::create(stderr).unwrap())
+        .creation_flags(DETACHED_PROCESS)
+        .spawn()
+        .unwrap();
+    let mut reader = child.stdout.take().expect("stdout was piped");
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut byte = [0_u8; 1];
+    while !seen.contains("listening on") {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the listener: {seen:?}"
+        );
+        match reader.read(&mut byte) {
+            Ok(0) => panic!("the server closed stdout before listening: {seen:?}"),
+            Ok(_) => seen.push(byte[0] as char),
+            Err(error) => panic!("cannot read the server stdout: {error}"),
+        }
+    }
+    // The reader is the wrapper's end of the log. Dropping it is what makes
+    // every later `outln!` write fail.
+    drop(reader);
+    (OwnedChild(child), PathBuf::from(config))
+}
+
+#[test]
+#[ignore = "starts a detached TLS server and closes its stdout under it"]
+fn the_control_path_still_works_once_the_log_reader_is_gone() {
+    let scratch = Scratch::new("logless");
+    let name = control_name("logless");
+    let mut authority = CertificateParams::new(Vec::<String>::new()).unwrap();
+    authority.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let issuer = CertifiedIssuer::self_signed(authority, KeyPair::generate().unwrap()).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec!["localhost".to_owned()])
+        .unwrap()
+        .signed_by(&leaf_key, &issuer)
+        .unwrap();
+    let certificate = scratch.file("leaf.pem");
+    let key = scratch.file("leaf.key");
+    fs::write(&certificate, format!("{}{}", leaf.pem(), issuer.pem())).unwrap();
+    fs::write(&key, leaf_key.serialize_pem()).unwrap();
+    let address = reserve_address();
+    let config = scratch.file("tls.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server.tls]\nlisten = \"{address}\"\n\n[[server.tls.certificates]]\n\
+             cert = {}\nkey = {}\nnames = [\"localhost\"]\ndefault = true\n\n\
+             [server.control]\nname = \"{name}\"\n\n[[hosts]]\nname = \"localhost\"\n\
+             locations = [{{ path = \"/\", handler = \"not_found\" }}]\n",
+            quoted(&certificate),
+            quoted(&key)
+        ),
+    )
+    .unwrap();
+    let errors = scratch.file("server.stderr");
+    let (mut server, config) = spawn_with_closable_stdout(&config, &errors);
+    let server_pid = server.id();
+
+    // Every answer below is produced while the server cannot write a single
+    // line of its own output anywhere.
+    let (ok, status) = control(&config, "status");
+    assert!(ok, "status failed with stdout closed: {status}");
+    assert!(status.contains("state=serving"), "{status}");
+    // A reload reports several lines on stdout. Twice, because a reload task
+    // killed by the first failed write would only show on the second.
+    for attempt in 1..=2 {
+        let (ok, reloaded) = control(&config, "reload-certificates");
+        assert!(ok, "reload {attempt} failed with stdout closed: {reloaded}");
+        assert!(reloaded.contains("certificates=1"), "{reloaded}");
+        assert_eq!(
+            server.exited(),
+            None,
+            "the server exited during reload {attempt} with stdout closed"
+        );
+    }
+
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "stop failed with stdout closed: {stopped}");
+    assert!(
+        wait_for_exit(server_pid, Duration::from_secs(10)),
+        "server did not exit after a control stop with stdout closed"
+    );
+    assert_eq!(server.exited(), Some(0));
+    assert_eq!(
+        fs::read_to_string(&errors).unwrap(),
+        "",
+        "a closed log reader is not an error condition"
+    );
+    eprintln!("control evidence: status, two reloads and a graceful stop with no writable stdout");
+}
+
+/// Sends one request and leaves the response unread until the caller joins.
+fn request_in_flight(address: SocketAddr, target: &str) -> thread::JoinHandle<String> {
+    let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    })
+}
+
+#[test]
+#[ignore = "starts a detached server and stops it with a request in flight; requires php/8.5/php.exe"]
+fn status_reports_draining_while_a_stop_finishes_an_in_flight_request() {
+    let scratch = Scratch::new("drain");
+    let name = control_name("drain");
+    let address = reserve_address();
+    let config = scratch.file("server.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\n\
+             handler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\n\
+             workers = 1\nrequest_timeout = 30\n",
+            quoted(&php_executable()),
+            quoted(&worker_script())
+        ),
+    )
+    .unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+    let server_pid = server.id();
+
+    // The drain cannot finish before this request does, which is what makes
+    // the draining state observable rather than a race.
+    let in_flight = request_in_flight(address, "/delay?ms=3000");
+    thread::sleep(Duration::from_millis(400));
+
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "stop failed: {stopped}");
+    let (ok, status) = control(&config, "status");
+    assert!(
+        ok,
+        "the endpoint stopped answering during the drain: {status}"
+    );
+    assert!(
+        status.contains("state=draining"),
+        "a draining server reported itself as serving: {status}"
+    );
+
+    // The request that held the drain open was still answered in full.
+    let answer = in_flight.join().unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer:?}");
+    assert!(answer.contains("delayed"), "{answer:?}");
+    assert!(
+        wait_for_exit(server_pid, Duration::from_secs(15)),
+        "server did not exit after the drain"
+    );
+    assert_eq!(server.exited(), Some(0));
+    eprintln!("control evidence: state=draining observed while an in-flight request finished");
 }
 
 #[test]

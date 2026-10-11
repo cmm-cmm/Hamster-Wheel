@@ -1,5 +1,75 @@
 # AI Handoff
 
+## Lifecycle visibility, applied from the supervision study (2026-10-11)
+
+Owner approved applying what
+`doc/research/HERDR_HAMSTER_CONTROL_SUPERVISION_STUDY.md` actually supports on
+this host. Nothing was committed, tagged, pushed, merged or released; no
+Service, firewall or application data was touched.
+
+CORRECTION first, because it changed what was worth building. The study's
+lesson "SCM `Running` is not application readiness" was initially read here as
+a gap in `status`: the control endpoint logs its line before
+"Hamster Wheel listening on", so it looked as though `status` could answer
+while workers were still starting. That inference was wrong, and it came from
+log order rather than code order. `src/server.rs` runs
+`config.start_workers().await` (every initial worker READY), then
+`TcpListener::bind` for every listener, and only then creates the control
+pipe. An answer from the endpoint therefore already proves initial readiness
+and bound sockets. A `serving=true|false` key at startup would have been
+noise.
+
+FACT: the real lifecycle gap is at the other end. The control task is aborted
+only after `serve_listeners` returns, so the endpoint keeps answering
+throughout a graceful drain and reported a draining server exactly as it
+reports a serving one. `status` now carries `state=serving|draining`, set from
+an `AtomicBool` the shutdown future stores before the drain begins. A
+supervisor that restarts on an unhealthy answer can now tell "stopping on
+purpose" from "broken". Rehearsed with a three-second PHP request in flight:
+`stop` is acknowledged, `status` reports `state=draining`, the in-flight
+request still completes 200 and the process exits 0.
+
+FACT: `status` now also carries `pids=` per pool, taken from the same snapshot
+as the counts so the two cannot disagree. This serves the study's
+"exact PID, never process names" gate for the tree Hamster owns. The existing
+`status` rehearsal asserts the reported PID equals the one in the startup log.
+Note for whoever reads health from this surface: compare `live` against
+`target`. `ready` counts READY *and idle* workers, so a healthy pool at full
+concurrency reports `ready=0`; the runbook now says so.
+
+FACT: the study's "measure the log when the pipe closes" gate had a precedent
+for Ctrl+Break only (`tests/tls_reload_process.rs`). It now covers the control
+path: a detached TLS server whose piped stdout is closed under it still
+answers `status`, two consecutive `reload-certificates` and a graceful `stop`,
+exits 0, and writes nothing to stderr. The test was verified to bite —
+replacing the control stop's `outln!` with `println!` makes the server stop
+exiting 0 — and that is the first executable evidence for the `outln!`/`errln!`
+rule in `AGENTS.md`. A first negative check aimed at
+`report_certificate_reload` did **not** bite, which established something
+worth knowing: the control reload path logs nothing of its own, so only the
+stop path's own output is exposed to a closed log reader.
+
+FACT: the runbook's WinSW `<stoptimeout>` guidance now includes the control
+client's five-second retry budget in the sum, because the client may
+legitimately spend it waiting for a pipe instance or retrying `ERR busy`. A
+timeout sized only from request-plus-drain can force-kill a server that was
+stopping correctly.
+
+Deliberately NOT applied, as the study itself argues: swapping the transport
+for `interprocess`; widening the control plane towards Mullvad's gRPC
+subscriptions or Distant's remote process/file protocol; Mullvad's broad
+local-user pipe ACL; WezTerm's client-auto-spawns-daemon model; and any
+Zellij/Distant session machinery, which belongs to Herdr rather than Hamster.
+Choosing WinSW versus a native SCM adapter still needs the isolated VM and is
+untouched.
+
+This closes the open decision recorded below as "whether `status` should ever
+carry more than the operational fields it has": it carries two more fields,
+both lifecycle facts a supervisor must act on, and no new subsystem.
+
+Gates at this working tree: `cargo fmt --all -- --check`; strict MSVC Clippy
+`--all-targets --all-features -D warnings`; `windows_control` ignored 11/11.
+
 ## Control overload bound and WinSW stop contract (2026-10-11, current pass)
 
 This pass preserved the pre-existing uncommitted control-path, configuration,

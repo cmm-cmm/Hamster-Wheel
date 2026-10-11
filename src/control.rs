@@ -100,7 +100,10 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 mod protocol {
     use std::{
         fmt::Write as _,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -189,10 +192,11 @@ mod protocol {
         command: Command,
         config: &Arc<RuntimeConfig>,
         started: Instant,
+        draining: &AtomicBool,
     ) -> Response {
         match command {
             Command::Ping => Response::ok(format!("pid={}", std::process::id())),
-            Command::Status => Response::ok(status_details(config, started)),
+            Command::Status => Response::ok(status_details(config, started, draining)),
             Command::Stop => Response {
                 // Answered before the shutdown is triggered, so the client learns
                 // the request was accepted even though the pipe is about to close.
@@ -203,13 +207,30 @@ mod protocol {
         }
     }
 
-    fn status_details(config: &Arc<RuntimeConfig>, started: Instant) -> String {
+    fn status_details(
+        config: &Arc<RuntimeConfig>,
+        started: Instant,
+        draining: &AtomicBool,
+    ) -> String {
         let mut details = String::new();
         let _ = writeln!(details, "pid={}", std::process::id());
         let _ = writeln!(
             details,
             "uptime_seconds={:.3}",
             started.elapsed().as_secs_f64()
+        );
+        // The endpoint keeps answering while connections drain, so without
+        // this a health poll during a stop would be told the server is still
+        // serving. A supervisor that restarts on an unhealthy answer must be
+        // able to tell "stopping on purpose" from "broken".
+        let _ = writeln!(
+            details,
+            "state={}",
+            if draining.load(Ordering::Acquire) {
+                "draining"
+            } else {
+                "serving"
+            }
         );
         if let Some(address) = config.listen_address() {
             let _ = writeln!(details, "listener=http://{address}");
@@ -241,13 +262,24 @@ mod protocol {
         );
         for pool in config.php_workers() {
             let snapshot = pool.snapshot();
+            // The exact worker PIDs come from the same snapshot as the
+            // counts, so they cannot disagree with them. An operator tracking
+            // or reaping a worker tree must not have to match process names.
+            let pids = snapshot
+                .workers
+                .iter()
+                .filter_map(|worker| worker.pid)
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let _ = writeln!(
                 details,
-                "php_pool={} target={} live={} ready={}",
+                "php_pool={} target={} live={} ready={} pids={}",
                 single_line(pool.label()),
                 snapshot.target_workers,
                 snapshot.live_workers,
-                snapshot.ready_workers
+                snapshot.ready_workers,
+                pids
             );
         }
         for upstream in config.upstreams() {
@@ -376,7 +408,7 @@ mod windows {
         io,
         os::windows::ffi::OsStrExt,
         ptr,
-        sync::Arc,
+        sync::{Arc, atomic::AtomicBool},
         time::{Duration, Instant},
     };
 
@@ -497,6 +529,7 @@ mod windows {
             mut self,
             config: Arc<RuntimeConfig>,
             started: Instant,
+            draining: Arc<AtomicBool>,
             stop_tx: mpsc::Sender<()>,
         ) {
             let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EXCHANGES));
@@ -564,9 +597,10 @@ mod windows {
                     }
                 };
                 let config = Arc::clone(&config);
+                let draining = Arc::clone(&draining);
                 let stop_tx = stop_tx.clone();
                 tokio::spawn(async move {
-                    handle(connected, &config, started, &stop_tx).await;
+                    handle(connected, &config, started, &draining, &stop_tx).await;
                     drop(permit);
                 });
             }
@@ -676,6 +710,7 @@ mod windows {
         mut pipe: NamedPipeServer,
         config: &Arc<RuntimeConfig>,
         started: Instant,
+        draining: &AtomicBool,
         stop_tx: &mpsc::Sender<()>,
     ) {
         let exchange = timeout(EXCHANGE_TIMEOUT, async {
@@ -698,7 +733,7 @@ mod windows {
             }
             let line = String::from_utf8_lossy(&request).into_owned();
             let response = match Command::parse(&line) {
-                Some(command) => execute(command, config, started).await,
+                Some(command) => execute(command, config, started, draining).await,
                 None => Response::unknown_command(),
             };
             Ok(Some(response))

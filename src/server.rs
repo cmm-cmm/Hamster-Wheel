@@ -154,6 +154,11 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     // The endpoint is bound before serving: a name already in use is a startup
     // failure, not something discovered when an operator first needs it.
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    // Read by the control endpoint's `status`. The endpoint keeps answering
+    // while connections drain, so a health poll during a stop must be able to
+    // see that the stop is deliberate.
+    #[cfg(windows)]
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Annotated because the only assignment is Windows-only; without this the
     // type could not be inferred on other targets.
     let mut control_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -166,6 +171,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
                 control_task = Some(tokio::spawn(listener.serve(
                     config,
                     started,
+                    Arc::clone(&draining),
                     stop_tx.clone(),
                 )));
             }
@@ -182,6 +188,10 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             () = console_shutdown => {}
             _ = stop_rx.recv() => outln!("Control endpoint requested shutdown"),
         }
+        // Set before the graceful drain starts, so the first `status` that can
+        // observe a drain already reports it.
+        #[cfg(windows)]
+        draining.store(true, std::sync::atomic::Ordering::Release);
     };
     let mut reload_task = if let Some(tls) = config.tls() {
         match certificate_reload_signal(Arc::clone(tls)) {
