@@ -13,7 +13,7 @@ use tokio::time::{Instant, timeout};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
 
@@ -149,6 +149,16 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         Ok(shutdown) => shutdown,
         Err(error) => return Err(stop_workers_after(&config, error).await),
     };
+    // Finish fallible signal setup before starting administrative tasks. A
+    // later startup error must not leave a control task owning the config.
+    let reload = if let Some(tls) = config.tls() {
+        match certificate_reload_signal(Arc::clone(tls)) {
+            Ok(reload) => Some(reload),
+            Err(error) => return Err(stop_workers_after(&config, error).await),
+        }
+    } else {
+        None
+    };
     // A control `stop` must reach the same graceful path as Ctrl+C, so the two
     // triggers are merged into the one future `serve_listeners` already takes.
     // The endpoint is bound before serving: a name already in use is a startup
@@ -161,19 +171,24 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Annotated because the only assignment is Windows-only; without this the
     // type could not be inferred on other targets.
-    let mut control_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut control_task: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> = None;
     #[cfg(windows)]
     if let Some(name) = config.control_name() {
         match crate::control::ControlListener::bind(name) {
             Ok(listener) => {
                 outln!("Control endpoint listening on {}", listener.path());
                 let config = Arc::clone(&config);
-                control_task = Some(tokio::spawn(listener.serve(
-                    config,
-                    started,
-                    Arc::clone(&draining),
-                    stop_tx.clone(),
-                )));
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                control_task = Some((
+                    shutdown_tx,
+                    tokio::spawn(listener.serve(
+                        config,
+                        started,
+                        Arc::clone(&draining),
+                        stop_tx.clone(),
+                        shutdown_rx,
+                    )),
+                ));
             }
             Err(error) => return Err(stop_workers_after(&config, error).await),
         }
@@ -193,14 +208,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         #[cfg(windows)]
         draining.store(true, std::sync::atomic::Ordering::Release);
     };
-    let mut reload_task = if let Some(tls) = config.tls() {
-        match certificate_reload_signal(Arc::clone(tls)) {
-            Ok(reload) => Some(tokio::spawn(reload)),
-            Err(error) => return Err(stop_workers_after(&config, error).await),
-        }
-    } else {
-        None
-    };
+    let mut reload_task = reload.map(tokio::spawn);
     // Printed once at startup, beside the other readiness lines. A refused
     // request is only explainable if the operator can see what the ceiling was
     // set to, and a configured limit is not something a running server should
@@ -244,8 +252,8 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     }
     // Accepting another control request after the listeners have stopped would
     // answer for a server that is already going away.
-    if let Some(task) = control_task.take() {
-        task.abort();
+    if let Some((shutdown_tx, task)) = control_task.take() {
+        let _ = shutdown_tx.send(());
         let _ = task.await;
     }
     // Every downstream connection, and therefore every active proxy exchange,
@@ -255,7 +263,10 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     }
     let shutdown_result = config.shutdown_workers().await;
     match (serve_result, shutdown_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => {
+            outln!("Hamster Wheel stopped");
+            Ok(())
+        }
         (Err(error), Ok(())) => Err(ServerError::Io(error)),
         (Ok(()), Err(error)) => Err(ServerError::Worker(error)),
         (Err(source), Err(cleanup)) => Err(ServerError::IoWithWorkerCleanup { source, cleanup }),
@@ -388,7 +399,7 @@ where
         }
     }
 
-    outln!("Hamster Wheel stopped");
+    outln!("HTTP listeners drained");
     Ok(())
 }
 

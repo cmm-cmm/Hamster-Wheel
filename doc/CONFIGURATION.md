@@ -216,15 +216,19 @@ name = "edge"                 # ASCII letters, digits, '-', '_', '.'; 1-64 long
 a Windows named pipe at `\\.\pipe\hamster-wheel-control-<name>`, so the key is
 rejected while compiling a configuration on any other platform. A name already
 in use is a startup failure rather than a shared endpoint. The pipe's DACL is
-set at creation and protected: LocalSystem and the pipe's owner, which is the
-account the server runs as, have full access and nobody else has any; remote
+set at creation and protected: LocalSystem and the pipe's object-owner SID
+have full access and nobody else has any; verify the actual Service token's
+default owner rather than assuming it equals its user SID. Remote
 clients are rejected. Anyone who can open it can stop the server.
 
 There is no concurrency key: the endpoint handles four exchanges at once, and a
-connection beyond that is answered `ERR busy` and released, which the client
-retries inside its own five-second budget. These commands are administrative
-and rare, so the ceiling bounds what a client with pipe access can queue
-without crowding out the one command an operator typed.
+connection beyond that is answered `ERR busy` within eight bounded refusal
+slots, which the client retries inside its own five-second budget. Beyond
+those slots it closes without a guaranteed frame; that is a client error,
+not success. One five-second exchange deadline covers all phases. The
+listener owns and joins its exchanges on shutdown. Sustained overload can
+still prevent an operator command: this is bounded admission, not a fairness
+or reserved-operator-slot guarantee.
 
 The same binary is the client, and needs the same configuration file because
 that file names the endpoint:

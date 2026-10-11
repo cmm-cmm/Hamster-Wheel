@@ -1,13 +1,27 @@
 # Windows Operations (Current Scope)
 
-Hamster Wheel is qualified here as a Windows console-hosted Web/Application
-Server, not as a Windows Service or release package. Build with
+Current evidence: [Windows Service lifecycle qualification](WINDOWS_SERVICE_LIFECYCLE_GAPS.md).
+The pinned WinSW 2.11 NET461 companion extension passed two real LocalService
+runs, including independent main exit 0 and wrapper-only idle/busy/stop crashes.
+The sample XML now requires that extension. Older evidence below without it
+remains SCM-stop scoped; do not infer safety from the unmodified wrapper.
+
+Hamster Wheel is qualified here as a Windows console-hosted/detached server
+and, in the specific rehearsal below, through WinSW 2.11.0 under LocalService
+with the pinned lifecycle integration. This is not release qualification, boot verification
+or qualification of every Service wrapper/account. Build with
 `cargo build --release --target x86_64-pc-windows-msvc` and start the binary
 with an explicit deployment config:
 
 ```powershell
 .\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe --config D:\site\hamster.toml
 ```
+
+Windows builds embed `icon/hamster-wheel.ico` into the executable through
+`build.rs` and `embed-resource` (build-time only, scoped to `hamster-wheel`).
+Install the Windows SDK resource compiler alongside the MSVC build tools;
+missing/invalid resources fail the Windows build rather than silently omit
+the icon. Other target platforms skip resource compilation.
 
 The checked-in `hamster.toml` is a development example. Relative roots, PHP
 paths, and certificate paths in an explicit config resolve beside that config
@@ -104,9 +118,11 @@ Read health from `php_pool=<label> target= live= ready= pids=` by comparing
 `live` against `target`. `live` counts workers that exist and reached READY,
 while `ready` counts those that are READY **and idle**, so a fully healthy pool
 serving at full concurrency reports `ready=0`; do not build a degradation check
-on `ready`. `pids=` lists the exact worker PIDs taken from the same snapshot as
-the counts, so a supervisor tracking or reaping the tree Hamster owns never has
-to match process names.
+on `ready`. `pids=` lists the workers observed while constructing that
+snapshot. Counters and individual slots are sampled separately, not atomically;
+brief differences during replacement are possible. These PIDs are diagnostics,
+**not termination authority**. Before terminating anything, retain its process
+handle and verify executable, creation time and deployment/parent ownership.
 
 `state=` is `serving` or `draining`. The endpoint keeps answering while
 connections drain, so without it a health poll during a deliberate stop would
@@ -132,11 +148,18 @@ but sustained overload can still make an operator command fail. Retry it after
 the overload subsides; do not interpret `ERR busy` as a stop acknowledgement.
 The high pipe-instance ceiling is not a task/handle budget. Silent or partial
 requests are released at the five-second exchange deadline without execution.
+One deadline covers reading, command execution, writing and peer-close, rather
+than granting five seconds to each phase. The listener owns, cancels and joins
+all exchange/refusal tasks on shutdown; they cannot outlive it. Invalid status
+lines and oversized/truncated answers are client errors, never success.
+Once a complete `stop` is accepted, losing its client does not undo the stop.
 
 Access is controlled by the pipe's DACL, set when the pipe is created and
 protected from inheritance: `D:P(A;;GA;;;SY)(A;;GA;;;OW)` grants LocalSystem
-and the pipe's owner, which is the account the server runs as, and grants
-nobody else anything. Remote clients are rejected, and the first instance
+and the pipe's object-owner SID, and grants nobody else anything. On the tested
+unelevated account the token user and default owner match. Do not assume this
+for an elevated or Service token: verify its actual owner and access in the
+deployment. Remote clients are rejected, and the first instance
 claims the name so a second process cannot serve the same endpoint beside it.
 Treat membership of that account as equal to the ability to stop the server.
 
@@ -145,13 +168,32 @@ name; it never compiles the configuration, so a certificate that no longer
 loads from disk still leaves `reload-certificates` usable, which is exactly
 when it is needed.
 
-### WinSW candidate (not Service-qualified)
+### WinSW deployment (pinned lifecycle integration)
 
 [`examples/winsw/HamsterWheelService.xml`](../examples/winsw/HamsterWheelService.xml)
 is a reviewable WinSW configuration, **not** an installed Service. Place a
 WinSW v2.11.0 executable named `HamsterWheelService.exe` beside a copy
-of that XML with the same base name, the release `hamster-wheel.exe`, and a
-deployment `hamster.toml`. The example selects the low-privilege built-in
+of that XML with the same base name, `Stop-Hamster.ps1`, the release
+`hamster-wheel.exe`, and a deployment `hamster.toml`. Build the required
+`HamsterLifecycleExtension.dll` and unchanged `WinSW.NET461.exe` reference copy
+into the same deployment directory:
+
+```powershell
+.\examples\winsw\Build-LifecycleExtension.ps1 -WinSW D:\tools\WinSW.NET461.exe -OutputDirectory D:\HamsterDeployment
+```
+
+The builder and runtime both pin vendor SHA256
+`31DCA0D9BD3C5AB7E119172BDB927B90C9DA935D0F4963335EAF60E7D8F7AABF`.
+Do not replace or modify the upstream executable. Missing/incompatible assets
+are a startup failure, not an uncontained fallback. The extension self-assigns
+the wrapper to a kill-on-close job before Hamster is spawned, and uses the
+Service's existing status handle for the specific vendor unsolicited-exit-0
+access-denied branch. It needs no broader SCM rights. Its private WinSW/CLR
+coupling is qualified only within the exact environment documented above.
+
+Keep the main command
+exactly `hamster-wheel.exe --config <absolute-config-path>`: the stop helper
+deliberately rejects other argv shapes. The example selects the low-privilege built-in
 `LocalService` account; create a writable `logs` directory and grant that
 account only the access it needs to the executable, configuration, application
 files, TLS keys and logs. Do not put an account password in the XML. Set a
@@ -163,45 +205,299 @@ ordinary administrator/operator in a different account cannot directly run
 same-account control procedure or a separately approved ACL policy; do not
 silently broaden pipe access.
 
-WinSW v2.11.0's [XML contract](https://github.com/winsw/winsw/blob/v2.11.0/doc/xmlConfigFile.md)
-says `<stoparguments>` launches the stop command and waits for **both** it
-and the main process to exit before reporting the Service stopped. The sample
-uses `--control stop`, not a console event. `OK stopping=true` means Hamster
-accepted the command; it does not mean its connections drained or its process
-exited. The 120-second `<stoptimeout>` is a sample upper bound, not a verified
-universal value: choose it above the deployment's longest legitimate request
-and worker drain, **plus** the control client's own five-second retry budget,
-which it may legitimately spend waiting for a pipe instance or retrying an
-`ERR busy` answer; then verify with an in-flight request. Only after that
-deadline may WinSW's forced termination act as a last resort. A failed stop
-client or an overloaded pipe is **not** proof that Hamster stopped; inspect
-the wrapper log and the exact Hamster PID. The sample's `onfailure` restart
-policy applies to crashes, not operator-managed `php-cgi` endpoints, which
-need separate supervision. Its stdout/stderr files use WinSW's
+**Correction to the earlier runbook:** WinSW v2.11.0's
+[implementation](https://github.com/winsw/winsw/blob/v2.11.0/src/WinSW/WrapperService.cs)
+waits for both main and custom stop processes **without applying
+`<stoptimeout>` in the custom-stop branch**. A bare `--control stop` can
+therefore leave Service stop waiting indefinitely. The supplied helper owns
+the deadline instead; the XML no longer advertises an ineffective timeout.
+
+[`Stop-Hamster.ps1`](../examples/winsw/Stop-Hamster.ps1) checks its live wrapper
+parent, then verifies a direct child's executable, config argv and creation
+time, rechecks its deployment record after opening a retained process handle,
+and rejects ambiguous matches. It invokes `--control stop`, waits on that
+**same handle** for actual exit, and only after `-GraceSeconds` terminates that
+verified process using the retained handle. `OK stopping=true` is receipt,
+not completion. Failed/busy control does not trigger an immediate kill.
+Identity discovery failure exits 1 **without killing**: WinSW may still wait
+for the main process; diagnose ownership/permissions, never guess a PID.
+Exit 0 means actual exit before the deadline (inspect Hamster's logged exit
+code); exit 2 records forced fallback. `logs/last-stop.log` records the latest
+stop's identity, elapsed time and graceful/forced result.
+
+`-GraceSeconds 120` is an example, not a universal budget. Include helper
+startup/discovery, the five-second control budget, connection drain and all
+accepted PHP jobs, not just one request. Pools shut down sequentially; a
+conservative worker budget is the sum over pools of
+`ceil((queue_capacity + workers) / workers) * request_timeout`, plus worker
+SHUTDOWN/ACK/kill/reap and scheduling margin. Also allow the HTTP/TLS/proxy/
+FastCGI drain deadlines configured for this deployment. Rehearse the actual
+bounded workload and adjust the sample. Forced fallback waits up to another
+five seconds for the retained process to signal; native CIM/OS calls are not
+claimed hard real-time. Immutable scripts/config/executable are required:
+application users must not be able to replace stop policy.
+
+The sample's restart policy applies to crashes, not operator-managed
+`php-cgi` endpoints, which need separate supervision. Hamster's Job Object
+reclaims its inherited PHP worker tree after forced fallback; it does not own
+an externally launched endpoint. Its stdout/stderr files use WinSW's
 [size-based rolling mode](https://github.com/winsw/winsw/blob/v2.11.0/doc/loggingAndErrorReporting.md)
 at 10 MiB with eight retained files; still monitor wrapper/Event Log errors.
 
-For a manual VM rehearsal, capture a process handle for the PID reported by
-`--control status` *before* issuing stop, then wait on that same process
-object. Do not infer exit from the control client's exit code alone:
+### Automated dedicated Service qualification (Administrator required)
+
+Owner authorized temporary Services on this host for this rehearsal. The
+first preparation token was not elevated. After Owner restarted with
+Administrator privileges, the full Service procedure completed successfully
+on 2026-10-11; see evidence below. A VM is not a prerequisite for this
+specifically authorized test. No reboot, firewall change or modification of
+existing Services is authorized by the script.
+
+From **PowerShell, Run as administrator**, execute:
 
 ```powershell
-$hamsterPid = 12345 # replace with pid= from --control status
-$main = Get-Process -Id $hamsterPid
-& .\hamster-wheel.exe --config .\hamster.toml --control stop
-if (-not $main.WaitForExit(120000)) { throw 'Hamster did not exit gracefully' }
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Project\Hamster-Wheel\examples\winsw\Invoke-LifecycleQualification.ps1"
 ```
 
-Before use, rehearse in an isolated Windows VM with a pinned WinSW version:
-start and confirm HTTP readiness and log capture; stop during a bounded
-in-flight request and require normal Hamster exit, worker ACK/reap and Service
-STOPPED only afterwards; terminate the exact Hamster PID and check restart;
-verify ordinary PHP descendants are reclaimed while independently managed
-`php-cgi` follows its own policy; rotate logs and reload a replacement TLS
-certificate through `--control reload-certificates`; verify Service-account
-and operator access separately. No Service was installed on this host.
+[`Invoke-ServiceQualification.ps1`](../examples/winsw/Invoke-ServiceQualification.ps1)
+uses the already-built MSVC release binary, local `php/8.5`, Git's OpenSSL
+(override with `-OpenSsl <absolute-path>`) and pinned official WinSW 2.11.0
+.NET461. The script records its source/hash; the checksum is not a separate
+publisher signature verification. It never prompts for elevation. Missing
+Administrator returns exit 3 before creating fixtures or touching SCM.
+
+The matrix runs an unmodified baseline then a fixed deployment sequentially.
+For only the fixed full rehearsal, use `Invoke-ServiceQualification.ps1 -Mode
+Service -LifecycleExtension`. Plain `-Mode Service` retains the older SCM-stop
+scope; `-LifecycleBaseline` deliberately reproduces vendor failures, not a
+safe deployment. `-RunnerSelfTest` tests error-exit/finally handling without SCM.
+
+Each run creates `target/windows-service-qualification/<GUID>`, unused
+loopback ports and two unique `HamsterQual_<id>` Services. The main runs as
+LocalService with Automatic startup and three-second SCM crash recovery. The
+Manual `_Control` Service runs a finite ping/status/reload exchange under the
+same actual account, recording user/owner SIDs; the harness SCM-stops it after
+the exchange completes. It is not a new production management service. A
+different runner account must get access denied (a
+LocalSystem runner cannot qualify denial). Scratch deployment ACL inheritance
+is removed: deployer/Administrators/System retain control, LocalService gets
+read/execute and modify only on state/logs. No original PHP/config/key ACL is
+modified. Private fixture CA/leaf keys never enter the Windows certificate
+store; HTTPS probes pin the generated leaf and check hostname, after offline
+CA verification. All scripts, keys and PHP sources are outside static roots.
+
+Gates cover application readiness (not SCM RUNNING alone), HTTP/HTTPS/native
+PHP and an independently owned php-cgi endpoint, control ACL, valid TLS reload
+and invalid-key rollback, disconnected-client transaction drain/ACK, retained
+main/child handles, STOPPED-after-exit, replacement-generation/descendant
+containment, Hamster crash/SCM recovery, stderr rotation (scratch 64 KiB/eight
+retained), and a deliberately failed control client. The latter must wait the
+12-second test grace before terminating the verified main handle; another
+Hamster and the externally owned endpoint must remain alive. The short grace
+is deliberate fault-test policy, not the production sample's 120 seconds.
+
+Actual SCM Auto is reported **CONFIGURED, NOT VERIFIED** until a separately
+authorized reboot. Restarting the Service does not verify boot startup. Main
+process crash is distinct from abrupt wrapper crash; both were subsequently
+qualified with the pinned extension. A wrapper crash during STOP_PENDING also
+triggered automatic recovery: verify STOPPED and reissue stop if interrupted.
+WinSW's stdout/stderr roll policy does
+not rotate its separate `.wrapper.log`; arrange independent retention for
+that file/Event Log in deployment policy. Endpoint lifecycle remains external.
+
+**Unmodified vendor limitation:** WinSW 2.11's unsolicited child exit-0
+callback invokes `SignalStopped`, which opens SCM with access LocalService
+lacks. The first finite-probe run logged Access denied and left the wrapper
+RUNNING even though its child had exited. With the pinned extension, actual
+independent Hamster exit 0 now reports STOPPED and exits the wrapper 0 without
+crash recovery. The normal deployment stop remains **SCM stop / WinSW
+`stopwait` → Stop-Hamster → control stop → wait actual main exit**.
+`OK stopping=true` alone still proves nothing about completion. Without the
+extension, independently stopping main remains unsafe. Do not grant LocalService broad SCM rights or
+silently substitute LocalSystem to hide this. The test probe is now held until
+SCM stop after its control exchange, with bounded expiry; its completed control
+transaction is not cancelled. Vendor code evidence:
+[WrapperService.cs, SignalStopped/OnProcessCompleted](https://github.com/winsw/winsw/blob/v2.11.0/src/WinSW/WrapperService.cs).
+The issue is in the wrapper, not Hamster's worker or pipe ACL. The exact
+before/after reports and wrapper-only crash matrix are in the current lifecycle
+qualification report. Other wrapper versions remain separate compatibility work.
+
+Exit 0 means all executed gates passed; exit 1 means failure, with evidence.
+`finally` disables recovery only for verified owned Services, waits owned
+process handles, uninstalls those Services and removes their Event Log
+sources. Successful runs delete scratch deployment/keys; failed runs retain
+diagnostic fixtures but still attempt process/SCM cleanup. Inspect the report's
+Cleanup result before assuming removal succeeded; never compensate with
+process-name kills or snapshot PIDs. The ignored JSON result is retained next
+to, not inside, the deleted fixture. `-KeepFixture` retains scratch files,
+**not** Services. The cached WinSW tool is retained for reproducibility.
+
+Unprivileged `-Mode Prepare` checks staging/PKI/XML/PHP lint;
+`-Mode Process` rehearses application/lifecycle/stop behavior without WinSW or
+SCM. These are **not** Service qualification. Process mode passed on
+2026-10-11, including real PHP/HTTPS, reload/rollback, graceful ACK, replacement
+and ordinary descendants reclaimed in 23 ms, 12-second forced fallback and
+instance isolation. Evidence:
+`target/windows-service-qualification/98443e3b6c2243238fddd333f6a8f585-results.json`
+(local ignored artifact; historical process-only evidence).
+
+### Actual LocalService/SCM evidence (2026-10-11)
+
+Full Service mode returned exit 0. Ignored evidence JSON:
+`target/windows-service-qualification/58e4cf9b7f324b79b6d0b35558ff7c7a-results.json`.
+Services `HamsterQual_58e4cf9b7f32` and `_Control` used LocalService; recorded
+user/owner SID was `S-1-5-19`. Main had SCM Auto and three-second restart
+policy; real PHP served HTTP/HTTPS. Both same-account control authorization
+and different elevated operator denial passed without changing pipe policy.
+Valid TLS adoption and mismatched-key rollback passed pinned handshakes.
+
+SCM stop while a disconnected client's transaction was busy kept main PID
+6928 alive after receipt, then completed the transaction, SHUTDOWN_ACK,
+worker/descendant reap, main exit 0 and SCM STOPPED. Replacing a killed PHP
+worker, then terminating retained main PID 2400, reclaimed recorded initial/
+replacement/descendant handles in 29 ms. SCM automatically created wrapper
+PID 8548 / main PID 19872 and restored PHP service. These PIDs are historical
+diagnostics only, not termination authority. Exact images/creation times and
+retained handles were used by the test.
+
+Real WinSW stderr rotation retained eight ~64-KiB archives plus active file.
+Deliberately failing control caused forced stop only after the 12-second grace;
+actual stop/STOPPED convergence took 14,255 ms, main exit code 1. Separate
+Hamster and externally owned php-cgi remained live and responsive. Both test
+Services and Event Log sources were removed; successful fixture/keys were
+deleted and final process/SCM inventory was empty. No reboot or firewall change
+occurred. A second PHP request through the independent instance explicitly
+confirmed endpoint responsiveness after forced stop. First corrected pass
+(`9f83d684e6b44626a49598d9a22244cf-results.json`) also passed, with 22-ms reclaim
+and 14,238-ms forced convergence. Auto was **CONFIGURED, NOT VERIFIED for boot** during the test;
+the temporary installed SCM entry no longer exists after cleanup.
+
+Two initial Service attempts failed before the full corrected pass: missing
+probe XML description, then WinSW's unsolicited exit-0 behavior described
+above. Their owned Services/processes were cleaned up. Four failed diagnostic
+directories remain because tool policy rejected explicit recursive deletion:
+`f281d460959642b693d96a5cd1067008`, `3babe74087f843ee90803e26c4520043`,
+`086855c6ff724553b08a9c1c63ad5f09`, `31df729cbf24402b8763205d42dcba8b`
+under `target/windows-service-qualification/`. They contain only scratch PHP,
+certificates and diagnostics, not original application data. Owner can remove
+these exact directories after reviewing failure logs. JSON evidence and tool
+cache are intentionally retained. Linux, SYN-blackhole, abrupt wrapper death,
+other service accounts and boot/reboot remain NOT VERIFIED.
+
+### Manual staging procedure (historical VM alternative, NOT VERIFIED here)
+
+Stage a dedicated `C:\HamsterRehearsal` deployment; never use production data.
+Pin/check the WinSW 2.11.0 binary checksum independently. Stage the main/XML/
+helper/config assets and the built lifecycle DLL plus unchanged vendor reference
+copy described above, trusted PHP/fixtures or a scratch application, and scratch TLS keys.
+Create `logs`; restrict deployment/script/config modification to the deployer
+and System. Give LocalService read/execute on binaries/application, read on
+config/keys, and modify only on logs and explicitly writable scratch app data.
+Keep keys and PHP sources outside static roots. Do not grant Everyone access
+to the pipe or TLS keys. Set a unique control name and unused loopback ports.
+
+Only in an **Owner-authorized dedicated elevated test environment**, from that
+staging directory:
+
+```powershell
+# Do not install the generic name beside a real deployment; choose a unique ID.
+.\HamsterWheelService.exe install
+.\HamsterWheelService.exe start
+.\HamsterWheelService.exe status
+# A safe GET and a verified TLS handshake establish application readiness;
+# SCM RUNNING alone does not. Capture wrapper/stdout/stderr/Event Log.
+Invoke-WebRequest http://127.0.0.1:18080/ -UseBasicParsing
+# Start a bounded scratch application request before requesting this stop.
+.\HamsterWheelService.exe stopwait
+.\HamsterWheelService.exe status
+Get-Content .\logs\last-stop.log
+# After all rehearsals, remove only this explicitly named test Service.
+.\HamsterWheelService.exe uninstall
+```
+
+Require STOPPED only after actual process exit, normal worker ACK/reap on the
+graceful case and `forced=false`. Deliberately unavailable control must reach
+the configured deadline before `forced=true`; it must not kill another
+deployment. For crash recovery, acquire/verify the main's retained handle and
+deployment/parent/creation identity first (same rules as the helper), terminate
+through that handle, and require a new main instance, initial READY and safe
+GET after the restart delay. Record old/new creation times, not PID alone.
+Test a workload exceeding 10 MiB of startup/diagnostic logs and check the eight
+retained rotations, disk-full/log-reader loss, and wrapper/Event Log errors.
+Do not add request logging solely to fill files.
+
+Under the actual Service token, verify `ping`, `status`, `reload-certificates`
+and `stop`; replacement leaf adoption and invalid-key rollback must be proven
+by verified TLS handshakes. Test a different ordinary operator account gets
+access denied. Operators may use SCM stop if granted that specific right; live
+reload currently requires an authorized owner/System control procedure. A
+broader operator pipe ACL is an Owner policy decision, not silently enabled.
+Test compatible/restrictive outer jobs and independently supervised
+`php-cgi` crash/restart separately. Record exact handles/identities and clean
+only owned scratch processes, Service and files. **Real LocalService account,
+cross-account control, SCM recovery and WinSW log rotation have now passed in
+the automated scoped rehearsal above.** This manual alternative was not run;
+do not infer different wrapper/account compatibility. The automated procedure above is the
+preferred repeatable path; the VM-only restriction in older dated entries below
+predates Owner's explicit temporary-Service authorization.
 
 ## Qualification Boundary
+
+### Final Windows operations pass (2026-10-11)
+
+Scope: local console/detached operation and the supplied supervisor stop
+helper, **not SCM/Service qualification**. The starting checkout was clean
+at `18a2f13` on `dev`; no existing deployment or Service was modified.
+
+Reproduced before correction: aborting a control listener left a detached
+exchange holding its pipe; an invalid framed status was reported as client
+success; cancelling TLS reload released serialization while certificate work
+was still queued; the old completion log appeared while a disconnected
+client's PHP transaction was still running. New regressions fail with the old
+behavior and pass after correction. No PHP protocol, dispatcher, FastCGI
+connect policy, at-most-once or application lifecycle changes were required.
+
+Verified groups:
+
+| Group | Result |
+|---|---|
+| Full MSVC default suite | 244 passed; prerequisite/manual tests remain ignored |
+| Real-PHP worker regressions | 59 passed, including cancellation, timeout classification, replacement startup budget, recycle/backoff/cooldown, Ctrl+C/Ctrl+Break and broken stdout/stderr |
+| Multi-pool / FastCGI / live-readiness | 9 / 8 / 1 passed; real `php-cgi`, rollback, all-pool reap and external endpoint ownership |
+| Release process rehearsals | Control 15, containment 4, TLS console reload 2, detached headless 2: all passed |
+| Build/tool gates | rustfmt check, strict all-target/all-feature MSVC Clippy, release build, profiling bench linking, diff check; 45 PHP fixtures linted; XML/PowerShell parsed |
+
+Release control overload held 112 baseline handles, peaked at 127 and returned
+to 112 after deadlines; status and stop recovered. Release containment
+reclaimed busy/bootstrap/replacement/multi-pool/ordinary descendants within
+0–5 ms in this run (the assertions allow five seconds, not a latency SLA).
+The fallback helper waited 5.009 s before terminating its verified main
+handle, confirmed exit at 5.025 s and left another deployment usable. The
+graceful barrier test confirmed stop receipt precedes transaction completion,
+worker SHUTDOWN_ACK and real process exit. An incorrect wrapper identity was
+refused without stopping the server. A duplicate control name now also proves
+rollback of an already-READY PHP worker and removal of the failed listener.
+
+Reproduce release process coverage (helpers are not standalone tests):
+
+```powershell
+cargo test --release --target x86_64-pc-windows-msvc --test windows_control --test windows_containment --test windows_headless --test tls_reload_process -- --include-ignored --skip console_probe_entry --skip ctrl_break_helper_entry --nocapture --test-threads=1
+```
+
+External Laravel/PMS/application workspaces were not reused or modified.
+Unchanged historical measurement probes, 10k forced-failure soak and 60-second
+random-kill stress were not repeated; existing evidence remains applicable,
+not a new result. TCP SYN-blackhole, native Linux, real Service/cross-account
+access, SCM recovery and WinSW rotation are **NOT VERIFIED**. Those are
+environment qualifications, not reasons to repeat completed local tests.
+
+`HTTP listeners drained` means only connection drain. `Hamster Wheel stopped`
+is emitted only after successful worker shutdown/reap; neither log line nor
+`status` replaces a retained process handle when proving exit. Logging tolerates
+a missing/broken sink; this does not claim asynchronous nonblocking writes to
+a sink that remains open but never reads. Cancelled native certificate I/O is
+bounded in outstanding work, not forcibly interruptible; use reliable local
+certificate storage and the supervisor's last-resort timeout.
 
 ### Control endpoint rehearsal (2026-10-11)
 
@@ -209,7 +505,7 @@ and operator access separately. No Service was installed on this host.
 the shipped client against them. Verified: `status` reports the live PID,
 `state=serving`, the listener, worker readiness and the exact worker PID;
 `stop` ends the server with exit code 0 and its
-PHP worker exits with it, which `TerminateProcess` does not do; a reload adopts
+PHP worker exits through the normal lifecycle rather than forced containment; a reload adopts
 a replacement leaf that a verified TLS handshake then presents, and a
 mismatched key is refused with `active_set=previous` while the adopted leaf
 keeps serving; a thread impersonating a token restricted to `Everyone` is
@@ -302,8 +598,9 @@ cargo test --target x86_64-pc-windows-msvc --test windows_headless -- --nocaptur
 cargo test --target x86_64-pc-windows-msvc --test windows_headless -- --ignored --nocapture
 ```
 
-The WinSW sample and stop contract above are documentation-backed, not a
-Service rehearsal. Actual Service console behavior is **NOT VERIFIED**.
+The WinSW stop helper has a process-level rehearsal with the real binary and
+PHP; WinSW/SCM integration itself is not a Service rehearsal. Actual Service
+console behavior, recovery policy and log rotation are **NOT VERIFIED**.
 Operator-managed `php-cgi` requires separate supervision; Hamster's Job Object
 does not protect that endpoint.
 

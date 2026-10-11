@@ -349,10 +349,22 @@ async fn body_budget_is_shared_across_pools_and_released_on_disconnect() {
 
     let mut held = TcpStream::connect(address).await.unwrap();
     held.write_all(
-        b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\nx",
+        b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1048576\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
     )
     .await
     .unwrap();
+
+    // Writing A's headers does not prove the server admitted its body. Under
+    // parallel test load B could reserve its byte first and cause A to be
+    // refused. Hyper sends 100 Continue when the body is first polled, which
+    // happens AFTER PHP's declared-length reservation. Wait for that observable
+    // boundary before creating the competing request; do not guess with sleep.
+    let mut interim = [0; 25];
+    tokio::time::timeout(Duration::from_secs(2), held.read_exact(&mut interim))
+        .await
+        .expect("pool A should begin reading its admitted body")
+        .unwrap();
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
 
     let small_post =
         "POST /echo HTTP/1.1\r\nHost: b.test\r\nContent-Length: 1\r\nConnection: close\r\n\r\ny";

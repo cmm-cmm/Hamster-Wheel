@@ -1,5 +1,308 @@
 # AI Handoff
 
+## Current: two Service lifecycle gaps qualified (2026-10-11)
+
+Owner enabled Administrator; actual elevated `OBJECTLAPTOP\cmmph` token was
+verified. Read `doc/WINDOWS_SERVICE_LIFECYCLE_GAPS.md` and the current WinSW
+deployment section of `doc/WINDOWS_OPERATIONS.md` first. This entry supersedes
+the NOT CLOSED preparation below; no commit/tag/push/merge/release was made.
+
+FACT: unmodified WinSW 2.11 NET461 / LocalService reproduced actual main exit 0
+with wrapper RUNNING/access denied, and wrapper-only death leaving main/PHP
+serving. Vendor `SignalStopped` unnecessarily requests SCM All access; after
+its error disposes the Process, subsequent custom stop can also fail on Id.
+Hamster's own job cannot contain its parent wrapper.
+
+Fixed via a small companion C# extension, not a vendor binary/Rust rewrite:
+exact vendor hash/layout pin; wrapper self-membership in kill-on-close job
+before any child spawn; rooted non-inheritable process-lifetime handle; narrow
+synchronous first-chance filter reports STOPPED through existing own-Service
+status handle only after actual main exit 0. No LocalSystem/SCM ACL expansion.
+Sample XML enables it; build DLL/reference assets using
+`examples/winsw/Build-LifecycleExtension.ps1`. Private vendor/CLR coupling is
+intentional and scoped; mismatches fail closed before application startup.
+
+Before/after matrix PASS:
+`target/windows-service-qualification/1a4843a8118e44749ff26f5f8de2d55b-matrix.json`;
+baseline `531b5518ba534d1d80f9b5d4105836fb-results.json`;
+fixed `6e6e8a5984e04317bf5ad6d4c7334066-results.json`.
+Second full fixed pass after template integration:
+`ce6598d8467e481c8481e1ef45cb6c53-results.json` (same evidence directory).
+Direct stop drained disconnected transaction, main/wrapper exit 0, SCM STOPPED,
+no recovery during six-second observation. Normal SCM stop retained ACK/reap.
+Wrapper-only idle/busy/STOP_PENDING/repeat1/repeat2 all reclaimed exact retained
+old trees (6–40 ms first, 9–30 ms second) and automatically recovered actual
+PHP/TLS/CGI readiness (4.354–5.648 s first, 4.387–4.499 s second), with one main,
+no port conflict and independent instance/operator php-cgi still serving.
+Crash during stop DID trigger recovery: operator must verify STOPPED/reissue
+SCM stop if interrupted. Abnormal kill is not transaction drain/retry.
+
+Both runs also passed real LocalService control SID S-1-5-19, different-account
+denial, TLS reload/rollback, worker replacement/descendants, main crash recovery,
+64-KiB stderr rolling (eight archives plus active), 12-second forced-budget
+convergence (13.494 / 13.308 s). No request-hot-path change or new throughput claim.
+Fresh fmt, strict all-target/all-feature MSVC Clippy, default 244 tests, release
+build and bench link gates passed. Fresh ignored control 14/14, containment 4/4,
+C# smoke and runner error/finally self-test, six PowerShell/XML parsers, 42 PHP
+fixture lints and diff check passed. Previous unchanged ignored cancellation,
+no-retry, timeout, multi-pool and containment evidence remains applicable.
+
+Successful run Services/Event Log sources/fixture keys removed; owned handles
+waited. Four old deletion-denied diagnostic directories remain untouched.
+Ignored JSON/log/compiler evidence intentionally retained. Two new failed
+diagnostic fixture directories (`9a846c39af004436b42e39279f58bae2`,
+`c4b39c487968474491b7130b976e806f`) also remain: their removal command was
+tool-denied before execution, no retry/bypass or archive. Final scoped inventory
+found zero qualification Services and zero fixture processes. Successful
+deployment directories were removed automatically.
+Early new harness
+failures are explicitly recorded, not PASS: invalid fixture ID corrected;
+native child runner now waits finally despite stderr/exit 1 (self-test).
+Only exact owned handles/Service identities are cleanup authority, never old
+report PIDs or process names. No unrelated Service/firewall/data changes.
+
+Qualification scope: Windows 11 x64 build 26300, pinned WinSW 2.11 NET461,
+LocalService. Other vendor/OS/account/outer-job environments remain unqualified.
+Boot Auto CONFIGURED, NOT VERIFIED (no reboot, test Services removed); Linux
+and SYN-blackhole NOT VERIFIED. Next useful work: Owner review the scoped
+integration/workaround before deployment; do not repeat completed stress absent
+new changes/evidence. No remaining administrative blocker for these two cases.
+
+## Historical preparation: Service lifecycle gaps (before elevation, NOT CLOSED)
+
+Current token `OBJECTLAPTOP\cmmph` has Administrator=False. A RunAs/UAC attempt
+did not complete; its waiting tool session was cancelled, no elevated matrix
+report or new Service was created. Historical Service PASS below remains
+SCM-stop scoped. Do not claim the two new gaps were closed.
+
+Read `doc/WINDOWS_SERVICE_LIFECYCLE_GAPS.md` next. Root cause is WinSW 2.11's
+unsolicited exit-0 `SignalStopped` opening SCM with default All access, not
+Hamster drain/control ACL. Wrapper death is outside Hamster's own job boundary.
+New opt-in C# integration shim in `examples/winsw/` uses wrapper self-membership
+before application spawn and the existing own-Service status handle for the
+specific vendor access-denied exit-0 branch. Original WinSW exe, Rust runtime,
+LocalService/pipe/SCM privileges and deployment XML were not changed this turn.
+Private vendor/CLR coupling is UNQUALIFIED; never deploy merely because it
+compiles. Build/fail-closed/filter/native-layout smoke checks passed.
+
+Next action is one Administrator command, no architectural choice needed:
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Project\Hamster-Wheel\examples\winsw\Invoke-LifecycleQualification.ps1"`.
+It runs original vendor baseline then opt-in shim qualification: actual main
+exit 0, wrapper-only idle/busy/stop crashes, two repeated recovery cycles,
+real serving, retained identity handles and independent php-cgi isolation.
+No automatic elevation, reboot or changes to other Services; own fixtures/
+Services are cleaned. STOP_PENDING recovery is an assertion still to verify.
+
+Fresh release Process rehearsal passed (real PHP, HTTPS, reload/rollback,
+drain/ACK, replacement/ordinary descendant containment, fallback/isolation),
+evidence `target/windows-service-qualification/63e55b41ec0942a19b5f6eadb312bb71-results.json`.
+20-ms main-death reclaim, 12,352-ms fallback with 12-second grace; NOT SCM
+wrapper results. Its processes/fixture/keys were removed. Four old tool-denied
+diagnostic directories are preserved. New ignored compile cache/JSON retained.
+Rust default 244, fmt/strict Clippy/release/bench links, containment 4 and
+ignored control 14 passed. Existing parallel multi-pool test initially failed
+because socket write did not establish reservation ordering; now waits for
+100 Continue before competing body, full parallel 9 passed three times after
+correction. Fresh PHP cancellation/stress (2), possibly-started no-retry (1),
+timeout no-duplicate (1) and busy shutdown (1) passed; 42 PHP fixtures linted.
+No production request/worker behavior was changed; Linux/boot remain outside
+scope / NOT VERIFIED. No commit/tag/push/merge/release.
+
+## Actual WinSW/SCM qualification completed in scoped rehearsal (2026-10-11)
+
+After Owner enabled Administrator, `OBJECTLAPTOP\cmmph` was elevated and the
+full `Invoke-ServiceQualification.ps1 -Mode Service` returned exit 0. Two
+unique LocalService Services were installed then uninstalled, without reboot,
+firewall/other Service changes or commit/tag/push/merge/release. Latest evidence:
+`target/windows-service-qualification/58e4cf9b7f324b79b6d0b35558ff7c7a-results.json`.
+This supersedes the no-elevation/Service NOT VERIFIED preparation below.
+
+PASS — real HTTP/HTTPS/PHP worker and independent operator php-cgi; same-account
+control with actual LocalService user/owner SID `S-1-5-19`; different elevated
+operator denied; TLS reload/last-good rollback; disconnected busy transaction
+drain/ACK/main exit 0 before SCM STOPPED; replacement generation/ordinary child
+containment (29 ms reclaim); automatic SCM recovery and PHP readiness; actual
+WinSW 64-KiB stderr rolling (8 archives + active); 12-second forced budget,
+14,255-ms observed stop/STOPPED convergence; other-instance/endpoint isolation
+verified by a real PHP response through the independent instance afterward.
+The first corrected Service pass also succeeded (9f83d684 report, 22-ms reclaim,
+14,238-ms forced convergence). No throughput claim is derived from these times.
+SCM Auto was configured during the test, but boot is NOT VERIFIED, no reboot
+was authorized. The temporary installed SCM entry was removed afterward.
+
+Two real Service runs reproduced harness/compatibility issues before correction:
+probe XML lacked required description; then WinSW 2.11's unsolicited child
+exit-0 callback called SignalStopped and failed SCM access under LocalService,
+leaving wrapper RUNNING. Keep low privilege. The qualified stop contract is
+SCM/WinSW stopwait -> Stop-Hamster -> control stop -> actual exit, NOT an
+out-of-band direct control stop under that wrapper. Probe now SCM-stops only
+after its finite exchange completes; expiry is bounded. No production Rust,
+worker/IPC protocol or ACL broadening was needed. See source-backed limitation
+and actual Service results in `doc/WINDOWS_OPERATIONS.md`.
+
+Gates rerun after corrections: full MSVC default suite 244 passed, fmt, strict
+all-target/all-feature Clippy, PowerShell/XML parse, fixture PHP lint and diff
+check, release build and complete profiling bench linking passed. Prepare
+mode also passed with the new required-field checks. Required WinSW XML fields
+are now checked before installation;
+denied operator SID/error is recorded. Existing ignored lifecycle evidence is
+unchanged; two real Service rehearsals verify the new integration, not a new
+request hot path.
+
+Cleanup PASS for every attempt's processes/owned Services/Event Log sources;
+final SCM/process inventory empty. Successful scratch deployment/keys deleted.
+Four earlier failed diagnostic directories remain, recursive delete rejected
+by tool policy: `f281d460959642b693d96a5cd1067008`,
+`3babe74087f843ee90803e26c4520043`, `086855c6ff724553b08a9c1c63ad5f09`,
+`31df729cbf24402b8763205d42dcba8b` under
+`target/windows-service-qualification/`. JSON evidence/tool cache retained.
+Do not claim complete file cleanup; no original application data was touched.
+
+NOT VERIFIED — abrupt WinSW wrapper death (main-crash recovery is different),
+independent main exit-0 compatibility outside SCM-stop contract, other Service
+accounts, non-elevated operator SCM permissions, boot/reboot, SYN-blackhole and
+native Linux. Wrapper.log needs separate retention; stdout/stderr rolling does
+not cover it. This is scoped Windows Service evidence, not release readiness.
+
+## Icon and dedicated WinSW qualification preparation (2026-10-11)
+
+Latest Owner authorization permits two separate temporary test Services on
+this host, Auto startup and SCM recovery; no reboot, firewall/other Service
+changes, commit, tag, push, merge or release. Current token is
+`OBJECTLAPTOP\cmmph`, **Administrator=False**. No Service was installed or UAC
+prompted. Earlier VM-only limitations below are historical, not current Owner
+policy. Actual Service qualification remains **NOT VERIFIED** for lack of
+elevation, not lack of a VM.
+
+Windows release now embeds `icon/hamster-wheel.ico` (not the `-2` variant).
+`build.rs`/`icon/hamster-wheel.rc` use build-only embed-resource, restricted to
+the main Windows binary; missing resource compilation fails the build.
+Read-only PE resource inspection verified all six image payloads byte-for-byte
+against the source ICO. Non-Windows compilation skips the resource; Linux is
+still NOT VERIFIED. Release build, fmt, strict all-target/all-feature Clippy
+and default MSVC suite (244 passed) passed after this build change.
+
+New `examples/winsw/Invoke-ServiceQualification.ps1` modes:
+Prepare (staging only), Process (no SCM), Service (fails exit 3 before writes
+unless elevated). See `doc/WINDOWS_OPERATIONS.md` for the complete procedure.
+Run once in **PowerShell, Run as administrator**:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Project\Hamster-Wheel\examples\winsw\Invoke-ServiceQualification.ps1" -Mode Service
+```
+
+It creates GUID-scoped deployment, copied PHP, private fixture PKI, loopback
+ports and two LocalService Services (main Auto/restart; finite same-account
+control probe). Only state/logs are writable by LocalService; inherited broad
+checkout ACLs are removed on the scratch root. XML sample remains Manual;
+the test explicitly verifies SCM Auto without rebooting. Service mode checks
+SCM STOPPED only after retained main exit and verifies real recovery/rotation.
+Cleanup disables only owned recovery, waits handles, uninstalls owned Services
+and removes Event Log sources; JSON stays outside the deleted fixture.
+Inspect Cleanup status on failure; diagnostic fixture retention does not mean
+a failed Service cleanup is safe to ignore. Do not kill by name/snapshot PID.
+
+FACT — Prepare and Process completed. Release real PHP/independent php-cgi,
+HTTP/HTTPS, control, TLS adoption/rollback, disconnected-client drain/ACK,
+initial/replacement/ordinary-descendant containment, 12-second forced fallback
+and other-instance isolation passed. Latest local ignored evidence:
+`target/windows-service-qualification/98443e3b6c2243238fddd333f6a8f585-results.json`.
+Two harness errors (URI mount expectation and path-separator identity check)
+were corrected and the full process rehearsal rerun successfully; they were
+not production failures. Successful rehearsal files/keys and all owned
+processes were cleaned up. Two earlier failed-run fixture directories remain:
+`target/windows-service-qualification/f281d460959642b693d96a5cd1067008` and
+`target/windows-service-qualification/3babe74087f843ee90803e26c4520043`.
+Read-only process/Service inventory is empty for these deployments; the tool
+policy rejected their explicit recursive deletion. They contain scratch PHP
+copies/certificates, not production data. Do not claim complete file cleanup;
+the Owner can remove these two exact directories after inspecting diagnostics.
+WinSW cache and ignored JSON evidence are intentionally retained.
+
+Additional gates: XML/all three PowerShell scripts parsed, 46 PHP fixtures
+linted, non-admin Service guard exit 3 confirmed, fmt/strict Clippy, complete
+profiling bench linking and diff check passed. No production hot-path change
+was made in the Service-preparation pass; earlier Windows regression evidence
+above remains applicable.
+
+NOT VERIFIED — actual LocalService/cross-account ACL, SCM recovery, Service
+STOPPED ordering, WinSW log rotation and boot startup (only XML prepared,
+not an installed SCM entry). Abrupt wrapper death is distinct from main crash;
+WinSW `.wrapper.log` is not covered by stdout/stderr rolling policy. Native
+Linux and TCP SYN-blackhole remain NOT VERIFIED. Next action is the single
+elevated command above; do not infer Service readiness from Process PASS.
+
+## Windows operations handoff — final local qualification (2026-10-11)
+
+Current authoritative operational entry point: `doc/WINDOWS_OPERATIONS.md`.
+Baseline was clean `dev` at `18a2f13` (matching `origin/dev`), not the older
+uncommitted states recorded below. This pass is uncommitted. No commit, tag,
+push, merge, release, Service installation, firewall change or persistent
+system setting change was performed. Existing application data/services and
+historical investigation directories were preserved.
+
+FACT — corrections proved before/after:
+
+- Control listener abort left detached exchanges/pipe handles alive. A
+  listener-owned JoinSet now bounds ownership, aborts and joins all exchanges
+  and refusals; server shutdown explicitly signals and awaits it.
+- An invalid framed response status was treated as client success. Validate
+  OK/ERR status and the complete response size before accepting it. One
+  five-second deadline now covers all exchange phases; partial EOF is not a
+  command, peer-close means EOF rather than one extra byte, and accepted stop
+  is not lost on a response write failure. Early disconnect cannot permanently
+  remove the endpoint; ERROR_NO_DATA renews the waiting pipe instance.
+- Cancelled TLS reload released its gate while spawn_blocking work remained.
+  Its owned mutex guard now travels with the blocking job and through adoption;
+  cancelled work cannot publish or enqueue more compilations behind itself.
+- The completion log preceded disconnected-client PHP transaction drain.
+  `HTTP listeners drained` is distinct from `Hamster Wheel stopped`, now
+  emitted only after successful pool shutdown/reap. A barrier fixture checks
+  normal transaction completion and SHUTDOWN_ACK before actual exit.
+
+FACT — important corrections to earlier handoff claims:
+`PoolSnapshot` samples counters and slots independently: pids/counts can differ
+briefly during lifecycle transitions. PID/status is diagnostics, not identity
+or permission to terminate. WinSW 2.11.0 **does not apply stoptimeout to its
+custom-stop branch** (confirmed against WrapperService.cs), despite earlier
+guidance below. The example now uses `examples/winsw/Stop-Hamster.ps1`: verify
+wrapper parent, retained main handle, executable/config argv/creation time;
+issue --control stop; wait real exit; terminate only that handle after grace.
+Failed identity validation refuses any kill. XML, ownership/timeout budgeting,
+LocalService/pipe policy, rotation and VM-only commands are in the runbook.
+The helper's process-level rehearsal is not a WinSW/SCM Service rehearsal.
+
+FACT — final Windows gates: full default MSVC suite 244 passed; real-PHP worker
+regressions 59 passed; multi-pool 9, real FastCGI 8, readiness 1 passed.
+Release process rehearsals: windows_control 15, windows_containment 4,
+tls_reload_process 2, windows_headless 2 passed. rustfmt, strict all-target/
+all-feature Clippy, release build, all profiling bench linking and diff check
+passed; 45 PHP fixtures linted and XML/PowerShell parsed. Control overload:
+112 baseline / 127 peak / 112 after deadline handles, followed by recovery.
+Containment used retained identities and reclaimed tested descendants in
+0–5 ms; graceful and 5-second forced helper paths passed, including isolation
+from a different deployment and refusal of an unverified wrapper.
+
+No broad throughput benchmark was warranted: no request hot-path change.
+Long historical soak/random-kill and measurement probes were not repeated;
+external Laravel/PMS/application environments were deliberately excluded,
+not marked passing. Owned processes/temp fixtures were reaped/removed; no
+repository PHP/Hamster process or new control scratch directory remained.
+
+INFERENCE — Windows console/detached local operation and its bounded stop
+helper are ready for Owner handoff; this is neither a release decision nor
+Service qualification. Only deployment/environment qualification remains in
+this operations slice. Keep native SCM integration deferred; no evidence
+requires a new architecture. Broken log sinks are handled, but indefinitely
+blocked native file/log I/O is not claimed interruptible or hard real-time.
+
+NOT VERIFIED — real Service account and cross-account access, SCM restart/log
+rotation, unusual outer-job restrictions, TCP SYN-blackhole and native Linux.
+No isolated Service VM was available. Next action, when that environment
+exists: execute the staged VM procedure, verify actual token owner/ACL and
+operator reload policy; do not infer Service readiness from XML/local tests.
+No additional local FastCGI optimization or repeated VM request is needed.
+
 ## Lifecycle visibility, applied from the supervision study (2026-10-11)
 
 Owner approved applying what

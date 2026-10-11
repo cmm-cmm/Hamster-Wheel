@@ -313,6 +313,250 @@ fn worker_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php")
 }
 
+fn barrier_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/operational_barrier.php")
+}
+
+fn encode_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect()
+}
+
+fn start_stop_helper(
+    config: &Path,
+    scratch: &Scratch,
+    tag: &str,
+    owner: &Path,
+    grace: u32,
+) -> OwnedChild {
+    OwnedChild(
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/winsw/Stop-Hamster.ps1"))
+            .arg("-Executable")
+            .arg(env!("CARGO_BIN_EXE_hamster-wheel"))
+            .arg("-Config")
+            .arg(config)
+            .arg("-OwnerExecutable")
+            .arg(owner)
+            .arg("-GraceSeconds")
+            .arg(grace.to_string())
+            .arg("-EvidencePath")
+            .arg(scratch.file(&format!("{tag}.evidence")))
+            .stdin(Stdio::null())
+            .stdout(File::create(scratch.file(&format!("{tag}.stdout"))).unwrap())
+            .stderr(File::create(scratch.file(&format!("{tag}.stderr"))).unwrap())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn write_barrier_config(config: &Path, address: SocketAddr, name: Option<&str>, ack: &Path) {
+    fs::write(
+        config,
+        format!(
+            "[server]\nlisten = '{address}'\n{}\n[[hosts]]\nname = 'localhost'\n\
+         [[hosts.locations]]\npath = '/'\nhandler = 'php_worker'\n\
+         [hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nrequest_timeout = 30\n\
+         [hosts.locations.php.env]\nHAMSTER_TEST_SHUTDOWN_ACK = {}\n",
+            name.map(|name| format!("[server.control]\nname = '{name}'\n"))
+                .unwrap_or_default(),
+            quoted(&php_executable()),
+            quoted(&barrier_script()),
+            quoted(ack),
+        ),
+    )
+    .unwrap();
+}
+
+fn start_barrier(address: SocketAddr, scratch: &Scratch) -> std::net::TcpStream {
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    write!(client, "GET /wait?started={}&release={}&completed={} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        encode_path(&scratch.file("started")), encode_path(&scratch.file("release")), encode_path(&scratch.file("completed"))).unwrap();
+    wait_until("PHP transaction start", || scratch.file("started").exists());
+    client
+}
+
+#[test]
+#[ignore = "rehearses the WinSW stop helper with real PHP and a disconnected in-flight client"]
+fn winsw_stop_helper_waits_for_worker_drain_and_actual_main_exit() {
+    let scratch = Scratch::new("winsw-drain");
+    let config = scratch.file("server.toml");
+    let name = control_name("winsw-drain");
+    let address = reserve_address();
+    write_barrier_config(&config, address, Some(&name), &scratch.file("ack"));
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("Hamster Wheel listening")
+    });
+    drop(start_barrier(address, &scratch));
+    let mut helper = start_stop_helper(
+        &config,
+        &scratch,
+        "stop",
+        &std::env::current_exe().unwrap(),
+        20,
+    );
+    let evidence = scratch.file("stop.evidence");
+    wait_until("accepted stop and HTTP drain", || {
+        assert_eq!(
+            helper.exited(),
+            None,
+            "helper ended early: {}",
+            fs::read_to_string(&evidence).unwrap_or_default()
+        );
+        fs::read_to_string(&evidence)
+            .unwrap_or_default()
+            .contains("acknowledged=True")
+            && fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("HTTP listeners drained")
+    });
+    assert_eq!(
+        server.exited(),
+        None,
+        "stop acknowledgement is not process exit"
+    );
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap()
+            .contains("Hamster Wheel stopped"),
+        "a worker-owned transaction is still draining"
+    );
+    assert!(!scratch.file("completed").exists());
+    fs::write(scratch.file("release"), b"release").unwrap();
+    wait_until("stop helper exit", || helper.exited().is_some());
+    assert_eq!(
+        helper.exited(),
+        Some(0),
+        "{}",
+        fs::read_to_string(&evidence).unwrap_or_default()
+    );
+    assert_eq!(server.exited(), Some(0));
+    assert!(scratch.file("completed").exists());
+    assert!(
+        scratch.file("ack").exists(),
+        "normal worker SHUTDOWN/ACK must precede process exit"
+    );
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .contains("Hamster Wheel stopped")
+    );
+    assert!(
+        fs::read_to_string(&evidence)
+            .unwrap()
+            .contains("forced=false")
+    );
+    eprintln!(
+        "WinSW helper evidence: {}",
+        fs::read_to_string(&evidence).unwrap()
+    );
+}
+
+#[test]
+#[ignore = "rehearses identity-checked deadline fallback; requires real PHP"]
+fn winsw_stop_helper_forces_only_its_verified_deployment_after_deadline() {
+    let scratch = Scratch::new("winsw-fallback");
+    let address = reserve_address();
+    let config = scratch.file("server.toml");
+    write_barrier_config(&config, address, None, &scratch.file("ack"));
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("Hamster Wheel listening")
+    });
+    drop(start_barrier(address, &scratch));
+    let worker = worker_pid(&log);
+    let other_config = scratch.file("other.toml");
+    let other_name = control_name("winsw-unrelated");
+    fs::write(&other_config, format!("[server]\nlisten = '{}'\n[server.control]\nname = '{other_name}'\n[[hosts]]\nname = 'localhost'\nlocations = [{{path = '/', handler = 'not_found'}}]\n", reserve_address())).unwrap();
+    let other_log = scratch.file("other.stdout");
+    let mut other = spawn_detached(&other_config, &other_log, &scratch.file("other.stderr"));
+    wait_until("other listener", || {
+        fs::read_to_string(&other_log)
+            .unwrap_or_default()
+            .contains("Hamster Wheel listening")
+    });
+    let mut helper = start_stop_helper(
+        &config,
+        &scratch,
+        "fallback",
+        &std::env::current_exe().unwrap(),
+        5,
+    );
+    wait_until("deadline helper exit", || helper.exited().is_some());
+    let evidence = fs::read_to_string(scratch.file("fallback.evidence")).unwrap();
+    assert_eq!(helper.exited(), Some(2), "{evidence}");
+    assert!(
+        evidence.contains("grace_expired=true") && evidence.contains("forced=true"),
+        "{evidence}"
+    );
+    assert_eq!(server.exited(), Some(1));
+    assert!(wait_for_exit(worker, Duration::from_secs(5)));
+    assert_eq!(
+        other.exited(),
+        None,
+        "same executable, different deployment must survive"
+    );
+    assert!(control(&other_config, "ping").0);
+    assert!(control(&other_config, "stop").0);
+    assert!(wait_for_exit(other.id(), Duration::from_secs(10)));
+    assert!(
+        !scratch.file("ack").exists(),
+        "fallback must be reported as abnormal shutdown"
+    );
+    eprintln!("WinSW helper fallback evidence: {evidence}");
+}
+
+#[test]
+#[ignore = "verifies the stop helper refuses an unverified wrapper without killing its server"]
+fn winsw_stop_helper_refuses_an_unverified_owner() {
+    let scratch = Scratch::new("winsw-owner");
+    let config = scratch.file("server.toml");
+    let name = control_name("winsw-owner");
+    let address = reserve_address();
+    fs::write(&config, format!(
+        "[server]\nlisten = '{address}'\n[server.control]\nname = '{name}'\n[[hosts]]\nname = 'localhost'\nlocations = [{{path = '/', handler = 'not_found'}}]"
+    )).unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("Hamster Wheel listening")
+    });
+    let wrong_owner = Path::new(env!("CARGO_BIN_EXE_hamster-wheel"));
+    let mut helper = start_stop_helper(&config, &scratch, "stop", wrong_owner, 5);
+    wait_until("refused stop helper", || helper.exited().is_some());
+    assert_eq!(helper.exited(), Some(1));
+    assert!(
+        fs::read_to_string(scratch.file("stop.evidence"))
+            .unwrap()
+            .contains("not a child of the expected live wrapper")
+    );
+    assert_eq!(server.exited(), None);
+    assert!(control(&config, "ping").0);
+    assert!(control(&config, "stop").0);
+    wait_until("normal server exit", || server.exited().is_some());
+    assert_eq!(server.exited(), Some(0));
+}
+
 fn worker_pid(log: &Path) -> u32 {
     let mut pid = None;
     wait_until("a worker PID in the log", || {
@@ -401,7 +645,7 @@ fn status_and_stop_reach_a_server_with_no_console() {
 }
 
 #[test]
-#[ignore = "starts two detached servers that contend for one pipe name"]
+#[ignore = "starts two detached servers that contend for one pipe name; verifies PHP rollback"]
 fn a_second_server_cannot_take_an_endpoint_name_already_in_use() {
     let scratch = Scratch::new("name");
     let name = control_name("name");
@@ -421,6 +665,9 @@ fn a_second_server_cannot_take_an_endpoint_name_already_in_use() {
         )
         .unwrap();
     }
+    let second_address = reserve_address();
+    let ack = scratch.file("rollback-ack");
+    write_barrier_config(&second_config, second_address, Some(&name), &ack);
     let first_log = scratch.file("first.stdout");
     let _first = spawn_detached(&first_config, &first_log, &scratch.file("first.stderr"));
     wait_until("the first listener", || {
@@ -430,13 +677,20 @@ fn a_second_server_cannot_take_an_endpoint_name_already_in_use() {
     });
 
     let second_errors = scratch.file("second.stderr");
-    let mut second = spawn_detached(
-        &second_config,
-        &scratch.file("second.stdout"),
-        &second_errors,
-    );
+    let second_log = scratch.file("second.stdout");
+    let mut second = spawn_detached(&second_config, &second_log, &second_errors);
     wait_until("the second server to exit", || second.exited().is_some());
     assert_eq!(second.exited(), Some(1));
+    let rollback_pid = worker_pid(&second_log);
+    assert!(
+        ack.exists(),
+        "pipe startup failure must gracefully shut down the already-READY PHP worker"
+    );
+    assert!(wait_for_exit(rollback_pid, Duration::from_secs(5)));
+    assert!(
+        std::net::TcpStream::connect(second_address).is_err(),
+        "a failed startup must not keep a listener"
+    );
     let reported = fs::read_to_string(&second_errors).unwrap();
     assert!(
         reported.contains("hamster-wheel:"),

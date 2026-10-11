@@ -7,6 +7,9 @@ description = "HTTP server with static files, routing, configuration, and persis
 [features]
 profiling = []
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [dependencies]
 bytes = "1"
 http-body-util = "0.1"

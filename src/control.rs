@@ -415,8 +415,9 @@ mod windows {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
-        sync::{Semaphore, mpsc},
-        time::{timeout, timeout_at},
+        sync::{Semaphore, mpsc, oneshot},
+        task::JoinSet,
+        time::timeout_at,
     };
 
     use super::{
@@ -531,11 +532,20 @@ mod windows {
             started: Instant,
             draining: Arc<AtomicBool>,
             stop_tx: mpsc::Sender<()>,
+            mut shutdown: oneshot::Receiver<()>,
         ) {
             let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EXCHANGES));
             let refusal_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REFUSALS));
+            // Tasks belong to this listener, including refusal waits. Reap
+            // completed tasks on each accept and abort/join the rest on stop.
+            let mut exchanges = JoinSet::new();
             let mut renewal_reported = false;
             loop {
+                while let Some(result) = exchanges.try_join_next() {
+                    if let Err(error) = result {
+                        errln!("control exchange task failed: {error}");
+                    }
+                }
                 // The waiting instance is created here rather than right after
                 // an accept, so a creation that cannot succeed yet is retried
                 // instead of ending the endpoint for the rest of this process.
@@ -552,7 +562,10 @@ mod windows {
                                 errln!("control endpoint cannot accept for now: {error}");
                                 renewal_reported = true;
                             }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::select! {
+                                _ = &mut shutdown => break,
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            }
                             continue;
                         }
                     }
@@ -561,9 +574,20 @@ mod windows {
                     .server
                     .as_mut()
                     .expect("an instance was just ensured above");
-                if let Err(error) = waiting.connect().await {
-                    errln!("control endpoint accept failed: {error}");
-                    return;
+                let accepted = tokio::select! {
+                    _ = &mut shutdown => break,
+                    accepted = waiting.connect() => accepted,
+                };
+                if let Err(error) = accepted {
+                    // ERROR_NO_DATA means the client connected and closed
+                    // before ConnectNamedPipe completed. Replace that instance
+                    // rather than losing the endpoint for the process lifetime.
+                    if error.raw_os_error() != Some(232) {
+                        errln!("control endpoint accept failed: {error}");
+                        break;
+                    }
+                    self.server.take();
+                    continue;
                 }
                 let connected = self
                     .server
@@ -588,7 +612,7 @@ mod windows {
                         // refusal budget is full, close immediately: a bare
                         // pipe error is preferable to unbounded server tasks.
                         if let Ok(permit) = Arc::clone(&refusal_limit).try_acquire_owned() {
-                            tokio::spawn(async move {
+                            exchanges.spawn(async move {
                                 refuse(connected).await;
                                 drop(permit);
                             });
@@ -599,11 +623,17 @@ mod windows {
                 let config = Arc::clone(&config);
                 let draining = Arc::clone(&draining);
                 let stop_tx = stop_tx.clone();
-                tokio::spawn(async move {
+                exchanges.spawn(async move {
                     handle(connected, &config, started, &draining, &stop_tx).await;
                     drop(permit);
                 });
             }
+            // Close admission first; every remaining task is administrative
+            // pipe work, not an application transaction. No exchange survives
+            // the listener or retains a RuntimeConfig after it returns.
+            self.server.take();
+            exchanges.abort_all();
+            while exchanges.join_next().await.is_some() {}
         }
     }
 
@@ -641,14 +671,14 @@ mod windows {
     /// which would leave the client at end of stream with nothing to report.
     async fn refuse(mut pipe: NamedPipeServer) {
         const REFUSAL: &[u8] = b"ERR busy\nmessage=too many control connections\n\n";
-        if timeout(EXCHANGE_TIMEOUT, pipe.write_all(REFUSAL))
-            .await
-            .is_err()
-        {
+        let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+        if !matches!(
+            timeout_at(deadline, pipe.write_all(REFUSAL)).await,
+            Ok(Ok(()))
+        ) {
             return;
         }
-        let _ = pipe.flush().await;
-        await_peer_close(pipe).await;
+        await_peer_close(pipe, deadline).await;
     }
 
     /// Reads one answer and stops at its terminating blank line.
@@ -672,26 +702,37 @@ mod windows {
                 ));
             }
             response.extend_from_slice(&chunk[..read]);
-            if response.ends_with(
-                b"
-
-",
-            ) {
-                break;
-            }
-            if response.len() >= MAX_RESPONSE_BYTES {
+            if response.len() > MAX_RESPONSE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "control answer exceeded its size limit",
                 ));
             }
+            if response.ends_with(b"\n\n") {
+                break;
+            }
         }
-        String::from_utf8(response).map_err(|_| {
+        let response = String::from_utf8(response).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "the control endpoint answered with invalid UTF-8",
             )
-        })
+        })?;
+        let status = response.lines().next().unwrap_or_default();
+        if status != "OK"
+            && !status.strip_prefix("ERR ").is_some_and(|code| {
+                !code.is_empty()
+                    && code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control answer has an invalid status line",
+            ));
+        }
+        Ok(response)
     }
 
     /// Waits for the client to close before this end does.
@@ -701,9 +742,16 @@ mod windows {
     /// end of stream. A client reads the whole answer and then closes, so its
     /// end of stream is the proof that the answer arrived. The wait is bounded
     /// because a client that never closes must not hold a pipe instance.
-    async fn await_peer_close(mut pipe: NamedPipeServer) {
-        let mut sink = [0_u8; 1];
-        let _ = timeout(EXCHANGE_TIMEOUT, pipe.read(&mut sink)).await;
+    async fn await_peer_close(mut pipe: NamedPipeServer, deadline: tokio::time::Instant) {
+        let mut sink = [0_u8; 256];
+        let _ = timeout_at(deadline, async {
+            while let Ok(count) = pipe.read(&mut sink).await {
+                if count == 0 {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 
     async fn handle(
@@ -713,12 +761,15 @@ mod windows {
         draining: &AtomicBool,
         stop_tx: &mpsc::Sender<()>,
     ) {
-        let exchange = timeout(EXCHANGE_TIMEOUT, async {
+        let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+        let exchange = timeout_at(deadline, async {
             let mut request = Vec::with_capacity(MAX_REQUEST_BYTES);
             let mut byte = [0_u8; 1];
             loop {
                 match pipe.read(&mut byte).await {
-                    Ok(0) => break,
+                    // EOF does not complete a request line. A client that
+                    // cancels before its newline must not execute a command.
+                    Ok(0) => return Ok(None),
                     Ok(_) => {
                         if byte[0] == b'\n' {
                             break;
@@ -747,18 +798,16 @@ mod windows {
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
         };
         let stop_requested = response.stop_requested;
-        if timeout(EXCHANGE_TIMEOUT, pipe.write_all(response.body.as_bytes()))
-            .await
-            .is_err()
-        {
-            return;
+        if matches!(
+            timeout_at(deadline, pipe.write_all(response.body.as_bytes())).await,
+            Ok(Ok(()))
+        ) {
+            await_peer_close(pipe, deadline).await;
         }
-        let _ = pipe.flush().await;
-        // The answer has been read by the client before shutdown begins, so a
-        // `stop` client always sees its acknowledgement.
-        await_peer_close(pipe).await;
+        // A complete stop was accepted even if its client vanished before
+        // reading the acknowledgement. Notification is idempotent and bounded.
         if stop_requested {
-            let _ = stop_tx.send(()).await;
+            let _ = stop_tx.try_send(());
         }
     }
 
@@ -798,11 +847,216 @@ mod windows {
             // A refusal means other control connections hold every slot, not
             // that the command was wrong. Retrying inside the same budget is
             // what makes a burst of connections survivable for the operator.
-            if response.starts_with("ERR busy") && tokio::time::Instant::now() < deadline {
+            if response.lines().next() == Some("ERR busy") && tokio::time::Instant::now() < deadline
+            {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
             return Ok(response);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::time::timeout;
+
+        fn endpoint_name(tag: &str) -> String {
+            format!(
+                "audit-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )
+        }
+
+        fn test_config() -> Arc<RuntimeConfig> {
+            Arc::new(crate::config::compile_str(
+                "[server]\nlisten = '127.0.0.1:8080'\n[[hosts]]\nname = 'localhost'\nlocations = [{path = '/', handler = 'not_found'}]",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            ).unwrap())
+        }
+
+        #[tokio::test]
+        async fn disconnect_before_accept_preserves_the_endpoint() {
+            let name = endpoint_name("early-close");
+            let listener = ControlListener::bind(&name).unwrap();
+            drop(ClientOptions::new().open(pipe_path(&name)).unwrap());
+            let (stop_tx, _stop_rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(listener.serve(
+                test_config(),
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+                stop_tx,
+                shutdown_rx,
+            ));
+            let answer = request(&name, Command::Ping).await;
+            let _ = shutdown_tx.send(());
+            task.await.unwrap();
+            assert!(answer.unwrap().starts_with("OK\n"));
+        }
+
+        #[tokio::test]
+        async fn a_partial_stop_at_eof_is_not_executed() {
+            let name = endpoint_name("partial-eof");
+            let listener = ControlListener::bind(&name).unwrap();
+            let (stop_tx, mut stop_rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(listener.serve(
+                test_config(),
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+                stop_tx,
+                shutdown_rx,
+            ));
+            let mut client = ClientOptions::new().open(pipe_path(&name)).unwrap();
+            client.write_all(b"stop").await.unwrap();
+            drop(client);
+            assert!(
+                request(&name, Command::Ping)
+                    .await
+                    .unwrap()
+                    .starts_with("OK\n")
+            );
+            assert!(
+                stop_rx.try_recv().is_err(),
+                "an incomplete command was executed"
+            );
+            let _ = shutdown_tx.send(());
+            task.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn explicit_shutdown_joins_exchanges_and_releases_the_config() {
+            let name = endpoint_name("join");
+            let listener = ControlListener::bind(&name).unwrap();
+            let config = test_config();
+            let (stop_tx, _stop_rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(listener.serve(
+                Arc::clone(&config),
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+                stop_tx,
+                shutdown_rx,
+            ));
+            let mut client = ClientOptions::new().open(pipe_path(&name)).unwrap();
+            timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&config) < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            shutdown_tx.send(()).unwrap();
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(Arc::strong_count(&config), 1);
+            let mut byte = [0; 1];
+            assert!(!matches!(client.read(&mut byte).await, Ok(count) if count > 0));
+        }
+
+        #[tokio::test]
+        async fn exchange_uses_one_deadline_including_waiting_for_peer_close() {
+            let name = endpoint_name("deadline");
+            let listener = ControlListener::bind(&name).unwrap();
+            let config = test_config();
+            let (stop_tx, _stop_rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(listener.serve(
+                Arc::clone(&config),
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+                stop_tx,
+                shutdown_rx,
+            ));
+            let mut client = ClientOptions::new().open(pipe_path(&name)).unwrap();
+            timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&config) < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            client.write_all(b"ping\n").await.unwrap();
+            assert!(read_framed(&mut client).await.unwrap().starts_with("OK\n"));
+            // Sending another byte must not release the slot prematurely.
+            client.write_all(b"x").await.unwrap();
+            let mut byte = [0; 1];
+            let closed = timeout(Duration::from_secs(4), client.read(&mut byte)).await;
+            let _ = shutdown_tx.send(());
+            task.await.unwrap();
+            assert!(
+                closed.is_ok(),
+                "each phase incorrectly received a fresh timeout budget"
+            );
+            assert!(!matches!(closed.unwrap(), Ok(count) if count > 0));
+            assert!(
+                started.elapsed() >= Duration::from_millis(4500),
+                "extra data was mistaken for peer close"
+            );
+        }
+
+        #[tokio::test]
+        async fn aborting_the_listener_releases_its_inflight_clients() {
+            let name = endpoint_name("ownership");
+            let listener = ControlListener::bind(&name).unwrap();
+            let config = Arc::new(crate::config::compile_str(
+                "[server]\nlisten = '127.0.0.1:8080'\n[[hosts]]\nname = 'localhost'\nlocations = [{path = '/', handler = 'not_found'}]",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            ).unwrap());
+            let (stop_tx, _stop_rx) = mpsc::channel(1);
+            let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(listener.serve(
+                Arc::clone(&config),
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+                stop_tx,
+                shutdown_rx,
+            ));
+            let mut client = ClientOptions::new().open(pipe_path(&name)).unwrap();
+            timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&config) < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            let _ = task.await;
+            let mut byte = [0_u8; 1];
+            let closed = timeout(Duration::from_millis(500), client.read(&mut byte)).await;
+            assert!(
+                closed.is_ok(),
+                "a detached exchange kept its pipe after the listener exited"
+            );
+            assert!(!matches!(closed.unwrap(), Ok(count) if count > 0));
+        }
+
+        #[tokio::test]
+        async fn a_framed_answer_with_an_invalid_status_is_not_success() {
+            let name = endpoint_name("status-line");
+            let mut pipe = ServerOptions::new().create(pipe_path(&name)).unwrap();
+            let peer = tokio::spawn(async move {
+                pipe.connect().await.unwrap();
+                let mut byte = [0_u8; 1];
+                while pipe.read(&mut byte).await.unwrap() > 0 && byte[0] != b'\n' {}
+                pipe.write_all(b"NOT_OK\n\n").await.unwrap();
+                let _ = pipe.read(&mut byte).await;
+            });
+            let response = request(&name, Command::Ping).await;
+            peer.await.unwrap();
+            assert!(
+                response.is_err(),
+                "an invalid status was treated as success: {response:?}"
+            );
         }
     }
 }

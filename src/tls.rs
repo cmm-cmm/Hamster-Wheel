@@ -215,7 +215,7 @@ pub struct TlsListener {
     source: Box<[CertificateSource]>,
     provider: Arc<CryptoProvider>,
     current: RwLock<Arc<CertificateSet>>,
-    reload_gate: Mutex<()>,
+    reload_gate: Arc<Mutex<()>>,
     handshake_timeout: Duration,
     stats: HandshakeStats,
     #[cfg(test)]
@@ -266,7 +266,7 @@ impl TlsListener {
             source: source.certificates.into_boxed_slice(),
             provider,
             current: RwLock::new(Arc::new(current)),
-            reload_gate: Mutex::new(()),
+            reload_gate: Arc::new(Mutex::new(())),
             handshake_timeout: source.handshake_timeout,
             stats: HandshakeStats::new(),
             #[cfg(test)]
@@ -277,12 +277,17 @@ impl TlsListener {
     /// Re-read only configured certificate and key paths. Compilation occurs
     /// outside the snapshot lock; failure leaves the serving set untouched.
     pub async fn reload_certificates(&self) -> Result<Arc<[CertificateReport]>, String> {
-        let _gate = self.reload_gate.lock().await;
+        let gate = Arc::clone(&self.reload_gate).lock_owned().await;
         let source = self.source.to_vec();
         let provider = Arc::clone(&self.provider);
-        let replacement = tokio::task::spawn_blocking(move || compile_set(&source, provider))
-            .await
-            .map_err(|error| format!("TLS certificate reload task failed: {error}"))??;
+        // Cancellation cannot stop a queued/running blocking filesystem job.
+        // That job retains serialization until it finishes; on success keep
+        // the guard through adoption too, preventing out-of-order commits.
+        let (replacement, _gate) = tokio::task::spawn_blocking(move || {
+            compile_set(&source, provider).map(|replacement| (replacement, gate))
+        })
+        .await
+        .map_err(|error| format!("TLS certificate reload task failed: {error}"))??;
         let reports = Arc::clone(&replacement.reports);
         let previous = {
             let mut current = self.current.write().expect("TLS snapshot lock");
@@ -694,6 +699,52 @@ impl HandshakeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_reload_keeps_its_blocking_work_serialized() {
+        let pki = test_support::Pki::new("cancel-reload");
+        let leaf = pki.leaf("server", &["localhost"]);
+        let tls = test_support::listener(
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_secs(5),
+            vec![test_support::source(&leaf, &["localhost"], true)],
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            });
+            started_rx.await.unwrap();
+            let reload_tls = Arc::clone(&tls);
+            let reload = tokio::spawn(async move { reload_tls.reload_certificates().await });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while tls.reload_gate.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            reload.abort();
+            let _ = reload.await;
+            let work_still_serialized = tls.reload_gate.try_lock().is_err();
+            // Always release the blocking thread before asserting, including
+            // the pre-fix failure case; runtime shutdown must not hang.
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tls.reload_certificates().await.unwrap();
+            assert!(
+                work_still_serialized,
+                "cancelled reload released its gate while certificate work was still queued"
+            );
+        });
+    }
 
     #[test]
     fn parses_exact_and_single_label_wildcard_names() {
