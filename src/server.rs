@@ -13,7 +13,7 @@ use tokio::time::{Instant, timeout};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{mpsc, watch},
     task::JoinSet,
 };
 
@@ -80,6 +80,10 @@ impl From<PhpPoolsError> for ServerError {
 }
 
 pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
+    // Reported by the control endpoint's `status`, so it is taken before any
+    // startup work rather than when the endpoint happens to be bound.
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
     #[cfg(windows)]
     if !config.php_workers().is_empty() {
         crate::windows_child_containment::establish().map_err(ServerError::ChildContainment)?;
@@ -141,9 +145,43 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             Err(error) => return Err(stop_workers_after(&config, error).await),
         }
     }
-    let shutdown = match shutdown_signal() {
+    let console_shutdown = match shutdown_signal() {
         Ok(shutdown) => shutdown,
         Err(error) => return Err(stop_workers_after(&config, error).await),
+    };
+    // A control `stop` must reach the same graceful path as Ctrl+C, so the two
+    // triggers are merged into the one future `serve_listeners` already takes.
+    // The endpoint is bound before serving: a name already in use is a startup
+    // failure, not something discovered when an operator first needs it.
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    // Annotated because the only assignment is Windows-only; without this the
+    // type could not be inferred on other targets.
+    let mut control_task: Option<tokio::task::JoinHandle<()>> = None;
+    #[cfg(windows)]
+    if let Some(name) = config.control_name() {
+        match crate::control::ControlListener::bind(name) {
+            Ok(listener) => {
+                outln!("Control endpoint listening on {}", listener.path());
+                let config = Arc::clone(&config);
+                control_task = Some(tokio::spawn(listener.serve(
+                    config,
+                    started,
+                    stop_tx.clone(),
+                )));
+            }
+            Err(error) => return Err(stop_workers_after(&config, error).await),
+        }
+    }
+    let shutdown = async move {
+        // The sender is held here for the lifetime of the wait. Dropping it
+        // would close the channel, `recv` would return `None` at once, and a
+        // server with no control endpoint would shut down the moment it
+        // started serving.
+        let _stop_tx = stop_tx;
+        tokio::select! {
+            () = console_shutdown => {}
+            _ = stop_rx.recv() => outln!("Control endpoint requested shutdown"),
+        }
     };
     let mut reload_task = if let Some(tls) = config.tls() {
         match certificate_reload_signal(Arc::clone(tls)) {
@@ -191,6 +229,12 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     let router = config.router_arc();
     let serve_result = serve_listeners(listeners, router, config.http_limits(), shutdown).await;
     if let Some(task) = reload_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    // Accepting another control request after the listeners have stopped would
+    // answer for a server that is already going away.
+    if let Some(task) = control_task.take() {
         task.abort();
         let _ = task.await;
     }

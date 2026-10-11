@@ -94,6 +94,54 @@ struct RawServer {
     max_body_memory: u64,
     #[serde(default = "default_http1_max_buffer_size")]
     http1_max_buffer_size: usize,
+    control: Option<RawControl>,
+}
+
+/// The local control endpoint. Absent means no endpoint exists at all.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControl {
+    name: String,
+}
+
+/// Just enough of a configuration file to find the control endpoint.
+///
+/// A control client must not compile the configuration: loading certificates,
+/// canonicalizing roots and building pools can fail for reasons that have
+/// nothing to do with the request, and a certificate that no longer loads is
+/// exactly when `reload-certificates` is needed. Unknown fields are ignored
+/// here on purpose, so a file the running server accepted stays readable.
+#[derive(Debug, Deserialize)]
+struct ControlProbe {
+    server: ControlProbeServer,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlProbeServer {
+    control: Option<RawControl>,
+}
+
+/// Reads the configured control endpoint name without compiling anything else.
+pub fn control_endpoint(selection: &ConfigSelection) -> Result<Option<String>, ConfigError> {
+    let ConfigSelection::File(path) = selection else {
+        // The built-in configuration has no control endpoint to name.
+        return Ok(None);
+    };
+    let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        context: format!("cannot read config file {}", path.display()),
+        source,
+    })?;
+    let probe: ControlProbe = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        source_name: path.display().to_string(),
+        source,
+    })?;
+    match probe.server.control {
+        None => Ok(None),
+        Some(control) => {
+            crate::control::validate_name(&control.name).map_err(ConfigError::Validation)?;
+            Ok(Some(control.name))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +259,7 @@ pub struct RuntimeConfig {
     listen: Option<SocketAddr>,
     tls: Option<Arc<TlsListener>>,
     http_limits: HttpLimits,
+    control: Option<String>,
     router: Arc<HostRouter>,
     php_pools: Vec<Arc<PhpWorkerPool>>,
     upstreams: Vec<Arc<Upstream>>,
@@ -382,6 +431,11 @@ impl RuntimeConfig {
         self.listen
     }
 
+    /// The configured control endpoint name, when an operator asked for one.
+    pub fn control_name(&self) -> Option<&str> {
+        self.control.as_deref()
+    }
+
     /// The HTTPS listener, with its certificates already loaded and checked.
     pub fn tls(&self) -> Option<&Arc<TlsListener>> {
         self.tls.as_ref()
@@ -528,18 +582,65 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    match parse_invocation(arguments)? {
+        Invocation::Serve(selection) => Ok(selection),
+        Invocation::Control { .. } => Err(ConfigError::Arguments(
+            "--control is not a server invocation".to_owned(),
+        )),
+    }
+}
+
+/// What the process was asked to be: the server, or a client of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    Serve(ConfigSelection),
+    /// Send one command to the control endpoint the configuration names.
+    Control {
+        selection: ConfigSelection,
+        command: crate::control::Command,
+    },
+}
+
+const USAGE: &str = "usage: hamster-wheel [--config PATH] [--control COMMAND]";
+
+pub fn parse_invocation<I, S>(arguments: I) -> Result<Invocation, ConfigError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
     let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
-    match arguments.as_slice() {
-        [] => Ok(ConfigSelection::BuiltIn),
-        [flag, path] if flag == "--config" && !path.is_empty() => {
-            Ok(ConfigSelection::File(PathBuf::from(path)))
+    // The control endpoint's name lives in the configuration, so a client
+    // invocation reads the same file the server was started with.
+    let (selection, rest) = match arguments.as_slice() {
+        [flag, path, rest @ ..] if flag == "--config" && !path.is_empty() => {
+            (ConfigSelection::File(PathBuf::from(path)), rest)
         }
-        [flag] if flag == "--config" => Err(ConfigError::Arguments(
-            "--config requires a file path".to_owned(),
+        [flag] if flag == "--config" => {
+            return Err(ConfigError::Arguments(
+                "--config requires a file path".to_owned(),
+            ));
+        }
+        rest => (ConfigSelection::BuiltIn, rest),
+    };
+    match rest {
+        [] => Ok(Invocation::Serve(selection)),
+        [flag, command] if flag == "--control" => {
+            match crate::control::Command::parse(&command.to_string_lossy()) {
+                Some(command) => Ok(Invocation::Control { selection, command }),
+                None => Err(ConfigError::Arguments(format!(
+                    "--control accepts {}",
+                    crate::control::Command::ALL
+                        .iter()
+                        .map(|command| command.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))),
+            }
+        }
+        [flag] if flag == "--control" => Err(ConfigError::Arguments(
+            "--control requires a command".to_owned(),
         )),
-        _ => Err(ConfigError::Arguments(
-            "usage: hamster-wheel [--config PATH]".to_owned(),
-        )),
+        _ => Err(ConfigError::Arguments(USAGE.to_owned())),
     }
 }
 
@@ -588,6 +689,7 @@ fn load_builtin() -> Result<RuntimeConfig, ConfigError> {
 fn builtin_raw_config() -> RawConfig {
     RawConfig {
         server: RawServer {
+            control: None,
             listen: Some(DEFAULT_LISTEN.to_owned()),
             tls: None,
             max_connections: default_max_connections(),
@@ -652,6 +754,7 @@ pub(crate) struct ValidatedConfig {
     listen: Option<SocketAddr>,
     tls: Option<TlsSource>,
     http_limits: HttpLimits,
+    control: Option<String>,
     hosts: Vec<ValidatedHost>,
 }
 
@@ -782,6 +885,19 @@ pub(crate) fn validate_raw(
         write_progress_timeout: Duration::from_secs(raw.server.write_progress_timeout),
         max_body_memory: raw.server.max_body_memory as usize,
         http1_max_buffer_size: raw.server.http1_max_buffer_size,
+    };
+    let control = match raw.server.control {
+        None => None,
+        Some(control) => {
+            if !cfg!(windows) {
+                return Err(ConfigError::Validation(
+                    "server.control is a Windows named pipe and is not available on this platform"
+                        .to_owned(),
+                ));
+            }
+            crate::control::validate_name(&control.name).map_err(ConfigError::Validation)?;
+            Some(control.name)
+        }
     };
     if raw.hosts.is_empty() {
         return Err(ConfigError::Validation(
@@ -1075,6 +1191,7 @@ pub(crate) fn validate_raw(
         listen,
         tls,
         http_limits,
+        control,
         hosts,
     })
 }
@@ -1563,6 +1680,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         listen: validated.listen,
         tls,
         http_limits: validated.http_limits,
+        control: validated.control,
         router: Arc::new(router),
         php_pools,
         upstreams,
@@ -1658,6 +1776,131 @@ mod tests {
         );
         assert!(parse_arguments(["--config"]).is_err());
         assert!(parse_arguments(["unknown"]).is_err());
+        // A control invocation is not a server invocation.
+        assert!(parse_arguments(["--config", "custom.toml", "--control", "stop"]).is_err());
+    }
+
+    #[test]
+    fn parses_control_invocations_beside_the_server_one() {
+        assert_eq!(
+            parse_invocation(["--config", "custom.toml", "--control", "stop"]).unwrap(),
+            Invocation::Control {
+                selection: ConfigSelection::File(PathBuf::from("custom.toml")),
+                command: crate::control::Command::Stop,
+            }
+        );
+        for command in crate::control::Command::ALL {
+            assert_eq!(
+                parse_invocation(["--control", command.name()]).unwrap(),
+                Invocation::Control {
+                    selection: ConfigSelection::BuiltIn,
+                    command,
+                }
+            );
+        }
+        assert_eq!(
+            parse_invocation(Vec::<OsString>::new()).unwrap(),
+            Invocation::Serve(ConfigSelection::BuiltIn)
+        );
+        assert!(parse_invocation(["--control"]).is_err());
+        assert!(parse_invocation(["--control", "restart"]).is_err());
+        assert!(parse_invocation(["--control", "stop", "extra"]).is_err());
+    }
+
+    #[test]
+    fn reads_the_control_endpoint_without_compiling_the_configuration() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "hamster-control-endpoint-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let temporary = Scratch(directory);
+        let path = temporary.0.join("hamster.toml");
+        // A certificate path that cannot load: the client must still be able to
+        // ask the running server to reload, which is the whole point.
+        fs::write(
+            &path,
+            "[server]
+listen = \"127.0.0.1:0\"
+
+[server.control]
+name = \"edge\"
+
+             [[server.tls.certificates]]
+cert = \"missing.pem\"
+key = \"missing.key\"
+             names = [\"localhost\"]
+
+[[hosts]]
+name = \"localhost\"
+locations = []
+",
+        )
+        .unwrap();
+        let selection = ConfigSelection::File(path);
+        assert!(load(selection.clone()).is_err());
+        assert_eq!(
+            control_endpoint(&selection).unwrap(),
+            Some("edge".to_owned())
+        );
+        assert_eq!(control_endpoint(&ConfigSelection::BuiltIn).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_an_unusable_control_endpoint_name() {
+        let base = "[server]
+listen = \"127.0.0.1:8080\"
+
+[[hosts]]
+name = \"localhost\"
+                    locations = [{ path = \"/\", handler = \"not_found\" }]
+
+[server.control]
+";
+        for name in ["", "a b", "pipe/name", "x!"] {
+            let source = format!(
+                "{base}name = \"{name}\"
+"
+            );
+            assert!(
+                matches!(
+                    compile_str(&source, Path::new(".")),
+                    Err(ConfigError::Validation(_))
+                ),
+                "{name}"
+            );
+        }
+        // An unknown key under [server.control] is a configuration error.
+        assert!(matches!(
+            compile_str(
+                &format!(
+                    "{base}name = \"edge\"
+path = \"ignored\"
+"
+                ),
+                Path::new(".")
+            ),
+            Err(ConfigError::Parse { .. })
+        ));
+        let runtime = compile_str(
+            &format!(
+                "{base}name = \"edge\"
+"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(runtime.control_name(), Some("edge"));
     }
 
     #[test]

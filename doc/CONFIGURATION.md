@@ -198,10 +198,36 @@ path. Key contents never appear in a diagnostic. A file holding only a leaf
 whose issuer is not included starts with a printed note, because only clients
 know which issuers they trust; startup also prints each certificate's expiry
 date. Configured certificate/key files can later be reloaded transactionally
-with Ctrl+Break in an attached Windows console; listeners, names and other
-configuration do not reload. TLS 1.2 and 1.3 use rustls's defaults with the
-aws-lc-rs provider, and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md`
-and `doc/TLS_CERTIFICATE_RELOAD.md` for the full semantics.
+with Ctrl+Break in an attached Windows console, or with the control endpoint
+below on a server that has none; listeners, names and other configuration do
+not reload. TLS 1.2 and 1.3 use rustls's defaults with the aws-lc-rs provider,
+and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md` and
+`doc/TLS_CERTIFICATE_RELOAD.md` for the full semantics.
+
+An optional local control endpoint gives a server with no console the graceful
+stop and the certificate reload that Ctrl+C and Ctrl+Break provide in one:
+
+```toml
+[server.control]
+name = "edge"                 # ASCII letters, digits, '-', '_', '.'; 1-64 long
+```
+
+`name` is the only key, and the endpoint exists only when it is present. It is
+a Windows named pipe at `\\.\pipe\hamster-wheel-control-<name>`, so the key is
+rejected while compiling a configuration on any other platform. A name already
+in use is a startup failure rather than a shared endpoint. The pipe's DACL is
+set at creation and protected: LocalSystem and the pipe's owner, which is the
+account the server runs as, have full access and nobody else has any; remote
+clients are rejected. Anyone who can open it can stop the server.
+
+The same binary is the client, and needs the same configuration file because
+that file names the endpoint:
+`hamster-wheel --config hamster.toml --control status|ping|stop|reload-certificates`.
+The client reads only `[server.control]` and compiles nothing else, so a
+certificate that no longer loads does not stop `reload-certificates` from
+reaching the running server. The server's answer is printed verbatim and the
+exit code is 0 for `OK`, 1 for `ERR`. See `doc/WINDOWS_OPERATIONS.md` for the
+operator runbook.
 
 On Windows, the presence of any `php_worker` location also requires process
 containment to be established before worker startup. Hamster creates and fully

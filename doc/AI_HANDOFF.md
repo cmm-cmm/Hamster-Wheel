@@ -1,5 +1,80 @@
 # AI Handoff
 
+## Console-free control endpoint (2026-10-11)
+
+This pass began from a clean `dev` checkout at `f5eaa76` (`origin/dev`) and
+closes the gap the previous section named: console-free graceful stop and
+certificate reload were **NOT IMPLEMENTED**, so a Service or supervisor could
+only `TerminateProcess` and could not rotate a certificate at all. Both now
+exist. Nothing was committed, tagged, pushed, merged or released; `ssl/`,
+`www/` and the research backlog were left alone.
+
+FACT: `[server.control] name = "..."` adds a Windows named pipe at
+`\\.\pipe\hamster-wheel-control-<name>`, created before the server serves so a
+name already in use is a startup failure. `src/control.rs` answers four
+commands — `ping`, `status`, `stop`, `reload-certificates` — one request per
+connection, as a status line, `key=value` details and a blank line. `stop`
+reaches the same graceful path as Ctrl+C and is answered before shutdown
+begins; `reload-certificates` calls the same transactional reload as
+Ctrl+Break and reports `active_set=previous` when the replacement set is
+refused. The same binary is the client:
+`hamster-wheel --config PATH --control COMMAND`, exit 0 for `OK` and 1 for
+`ERR`. `[server.control]` is rejected while compiling a configuration on any
+non-Windows target.
+
+FACT: the pipe's DACL is set at creation and protected,
+`D:P(A;;GA;;;SY)(A;;GA;;;OW)`: LocalSystem and the pipe's owner only. Remote
+clients are rejected and the first instance claims the name. The endpoint does
+not exist unless configured.
+
+FACT (`tests/windows_control.rs`, real `DETACHED_PROCESS` servers, five
+ignored rehearsals plus one unignored regression, all passing): `status`
+reported the live PID, listener and `ready=1`; `stop` exited the server with
+code 0 and its PHP worker exited with it; a reload adopted a replacement leaf
+that a verified handshake then presented, and a mismatched key was refused
+with the adopted leaf still serving; a thread impersonating a token restricted
+to `Everyone` was refused `ERROR_ACCESS_DENIED` while the owner kept access; a
+client that connected and sent nothing was released by the five-second
+exchange deadline, was never answered, and did not delay a later `stop`; an
+unknown request was answered `ERR unknown_command`; a second server naming an
+endpoint already in use exited 1 at startup.
+
+Two defects were found by testing and fixed. Wiring the control stop into the
+shutdown future first closed the trigger channel when no endpoint was
+configured, so `recv` returned immediately and **a server without
+`[server.control]` stopped the instant it began serving**; the unignored
+`windows_headless` TLS test caught it, the sender is now held for the lifetime
+of the wait, and `a_server_without_a_control_endpoint_keeps_serving` guards it.
+The control client also compiled the whole configuration, so a certificate that
+no longer loaded made `reload-certificates` unusable exactly when it was
+needed; the client now reads only `[server.control]`.
+
+Herdr (`herdrdev/herdr`) was read for its local control surface. Adopted: a
+local socket rather than a TCP port, a named pipe on Windows, the DACL set at
+pipe creation with that SDDL, and the endpoint name living in configuration.
+Deliberately not adopted: newline-delimited JSON with request ids and event
+subscriptions, which earn their cost across dozens of methods and long-lived
+subscribers but would add a JSON dependency and correlation machinery to four
+commands; and a client-started background server, because Hamster's lifetime
+belongs to its supervisor and its Windows Job Object containment.
+
+Windows gates at this checkout: format, strict MSVC Clippy, the default suite
+(188 library, 32 configuration, 7 routing, 7 static and both unignored process
+tests), the control rehearsal (5), headless (2), containment (4), TLS reload
+process (3), MSVC release build and the profiling bench link all passed. No
+benchmark was run: the endpoint adds no request-path work, and nothing on the
+hot path changed.
+
+Still **NOT VERIFIED**: anything under a real Windows Service account,
+cross-account denial with a second real user (the restricted-token check
+exercises the DACL, not a second login), and native Linux. The Linux
+cross-target check still cannot run here, because `aws-lc-sys` needs
+`x86_64-linux-gnu-gcc`; the non-Windows control path is therefore written to
+compile but is **not compile-checked**. An owner decision remains: whether a
+Service wrapper should call `--control stop` as its stop command, which the
+runbook now recommends, and whether `status` should ever carry more than the
+operational fields it has.
+
 ## Windows headless process rehearsal (2026-10-04)
 
 Current `dev` checkout was clean at `0b7fbbe` before this pass. Added the

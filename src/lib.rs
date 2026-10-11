@@ -8,6 +8,7 @@ pub mod body_budget;
 pub mod config;
 #[cfg(feature = "profiling")]
 pub mod config_profile;
+pub mod control;
 pub mod fastcgi;
 #[cfg(feature = "profiling")]
 pub mod fastcgi_profile;
