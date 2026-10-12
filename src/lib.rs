@@ -32,6 +32,7 @@ mod static_files;
 mod test_ports;
 pub mod tls;
 mod transport;
+pub mod validate;
 #[cfg(windows)]
 mod windows_child_containment;
 #[cfg(feature = "profiling")]

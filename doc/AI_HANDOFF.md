@@ -1,6 +1,63 @@
 # AI Handoff
 
-## Current: health, readiness and metrics, second 0.8 slice (2026-10-12)
+## Current: the validate CLI operation, third 0.8 slice (2026-10-12)
+
+The two slices below were committed and pushed as `e91fd65`
+(`observability: add a structured access log, health, readiness and metrics`)
+at the owner's instruction; this slice is uncommitted work on top of it. The
+0.8 scope asks for "CLI operations for validate, serve, status, reload and
+stop": serve exists, status and stop are the control endpoint, certificate
+reload exists, and this adds validate. A general configuration reload is still
+missing and is the last large 0.8 item.
+
+FACT: `hamster-wheel --config PATH --validate` compiles the file exactly as a
+start would — resolving roots, loading certificates, validating pool, proxy and
+FastCGI settings — then prints `key=value` lines describing the resources it
+would serve and exits 0; any error goes to stderr with exit 1. It starts
+nothing: `config::load` never calls `start_workers`, so no worker is spawned,
+no listener is bound, no log file is created and no Job Object is established.
+That is the operation's entire value, and it is what makes it safe to run on
+the machine that is currently serving.
+
+FACT: the report's last line is
+`not_checked=listener_bind,log_write,worker_startup,backend_reachability`. A
+report that looked complete would invite the conclusion that a validated
+configuration is a working deployment, which it is not: an address can still
+be in use, a log path unwritable, a worker unable to reach READY, and an
+external FastCGI or proxy endpoint is never probed. A unit test pins that line
+in place.
+
+FACT: the report lists resources rather than the route table, deliberately.
+`HostRouter` answers routing questions and does not enumerate itself;
+describing the routes here would be a second description to keep true. Pool,
+upstream and FastCGI labels are host+path, so they already say where each
+resource is mounted. Proxy upstreams print the address resolved at compile
+time rather than the name in the file, which is the address a running server
+would actually use.
+
+FACT (`tests/validate_cli.rs`, through the shipped binary): a valid file
+reports its listener and limits with nothing on stderr; **the configured
+address is still free afterwards**, which is the operation's claim stated as a
+test that binds it; an invalid handler exits 1 with the offending word on
+stderr and no `configuration=ok` on stdout; a certificate that does not exist
+fails validation, which proves certificates really are loaded; the built-in
+configuration validates; `--validate` beside `--control` is a usage error. One
+ignored test (needs `php/8.5/php.exe`) validates a four-worker pool, requires
+`php_pool=localhost/ workers=4` in the report, requires no "ready after" line,
+and checks the port is still free. The checked-in `hamster.toml` validates in
+0.04 s through the release binary.
+
+Gates at this working tree: `cargo fmt --all -- --check`; strict MSVC Clippy
+`--all-targets --all-features -D warnings`; the default suite 290 tests (278
+at `e91fd65`, plus 5 report unit tests, 1 CLI parsing test and 6 integration
+tests, with 1 more ignored); the ignored Windows suites unchanged
+(`windows_control` 14/14, `windows_headless` 2/2, `windows_containment` 4/4,
+`tls_reload_process` 3/3); the non-Windows cfg-flip compile check; MSVC release
+build; `cargo bench --no-run --features profiling` linking all 11 benches. No
+benchmark: this adds no request-path work at all, and the request path is
+untouched.
+
+## Health, readiness and metrics, second 0.8 slice (2026-10-12, in e91fd65)
 
 Owner chose to continue 0.8 after the access log. Nothing was committed,
 tagged, pushed, merged or released. The previous section's heading was
@@ -107,7 +164,7 @@ Still missing from 0.8: transactional configuration reload with generation
 identity, lifecycle records of their own, a `validate` CLI operation, and log
 rotation inside Hamster. Linux remains unverified.
 
-## Structured access log, first 0.8 slice (2026-10-12)
+## Structured access log, first 0.8 slice (2026-10-12, in e91fd65)
 
 Owner asked for a release assessment, accepted that a public release is not
 ready, and chose to start the 0.8 scope with structured access/error logging

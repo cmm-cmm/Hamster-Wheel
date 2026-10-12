@@ -628,6 +628,9 @@ where
         Invocation::Control { .. } => Err(ConfigError::Arguments(
             "--control is not a server invocation".to_owned(),
         )),
+        Invocation::Validate(_) => Err(ConfigError::Arguments(
+            "--validate is not a server invocation".to_owned(),
+        )),
     }
 }
 
@@ -635,6 +638,9 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Serve(ConfigSelection),
+    /// Compile the configuration, report what it would serve, and start
+    /// nothing. See `src/validate.rs`.
+    Validate(ConfigSelection),
     /// Send one command to the control endpoint the configuration names.
     Control {
         selection: ConfigSelection,
@@ -642,7 +648,7 @@ pub enum Invocation {
     },
 }
 
-const USAGE: &str = "usage: hamster-wheel [--config PATH] [--control COMMAND]";
+const USAGE: &str = "usage: hamster-wheel [--config PATH] [--control COMMAND | --validate]";
 
 pub fn parse_invocation<I, S>(arguments: I) -> Result<Invocation, ConfigError>
 where
@@ -681,6 +687,7 @@ where
         [flag] if flag == "--control" => Err(ConfigError::Arguments(
             "--control requires a command".to_owned(),
         )),
+        [flag] if flag == "--validate" => Ok(Invocation::Validate(selection)),
         _ => Err(ConfigError::Arguments(USAGE.to_owned())),
     }
 }
@@ -1933,6 +1940,22 @@ mod tests {
         assert!(parse_invocation(["--control"]).is_err());
         assert!(parse_invocation(["--control", "restart"]).is_err());
         assert!(parse_invocation(["--control", "stop", "extra"]).is_err());
+    }
+
+    #[test]
+    fn parses_validate_invocations_and_keeps_them_out_of_serving() {
+        assert_eq!(
+            parse_invocation(["--config", "custom.toml", "--validate"]).unwrap(),
+            Invocation::Validate(ConfigSelection::File(PathBuf::from("custom.toml")))
+        );
+        assert_eq!(
+            parse_invocation(["--validate"]).unwrap(),
+            Invocation::Validate(ConfigSelection::BuiltIn)
+        );
+        // Validation is not a server invocation, and not a control one.
+        assert!(parse_arguments(["--config", "custom.toml", "--validate"]).is_err());
+        assert!(parse_invocation(["--validate", "extra"]).is_err());
+        assert!(parse_invocation(["--validate", "--control", "stop"]).is_err());
     }
 
     #[test]

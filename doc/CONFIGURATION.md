@@ -265,6 +265,20 @@ in the log as a `log_dropped` record and shown by the control endpoint's
 `status` as `access_log=<target> queued= written= dropped= failed=`. See
 `doc/ACCESS_LOG_0_8.md` for the record fields and the complete behaviour.
 
+A configuration file can be checked without running it:
+
+```powershell
+hamster-wheel.exe --config D:\site\hamster.toml --validate
+```
+
+This compiles the file exactly as a server start would — resolving roots,
+loading certificates, validating pool, proxy and FastCGI settings — then prints
+the resources it would serve as `key=value` lines and exits 0. Any error is
+reported on stderr with exit 1. It starts nothing: no listener is bound, no PHP
+worker is spawned, no log file is created, so it is safe to run on the machine
+that is currently serving. The last line names what it did **not** check:
+`not_checked=listener_bind,log_write,worker_startup,backend_reachability`.
+
 An optional administrative listener serves health, readiness and metrics. It
 is off unless the section is present, and it is a separate socket that never
 receives the application router, so it cannot occupy an application route:

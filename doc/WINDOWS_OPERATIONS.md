@@ -28,6 +28,26 @@ paths, and certificate paths in an explicit config resolve beside that config
 file. Protect the config, private keys, application tree and writable data with
 normal Windows file permissions; do not place secrets in the repository.
 
+## Checking a Configuration Before Using It
+
+```powershell
+.\hamster-wheel.exe --config D:\site\hamster.toml --validate
+```
+
+Compiles the file as a start would and prints what it would serve, without
+binding a listener, spawning a worker or creating a log file, so it is safe
+while the current server is running. Exit 0 means the file compiles; exit 1
+reports the first error on stderr. Run it before every controlled restart: a
+configuration that fails to compile fails startup, and a server stopped by
+`--control stop` with a broken replacement file on disk will not come back.
+
+What it cannot tell you is on its last line:
+`not_checked=listener_bind,log_write,worker_startup,backend_reachability`. An
+address can still be in use, a log path can still be unwritable, a worker can
+still fail to reach READY, and an external FastCGI or proxy endpoint is never
+probed. Check those after starting, with the startup lines, `--control status`
+and a safe application route.
+
 ## Backend Ownership and Readiness
 
 Persistent `php_worker` pools are Hamster-owned. All initial workers must reach

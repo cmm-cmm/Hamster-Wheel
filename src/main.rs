@@ -1,6 +1,6 @@
 use std::{error::Error, io::Write, process::ExitCode};
 
-use hamster_wheel::{config, control, server};
+use hamster_wheel::{config, control, server, validate};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,7 +23,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         config::Invocation::Control { selection, command } => control(selection, command).await,
+        config::Invocation::Validate(selection) => validate(selection),
     }
+}
+
+/// Compiles a configuration and reports what it would serve, without
+/// starting a listener, a worker or a log file.
+///
+/// The report goes to stdout so it can be piped; a configuration error goes to
+/// stderr through `main` with exit code 1, which is what a deployment script
+/// checks.
+fn validate(selection: config::ConfigSelection) -> Result<(), Box<dyn Error>> {
+    let runtime = config::load(selection)?;
+    let report = validate::report(&runtime);
+    // Not `println!`: a closed stdout must not turn a successful validation
+    // into a panic and exit code 101. See `src/output.rs`.
+    let _ = write!(std::io::stdout().lock(), "{report}");
+    Ok(())
 }
 
 /// Sends one command to a running server's control endpoint and prints its

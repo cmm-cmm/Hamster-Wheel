@@ -9,7 +9,7 @@ document in `doc/` (`ROUTING.md`, `CONFIGURATION.md`, `PHP_WORKER.md`, `BENCHMAR
 `doc/WORKER_LIFECYCLE_0_3.md`.
 
 `src/` holds `main.rs`, `lib.rs`, and the runtime modules `server`, `config`, `router`, `handler`,
-`static_files`, `php_worker`, `php_protocol`, `proxy`, `tls`, `access_log`, `metrics`, `admin`, `fastcgi` (FastCGI to operator-started
+`static_files`, `php_worker`, `php_protocol`, `proxy`, `tls`, `access_log`, `metrics`, `admin`, `validate`, `fastcgi` (FastCGI to operator-started
 `php-cgi`, see `doc/FASTCGI_V1.md`) and their helpers. The `*_profile.rs` modules plus `profiling.rs` are
 `#[cfg(feature = "profiling")]` measurement code and must not affect the default build. Integration
 tests live in `tests/`, unit tests beside their modules, Cargo benches in `benches/`, PowerShell load
@@ -25,6 +25,8 @@ integration tests can run.
 
 - `cargo run` starts the development server with the built-in config (`127.0.0.1:8080`).
 - `cargo run -- --config hamster.toml` starts it from an explicit configuration file.
+- `cargo run -- --config hamster.toml --validate` compiles that file, prints the
+  resources it would serve, and starts nothing; exit 1 on any error.
 - `cargo build --release --target x86_64-pc-windows-msvc` creates the only build suitable for
   performance comparisons.
 - `cargo test` runs unit and integration tests; `cargo test -- --ignored` adds the PHP worker tests.
