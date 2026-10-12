@@ -95,6 +95,35 @@ struct RawServer {
     #[serde(default = "default_http1_max_buffer_size")]
     http1_max_buffer_size: usize,
     control: Option<RawControl>,
+    access_log: Option<RawAccessLog>,
+    admin: Option<RawAdmin>,
+}
+
+/// The administrative listener. Absent means health, readiness and metrics are
+/// not served at all, which is the default.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAdmin {
+    listen: String,
+}
+
+/// Per-request logging. Absent means no queue, no writer and no per-request
+/// work: a server that was not asked to log does not pay for logging.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAccessLog {
+    /// Log file, resolved beside this configuration file. Absent means stdout.
+    path: Option<String>,
+    /// Query strings are omitted by default because they carry credentials in
+    /// real deployments. See `src/access_log.rs` for what is replaced.
+    #[serde(default)]
+    include_query: bool,
+    #[serde(default = "default_access_log_queue_capacity")]
+    queue_capacity: usize,
+}
+
+const fn default_access_log_queue_capacity() -> usize {
+    crate::access_log::DEFAULT_QUEUE_CAPACITY
 }
 
 /// The local control endpoint. Absent means no endpoint exists at all.
@@ -260,6 +289,8 @@ pub struct RuntimeConfig {
     tls: Option<Arc<TlsListener>>,
     http_limits: HttpLimits,
     control: Option<String>,
+    access_log: Option<crate::access_log::Settings>,
+    admin: Option<crate::admin::Settings>,
     router: Arc<HostRouter>,
     php_pools: Vec<Arc<PhpWorkerPool>>,
     upstreams: Vec<Arc<Upstream>>,
@@ -434,6 +465,16 @@ impl RuntimeConfig {
     /// The configured control endpoint name, when an operator asked for one.
     pub fn control_name(&self) -> Option<&str> {
         self.control.as_deref()
+    }
+
+    /// The compiled per-request log settings, when logging was configured.
+    pub fn access_log(&self) -> Option<&crate::access_log::Settings> {
+        self.access_log.as_ref()
+    }
+
+    /// The administrative listener's settings, when one was configured.
+    pub fn admin(&self) -> Option<crate::admin::Settings> {
+        self.admin
     }
 
     /// The HTTPS listener, with its certificates already loaded and checked.
@@ -690,6 +731,8 @@ fn builtin_raw_config() -> RawConfig {
     RawConfig {
         server: RawServer {
             control: None,
+            access_log: None,
+            admin: None,
             listen: Some(DEFAULT_LISTEN.to_owned()),
             tls: None,
             max_connections: default_max_connections(),
@@ -755,6 +798,8 @@ pub(crate) struct ValidatedConfig {
     tls: Option<TlsSource>,
     http_limits: HttpLimits,
     control: Option<String>,
+    access_log: Option<crate::access_log::Settings>,
+    admin: Option<crate::admin::Settings>,
     hosts: Vec<ValidatedHost>,
 }
 
@@ -898,6 +943,14 @@ pub(crate) fn validate_raw(
             crate::control::validate_name(&control.name).map_err(ConfigError::Validation)?;
             Some(control.name)
         }
+    };
+    let access_log = match raw.server.access_log {
+        None => None,
+        Some(settings) => Some(validate_access_log(settings, base_directory)?),
+    };
+    let admin = match raw.server.admin {
+        None => None,
+        Some(settings) => Some(validate_admin(settings, listen, tls.as_ref())?),
     };
     if raw.hosts.is_empty() {
         return Err(ConfigError::Validation(
@@ -1192,6 +1245,8 @@ pub(crate) fn validate_raw(
         tls,
         http_limits,
         control,
+        access_log,
+        admin,
         hosts,
     })
 }
@@ -1681,11 +1736,84 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         tls,
         http_limits: validated.http_limits,
         control: validated.control,
+        access_log: validated.access_log,
+        admin: validated.admin,
         router: Arc::new(router),
         php_pools,
         upstreams,
         fastcgi_backends,
     })
+}
+
+/// Validates `[server.admin]`.
+///
+/// The address is bound in `server::run`, before workers start, so a clash
+/// with another process fails startup. What is checked here is a clash an
+/// operator can only have meant as a mistake: naming the address an
+/// application listener already uses, which would make the administrative
+/// surface and the application fight for the same socket.
+fn validate_admin(
+    raw: RawAdmin,
+    listen: Option<SocketAddr>,
+    tls: Option<&TlsSource>,
+) -> Result<crate::admin::Settings, ConfigError> {
+    let address: SocketAddr = raw.listen.parse().map_err(|_| {
+        ConfigError::Validation(format!(
+            "server.admin.listen must be host:port, got {}",
+            raw.listen
+        ))
+    })?;
+    // Port 0 asks the operating system for a free port, so two port-0
+    // addresses are not the same socket and must not be read as a clash.
+    let clashes = address.port() != 0
+        && (Some(address) == listen || tls.map(|tls| tls.listen) == Some(address));
+    if clashes {
+        return Err(ConfigError::Validation(format!(
+            "server.admin.listen {address} is already an application listener"
+        )));
+    }
+    Ok(crate::admin::Settings::new(address))
+}
+
+/// Validates `[server.access_log]` without creating or opening anything.
+///
+/// The file is opened once at startup by `server::run`, which fails closed on
+/// a path that cannot be written. Validation here is about values a
+/// configuration can get wrong: an unusable queue depth, or a path that names
+/// a directory that is already there.
+fn validate_access_log(
+    raw: RawAccessLog,
+    base_directory: &Path,
+) -> Result<crate::access_log::Settings, ConfigError> {
+    use crate::access_log::{MAX_QUEUE_CAPACITY, MIN_QUEUE_CAPACITY};
+    if !(MIN_QUEUE_CAPACITY..=MAX_QUEUE_CAPACITY).contains(&raw.queue_capacity) {
+        return Err(ConfigError::Validation(format!(
+            "server.access_log.queue_capacity must be between {MIN_QUEUE_CAPACITY} and {MAX_QUEUE_CAPACITY}"
+        )));
+    }
+    let path = match raw.path {
+        None => None,
+        Some(path) if path.trim().is_empty() => {
+            return Err(ConfigError::Validation(
+                "server.access_log.path must not be empty; omit it to log to stdout".to_owned(),
+            ));
+        }
+        Some(path) => {
+            let resolved = resolve_path(base_directory, PathBuf::from(path));
+            if resolved.is_dir() {
+                return Err(ConfigError::Validation(format!(
+                    "server.access_log.path {} is a directory",
+                    resolved.display()
+                )));
+            }
+            Some(resolved)
+        }
+    };
+    Ok(crate::access_log::Settings::new(
+        path,
+        raw.include_query,
+        raw.queue_capacity,
+    ))
 }
 
 fn canonical_directory(path: &Path, field: &str) -> Result<PathBuf, ConfigError> {
@@ -1936,6 +2064,160 @@ path = \"ignored\"
         assert!(matches!(
             compile_str(&port, Path::new(".")),
             Err(ConfigError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn compiles_an_admin_listener_and_rejects_one_that_takes_an_application_address() {
+        let hosts = "
+
+[[hosts]]
+name = \"localhost\"
+locations = [{ path = \"/\", handler = \"not_found\" }]
+";
+
+        let without = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:8080\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(without.admin().is_none(), "admin is off unless configured");
+
+        let configured = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.admin]
+listen = \"127.0.0.1:9090\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(
+            configured.admin().map(|admin| admin.listen()),
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+
+        // The same socket as the application listener is a mistake, not a
+        // configuration: it would make the two fight for one address.
+        assert!(matches!(
+            compile_str(
+                &format!(
+                    "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.admin]
+listen = \"127.0.0.1:8080\"{hosts}"
+                ),
+                Path::new(".")
+            ),
+            Err(ConfigError::Validation(_))
+        ));
+        // But port 0 asks for a free port, so two of them are two sockets.
+        let both_ephemeral = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:0\"
+
+[server.admin]
+listen = \"127.0.0.1:0\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(both_ephemeral.admin().is_some());
+
+        assert!(matches!(
+            compile_str(
+                &format!(
+                    "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.admin]
+listen = \"not-an-address\"{hosts}"
+                ),
+                Path::new(".")
+            ),
+            Err(ConfigError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn compiles_an_access_log_and_rejects_values_that_cannot_work() {
+        let base = "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.access_log]
+";
+        let hosts = "
+
+[[hosts]]
+name = \"localhost\"
+locations = [{ path = \"/\", handler = \"not_found\" }]
+";
+
+        // Absent section: no settings at all, so no queue and no writer.
+        let without = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:8080\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(without.access_log().is_none());
+
+        // Present with no path: stdout, query omitted, default queue.
+        let stdout = compile_str(&format!("{base}{hosts}"), Path::new(".")).unwrap();
+        let settings = stdout.access_log().expect("the section was present");
+        assert!(settings.path().is_none());
+        assert!(!settings.include_query());
+        assert_eq!(
+            settings.queue_capacity(),
+            crate::access_log::DEFAULT_QUEUE_CAPACITY
+        );
+        assert_eq!(settings.target_description(), "stdout");
+
+        // A relative path resolves beside the configuration file.
+        let relative = compile_str(
+            &format!("{base}path = \"logs/access.jsonl\"{hosts}"),
+            Path::new("D:/deployment"),
+        )
+        .unwrap();
+        assert_eq!(
+            relative.access_log().unwrap().path(),
+            Some(
+                Path::new("D:/deployment")
+                    .join("logs/access.jsonl")
+                    .as_path()
+            )
+        );
+
+        for rejected in [
+            "queue_capacity = 0",
+            "queue_capacity = 8",
+            "queue_capacity = 65537",
+            "path = \"\"",
+            // A directory is never a log file, and the error belongs in
+            // validation rather than in the first write.
+            "path = \".\"",
+        ] {
+            assert!(
+                matches!(
+                    compile_str(&format!("{base}{rejected}{hosts}"), Path::new(".")),
+                    Err(ConfigError::Validation(_))
+                ),
+                "{rejected} was accepted"
+            );
+        }
+        // An unknown key in the section is still a configuration error.
+        assert!(matches!(
+            compile_str(&format!("{base}rotate = true{hosts}"), Path::new(".")),
+            Err(ConfigError::Parse { .. })
         ));
     }
 

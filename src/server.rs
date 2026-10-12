@@ -18,8 +18,11 @@ use tokio::{
 };
 
 use crate::{
+    access_log::{AccessLog, MaybeObserved},
+    admin::{AdminState, Settings as AdminSettings},
     config::{HttpLimits, PhpPoolsError, RuntimeConfig},
     lingering_close::{CloseSignals, LingeringClose},
+    metrics::ServerMetrics,
     router::HostRouter,
     tls::{CertificateScope, TlsListener},
     transport::{ConnectionInfo, Scheme, TransportInfo},
@@ -88,6 +91,39 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     if !config.php_workers().is_empty() {
         crate::windows_child_containment::establish().map_err(ServerError::ChildContainment)?;
     }
+
+    // Started before any worker or listener: a log target that cannot be
+    // written is a startup failure, not something an operator discovers under
+    // load. Absent configuration means no queue and no writer task at all.
+    let (access_log, log_writer) = match config.access_log() {
+        None => (None, None),
+        Some(settings) => {
+            let (log, writer) = crate::access_log::start(settings)?;
+            outln!(
+                "Access log writing to {} (queue {}, query {})",
+                settings.target_description(),
+                settings.queue_capacity(),
+                if settings.include_query() {
+                    "included"
+                } else {
+                    "omitted"
+                }
+            );
+            (Some(log), Some(writer))
+        }
+    };
+
+    // Counters exist only when something reads them, so a server with no
+    // administrative listener pays nothing per request.
+    let (metrics, admin_listener) = match config.admin() {
+        None => (None, None),
+        Some(settings) => {
+            let listener = crate::admin::bind(settings)
+                .await
+                .map_err(|error| admin_bind_error(settings, error))?;
+            (Some(ServerMetrics::new()), Some((settings, listener)))
+        }
+    };
 
     let workers = match config.start_workers().await {
         Ok(workers) => workers,
@@ -164,10 +200,9 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     // The endpoint is bound before serving: a name already in use is a startup
     // failure, not something discovered when an operator first needs it.
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-    // Read by the control endpoint's `status`. The endpoint keeps answering
-    // while connections drain, so a health poll during a stop must be able to
-    // see that the stop is deliberate.
-    #[cfg(windows)]
+    // Read by the control endpoint's `status` and by the administrative
+    // `/ready`. Both keep answering while connections drain, so a health poll
+    // during a stop must be able to see that the stop is deliberate.
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Annotated because the only assignment is Windows-only; without this the
     // type could not be inferred on other targets.
@@ -185,6 +220,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
                         config,
                         started,
                         Arc::clone(&draining),
+                        access_log.clone(),
                         stop_tx.clone(),
                         shutdown_rx,
                     )),
@@ -193,6 +229,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             Err(error) => return Err(stop_workers_after(&config, error).await),
         }
     }
+    let drain_flag = Arc::clone(&draining);
     let shutdown = async move {
         // The sender is held here for the lifetime of the wait. Dropping it
         // would close the channel, `recv` would return `None` at once, and a
@@ -203,10 +240,9 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             () = console_shutdown => {}
             _ = stop_rx.recv() => outln!("Control endpoint requested shutdown"),
         }
-        // Set before the graceful drain starts, so the first `status` that can
-        // observe a drain already reports it.
-        #[cfg(windows)]
-        draining.store(true, std::sync::atomic::Ordering::Release);
+        // Set before the graceful drain starts, so the first `status` or
+        // `/ready` that can observe a drain already reports it.
+        drain_flag.store(true, std::sync::atomic::Ordering::Release);
     };
     let mut reload_task = reload.map(tokio::spawn);
     // Printed once at startup, beside the other readiness lines. A refused
@@ -245,7 +281,54 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     }
 
     let router = config.router_arc();
-    let serve_result = serve_listeners(listeners, router, config.http_limits(), shutdown).await;
+    // Started after the application listeners are bound and reported, and
+    // stopped after they drain: a load balancer must be able to read `/ready`
+    // for the whole of a graceful stop.
+    let (admin_shutdown, admin_task) = match admin_listener {
+        None => (None, None),
+        Some((settings, listener)) => {
+            outln!(
+                "Admin listener on http://{} serving /health, /ready and /metrics",
+                settings.listen()
+            );
+            if settings.is_public() {
+                errln!(
+                    "Admin listener {} is not a loopback address: health, readiness and metrics are reachable from the network, with no TLS and no authentication",
+                    settings.listen()
+                );
+            }
+            let state = Arc::new(AdminState {
+                config: Arc::clone(&config),
+                started: admin_started(),
+                draining: Arc::clone(&draining),
+                access_log: access_log.clone(),
+                metrics: metrics
+                    .clone()
+                    .expect("counters exist with an admin listener"),
+            });
+            let (stop_tx, stop_rx) = watch::channel(false);
+            (
+                Some(stop_tx),
+                Some(tokio::spawn(crate::admin::serve(listener, state, stop_rx))),
+            )
+        }
+    };
+
+    let serve_result = serve_listeners(
+        listeners,
+        router,
+        config.http_limits(),
+        access_log.clone(),
+        metrics.clone(),
+        shutdown,
+    )
+    .await;
+    if let Some(stop_tx) = admin_shutdown {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(task) = admin_task {
+        let _ = task.await;
+    }
     if let Some(task) = reload_task.take() {
         task.abort();
         let _ = task.await;
@@ -255,6 +338,14 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     if let Some((shutdown_tx, task)) = control_task.take() {
         let _ = shutdown_tx.send(());
         let _ = task.await;
+    }
+    // Every connection task has ended, so no further record can be produced.
+    // Dropping the last sink closes the queue, which is what ends the writer;
+    // waiting for it is what keeps the last requests served out of a lost
+    // tail.
+    drop(access_log);
+    if let Some(writer) = log_writer {
+        writer.finish().await;
     }
     // Every downstream connection, and therefore every active proxy exchange,
     // has ended. Close what remains idle instead of leaving it to process exit.
@@ -310,6 +401,49 @@ impl Listener {
     }
 }
 
+/// Keeps the active-connection gauge honest however a task ends.
+struct ConnectionGuard(Arc<ServerMetrics>);
+
+impl ConnectionGuard {
+    fn new(metrics: Arc<ServerMetrics>) -> Self {
+        metrics.connection_opened();
+        Self(metrics)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
+fn admin_started() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+fn admin_bind_error(settings: AdminSettings, error: io::Error) -> ServerError {
+    ServerError::Io(io::Error::new(
+        error.kind(),
+        format!(
+            "cannot bind the admin listener {}: {error}",
+            settings.listen()
+        ),
+    ))
+}
+
+/// What every connection served by one accept loop shares.
+///
+/// These three are cloned per connection and never change for its lifetime.
+/// Carrying them as one value keeps the serving functions' signatures about
+/// the connection rather than about the server's wiring.
+#[derive(Clone)]
+struct ServeContext {
+    router: Arc<HostRouter>,
+    http_limits: HttpLimits,
+    access_log: Option<Arc<AccessLog>>,
+    metrics: Option<Arc<ServerMetrics>>,
+}
+
 /// Serves one cleartext listener. Kept as the entry point every existing
 /// integration test and probe uses.
 pub async fn serve_with_router<F>(
@@ -325,6 +459,8 @@ where
         vec![Listener::cleartext(listener)],
         router,
         http_limits,
+        None,
+        None,
         shutdown,
     )
     .await
@@ -340,6 +476,8 @@ pub async fn serve_listeners<F>(
     listeners: Vec<Listener>,
     router: Arc<HostRouter>,
     http_limits: HttpLimits,
+    access_log: Option<Arc<AccessLog>>,
+    metrics: Option<Arc<ServerMetrics>>,
     shutdown: F,
 ) -> io::Result<()>
 where
@@ -347,6 +485,12 @@ where
 {
     tokio::pin!(shutdown);
 
+    let context = ServeContext {
+        router,
+        http_limits,
+        access_log,
+        metrics,
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut next_listener = 0;
@@ -366,19 +510,11 @@ where
                 let transport = TransportInfo::new(peer_addr, local_addr);
                 let tls = listeners[index].tls.clone();
                 let shutdown_rx = shutdown_rx.clone();
-                let router = Arc::clone(&router);
+                let context = context.clone();
 
                 connections.spawn(async move {
-                    serve_connection(
-                        stream,
-                        transport,
-                        tls,
-                        accepted_at,
-                        router,
-                        http_limits,
-                        shutdown_rx,
-                    )
-                    .await;
+                    serve_connection(stream, transport, tls, accepted_at, context, shutdown_rx)
+                        .await;
                 });
             }
             join_result = connections.join_next(), if !connections.is_empty() => {
@@ -428,10 +564,14 @@ async fn serve_connection(
     transport: TransportInfo,
     tls: Option<Arc<TlsListener>>,
     accepted_at: Instant,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    context: ServeContext,
     shutdown: watch::Receiver<bool>,
 ) {
+    let http_limits = context.http_limits;
+    // Counted here rather than in the accept loop so the gauge follows the
+    // task that actually holds the connection, including a TLS handshake that
+    // never becomes a request.
+    let _connection = context.metrics.clone().map(ConnectionGuard::new);
     // The write deadline wraps the socket, beneath TLS. It must observe bytes
     // the kernel accepted, not plaintext rustls buffered: above TLS it would
     // count buffering as progress, and a flush or close_notify stalled on a
@@ -444,16 +584,7 @@ async fn serve_connection(
     let stream = WriteProgressTimeout::new(lingering, http_limits.write_progress_timeout());
     let Some(tls) = tls else {
         let connection = ConnectionInfo::new(transport, Scheme::Http);
-        serve_http(
-            stream,
-            connection,
-            None,
-            router,
-            http_limits,
-            close_signals,
-            shutdown,
-        )
-        .await;
+        serve_http(stream, connection, None, context, close_signals, shutdown).await;
         return;
     };
     // Boxed so that a cleartext connection's task is not sized for the TLS
@@ -464,8 +595,7 @@ async fn serve_connection(
         transport,
         tls,
         accepted_at,
-        router,
-        http_limits,
+        context,
         close_signals,
         shutdown,
     ))
@@ -478,8 +608,7 @@ async fn serve_tls(
     transport: TransportInfo,
     tls: Arc<TlsListener>,
     accepted_at: Instant,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    context: ServeContext,
     close_signals: Arc<CloseSignals>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -497,8 +626,7 @@ async fn serve_tls(
             stream,
             connection,
             Some(scope),
-            router,
-            http_limits,
+            context,
             close_signals,
             shutdown,
         )
@@ -514,13 +642,18 @@ async fn serve_http<I>(
     io: I,
     connection_info: ConnectionInfo,
     scope: Option<Arc<CertificateScope>>,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    context: ServeContext,
     close_signals: Arc<CloseSignals>,
     mut shutdown: watch::Receiver<bool>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let ServeContext {
+        router,
+        http_limits,
+        access_log,
+        metrics,
+    } = context;
     let transport = connection_info.transport();
     let request_signals = Arc::clone(&close_signals);
     let service =
@@ -530,15 +663,32 @@ async fn serve_http<I>(
             request_signals.request_declared_body(!request.body().is_end_stream());
             let router = Arc::clone(&router);
             let scope = scope.clone();
+            // Taken before the handler runs so the record measures the whole
+            // request, and so a handler cannot change what was asked for.
+            let started = std::time::Instant::now();
+            let start = access_log
+                .as_ref()
+                .map(|log| log.begin(&request, connection_info));
+            let access_log = access_log.clone();
+            let metrics = metrics.clone();
             async move {
-                router
+                let served: Result<_, std::convert::Infallible> = router
                     .serve(
                         request,
                         connection_info,
                         http_limits.body_read_timeout(),
                         scope.as_deref(),
                     )
-                    .await
+                    .await;
+                served.map(|response| {
+                    MaybeObserved::wrap(
+                        started,
+                        access_log.as_ref(),
+                        start,
+                        metrics.as_ref(),
+                        response,
+                    )
+                })
             }
         });
     let mut builder = http1::Builder::new();
@@ -592,7 +742,7 @@ async fn serve_http<I>(
     }
 }
 
-fn should_report_connection_error(error: &hyper::Error) -> bool {
+pub(crate) fn should_report_connection_error(error: &hyper::Error) -> bool {
     // These are controlled by the remote peer and are expected admission
     // outcomes. Synchronously logging every one would turn malformed traffic
     // into a stderr backpressure path.

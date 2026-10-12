@@ -568,6 +568,8 @@ async fn an_https_client_is_forwarded_with_the_scheme_its_listener_established()
         vec![Listener::tls(socket, tls)],
         router,
         limits(),
+        None,
+        None,
         async move {
             let _ = shutdown_rx.await;
         },

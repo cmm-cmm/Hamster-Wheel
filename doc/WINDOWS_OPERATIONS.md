@@ -114,6 +114,52 @@ order), so a `status` that answers at all means the initial workers reached
 READY and the sockets are bound. It does not mean the pools are healthy *now*;
 that is what the live fields are for.
 
+### Health, readiness and metrics
+
+With `[server.admin] listen = "127.0.0.1:9090"` a separate socket serves
+`/health`, `/ready` and `/metrics`. It is off by default, never shares the
+application listener, and has no TLS or authentication, so it belongs on
+loopback or on a management interface only; a non-loopback bind logs a warning
+at startup naming what became reachable.
+
+Give a load balancer `/ready`, not `/health`. `/health` answers 200 for as long
+as the process can answer, including the whole of a graceful stop, which is
+what a supervisor needs so it does not restart a server that is deliberately
+stopping. `/ready` answers 503 `draining` from the moment a stop is triggered,
+and 503 `php_pool <label> has no live worker` when a pool cannot serve at all.
+A pool below its target but still serving stays ready on purpose: pulling a
+partly healthy instance during a worker replacement storm makes an incident
+worse. Read `hamster_php_pool_workers{pool,state=...}` for that.
+
+FastCGI and proxy backends are **not** in the readiness decision, for the same
+reason the startup line does not certify them: Hamster neither owns nor probes
+them. Their counters are exposed (`hamster_fastcgi_*`, `hamster_proxy_*`) so an
+operator can build that decision outside Hamster.
+
+Scrape `/metrics` for the Prometheus text exposition. Label cardinality is
+bounded by the configuration — pool, upstream, endpoint and certificate names,
+a fixed status class, fixed duration buckets — so traffic cannot grow the
+metric set. Scrapes and health checks are not counted as application traffic.
+`--control status` reports the same readiness judgement as `ready=true` or
+`ready=false reason=...`, plus `admin=http://...`, for a server reached only
+through its pipe. `doc/OBSERVABILITY_0_8.md` has the full metric list.
+
+When a per-request log is configured, `status` also reports it:
+
+```text
+access_log=D:\site\logs\access.jsonl queued=0 written=5312 dropped=0 failed=0
+```
+
+`dropped` is the only honest answer to "is this log complete?": the queue is
+bounded and is never waited on, so a log target slower than the traffic costs
+records rather than request latency. A non-zero `dropped` means the log has
+gaps, which are also written into the log as `log_dropped` records; a non-zero
+`failed` means the target refused writes. Hamster appends and never rotates
+this file: give it to the wrapper's rotation or to an out-of-process tool, and
+remember that renaming or deleting it under a running server sends records to
+the old handle until restart. `doc/ACCESS_LOG_0_8.md` has the record format and
+what is deliberately never logged.
+
 Read health from `php_pool=<label> target= live= ready= pids=` by comparing
 `live` against `target`. `live` counts workers that exist and reached READY,
 while `ready` counts those that are READY **and idle**, so a fully healthy pool

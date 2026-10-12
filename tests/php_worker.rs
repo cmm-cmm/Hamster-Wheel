@@ -3880,6 +3880,8 @@ async fn protocol_v3_carries_the_listener_scheme_not_a_forwarding_header() {
         ],
         runtime.router_arc(),
         runtime.http_limits(),
+        None,
+        None,
         async {
             let _ = shutdown_rx.await;
         },
@@ -3990,6 +3992,8 @@ async fn laravel_sees_https_from_the_tls_listener_and_not_from_a_forged_header()
         vec![server::Listener::tls(socket, tls)],
         runtime.router_arc(),
         runtime.http_limits(),
+        None,
+        None,
         async {
             let _ = shutdown_rx.await;
         },

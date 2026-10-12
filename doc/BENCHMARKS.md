@@ -2021,3 +2021,131 @@ pair was W1/C16 (async 440, blocking 425). Blocking connect p95 was around
 This supports retaining the Windows blocking path while leaving the cause of
 cross-run host variance unresolved. No exact before/after percentage is
 claimed, and the in-process A/B is not the independent production driver.
+
+## Structured access log A/B — order-balanced paired run (2026-10-12)
+
+First measurement of `[server.access_log]` (`doc/ACCESS_LOG_0_8.md`). The two
+arms differ only by the presence of that one section and are checked in as
+`benchmarks/access_log_off.toml` and `benchmarks/access_log_on.toml`; the
+logging arm appends JSON Lines to a file on the same disk.
+`benchmarks/static_http.ps1` gained `-ConfigPath`, whose default keeps the
+built-in configuration every earlier run used.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+# five pairs, one run each, arms alternating; pairs 1-3 ran off first,
+# pairs 4-5 ran on first
+./benchmarks/static_http.ps1 -ConfigPath ./benchmarks/access_log_<arm>.toml `
+  -Runs 1 -Requests 100000 -Concurrency 32 -WarmupRequests 1000
+```
+
+**Conditions, which bound what this run can claim.** Intel i5-1235U (2P+8E,
+12 threads, 1.3 GHz base), Windows 11 Home 10.0.26300, measured during an
+active desktop session: `LoadPercentage` was 81% before the run, with Chrome,
+this agent session, `audiodg` and `RazerAppEngine` all consuming CPU. Absolute
+throughput is therefore 3.0-4.0k RPS where the 0.5 admission runs on this
+machine recorded 6.9-7.3k at the same concurrency. **These absolute numbers
+must not be compared with any earlier entry**; only the paired arms are
+comparable with each other.
+
+| Pair | Order | off RPS | on RPS | on vs off |
+|---|---|---:|---:|---:|
+| 1 | off, on | 3,029 | 3,156 | +4.2% |
+| 2 | off, on | 3,467 | 3,773 | +8.8% |
+| 3 | off, on | 3,598 | 3,717 | +3.3% |
+| 4 | on, off | 3,894 | 3,606 | -7.4% |
+| 5 | on, off | 3,989 | 3,817 | -4.3% |
+
+The three forward pairs all made the logging arm look **faster**, which cannot
+be true of a change that only adds work. The ten runs in execution order were
+3,029 / 3,156 / 3,467 / 3,773 / 3,598 / 3,717 / 3,606 / 3,894 / 3,817 / 3,989:
+a monotonic warm-up drift that favours whichever arm ran second. Reversing the
+order reversed the sign, which is what identifies the bias rather than
+explaining it away.
+
+Order-balanced over the five pairs:
+
+| Measure | Balanced delta (on vs off) | Ordering bias |
+|---|---:|---:|
+| RPS | **-0.21%** | +/-5.6% |
+| CPU per request | **+19.8 us (+2.0%)** on 1,001 us baseline | same drift |
+| Working set | **+0.3-0.4 MiB** (10.6-10.9 vs 10.2-10.5) | drift-free |
+
+**Conclusion.** This run rejects a material static-path regression from access
+logging: the balanced RPS difference is within a fifth of a percent while the
+ordering bias alone is +/-5.6%. It cannot resolve a small cost, and the CPU
+figure (+2% per request) is the same order as the noise, so it is a direction,
+not a measurement. The working-set increase is the queue and the writer
+buffer and is the one consistent signal. A clean machine and the historical
+500,000-request parameters are needed before any cost claim is made; until
+then the honest statement is "no large regression found, small cost not
+excluded".
+
+**Completeness, which is not a timing claim.** The three logging runs wrote
+303,000 records for 3 x (100,000 measured + 1,000 warm-up) requests, zero
+`log_dropped` records, every record `"status":200`. The default 1,024-deep
+queue lost nothing at this rate through the real release binary.
+
+## Observability counters A/B — inconclusive, with the reason (2026-10-12)
+
+Second measurement attempt of a 0.8 slice, this time the per-request counters
+behind `[server.admin]` (`doc/OBSERVABILITY_0_8.md`). Arms differ only by that
+one section and are checked in as `benchmarks/admin_off.toml` and
+`benchmarks/admin_on.toml`; nothing scraped the administrative listener during
+the runs, so the only difference on the request path is five relaxed atomics
+per request and two per connection.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+# five pairs, one run each; pairs 1-3 ran off first, pairs 4-5 ran on first
+./benchmarks/static_http.ps1 -ConfigPath ./benchmarks/admin_<arm>.toml `
+  -Runs 1 -Requests 100000 -Concurrency 32 -WarmupRequests 1000
+```
+
+Conditions: Intel i5-1235U (2 performance cores + 8 efficient cores, 12
+threads, 1.3 GHz base), Windows 11 Home 10.0.26300. Unlike the access-log run
+earlier the same day, the machine was quiet: `LoadPercentage` was **4%** before
+the first run.
+
+| Pair | Order | off RPS | on RPS | on vs off | off CPU us/req | on CPU us/req |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | off, on | 5,203 | 3,768 | -27.6% | 672.7 | 1,000.2 |
+| 2 | off, on | 3,821 | 4,028 | +5.4% | 968.3 | 925.5 |
+| 3 | off, on | 3,916 | 4,637 | +18.4% | 908.6 | 787.5 |
+| 4 | on, off | 6,062 | 5,337 | -12.0% | 598.9 | 653.9 |
+| 5 | on, off | 5,445 | 5,478 | +0.6% | 630.8 | 661.3 |
+
+Order-balanced: RPS **-3.5%** with an ordering bias of **+2.2%**, CPU
+**+48.6 us/request**. Working set was 10.3-11.0 MiB with the counters off and
+10.4-10.7 MiB with them on: no difference.
+
+**This run does not resolve the cost, and the per-pair spread says why**: the
+same comparison produced -27.6% and +18.4% on a quiet machine. The cause is
+visible in the driver's own numbers rather than left as "variance". Across all
+ten runs the **server process** used 3.44-3.77 effective cores — a 10% spread —
+while throughput ranged 3,768-6,062 RPS, a 61% spread. The server was
+CPU-saturated in every run and received nearly the same CPU time; what differed
+was how much work that CPU delivered. On this processor that is the expected
+signature of thread placement across performance and efficient cores, which the
+scheduler chooses afresh for every process start, and the driver starts a fresh
+server per run.
+
+It also means `CPU_US_PER_REQUEST` here is a function of that placement, not of
+per-request work: it moves inversely with throughput at nearly constant core
+usage. The +48.6 us balanced CPU delta is therefore **not** attributable to the
+counters, and cannot be: five relaxed atomic increments are tens of nanoseconds,
+about four orders of magnitude below 48 us. For scale, 1% of this baseline is
+roughly 7 us per request, so the change being measured is some three orders of
+magnitude below what this driver can see on this machine.
+
+**Conclusion.** No large regression: nothing in ten runs suggests a cost
+anywhere near the measurement's own spread, and memory is unchanged. No cost
+figure is claimed, and the analytical expectation (tens of nanoseconds per
+request) is stated as analysis, not as a measurement.
+
+**What a valid measurement needs here**, recorded so the next attempt does not
+repeat this one: pin the server process to the performance cores, or measure on
+a machine with homogeneous cores; use the in-memory `/api` route to remove
+filesystem variance as the 0.5 admission comparison did; and use the historical
+500,000-request parameters. The driver does not set affinity today.
+

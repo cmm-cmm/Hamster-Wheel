@@ -68,6 +68,8 @@ impl Server {
             listeners,
             Arc::new(router),
             limits,
+            None,
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },

@@ -1,0 +1,19 @@
+# Logging arm for the access-log A/B: the baseline arm plus one section.
+[server]
+listen = "127.0.0.1:8080"
+
+[server.access_log]
+path = "../target/access-log-bench/access.jsonl"
+
+[[hosts]]
+name = "localhost"
+aliases = ["127.0.0.1"]
+
+[[hosts.locations]]
+path = "/api"
+handler = "not_found"
+
+[[hosts.locations]]
+path = "/"
+handler = "static"
+root = "../public"

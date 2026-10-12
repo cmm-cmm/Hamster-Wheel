@@ -2,6 +2,8 @@
 mod output;
 
 mod access;
+pub mod access_log;
+pub mod admin;
 #[cfg(feature = "profiling")]
 pub mod blocking_profile;
 pub mod body_budget;
@@ -14,6 +16,7 @@ pub mod fastcgi;
 pub mod fastcgi_profile;
 mod handler;
 mod lingering_close;
+pub mod metrics;
 mod php_protocol;
 pub mod php_worker;
 #[cfg(feature = "profiling")]

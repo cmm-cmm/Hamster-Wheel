@@ -457,6 +457,17 @@ fn map_io_error(error: io::Error) -> FileError {
 }
 
 fn text_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
+    if status.is_client_error() || status.is_server_error() {
+        let mut response = error_text_response(status, message);
+        response
+            .extensions_mut()
+            .insert(crate::access_log::ErrorReason(message));
+        return response;
+    }
+    error_text_response(status, message)
+}
+
+fn error_text_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
     let mut response = Response::new(ResponseBody::buffered(Bytes::from_static(
         message.as_bytes(),
     )));

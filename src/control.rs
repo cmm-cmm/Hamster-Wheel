@@ -108,7 +108,7 @@ mod protocol {
     };
 
     use super::Command;
-    use crate::config::RuntimeConfig;
+    use crate::{access_log::AccessLog, config::RuntimeConfig};
 
     /// Deadline for one control exchange, from connect to the written response.
     ///
@@ -193,10 +193,11 @@ mod protocol {
         config: &Arc<RuntimeConfig>,
         started: Instant,
         draining: &AtomicBool,
+        access_log: Option<&AccessLog>,
     ) -> Response {
         match command {
             Command::Ping => Response::ok(format!("pid={}", std::process::id())),
-            Command::Status => Response::ok(status_details(config, started, draining)),
+            Command::Status => Response::ok(status_details(config, started, draining, access_log)),
             Command::Stop => Response {
                 // Answered before the shutdown is triggered, so the client learns
                 // the request was accepted even though the pipe is about to close.
@@ -211,6 +212,7 @@ mod protocol {
         config: &Arc<RuntimeConfig>,
         started: Instant,
         draining: &AtomicBool,
+        access_log: Option<&AccessLog>,
     ) -> String {
         let mut details = String::new();
         let _ = writeln!(details, "pid={}", std::process::id());
@@ -253,6 +255,32 @@ mod protocol {
                 details,
                 "handshakes_timed_out={}",
                 tls.handshakes_timed_out()
+            );
+        }
+        match crate::metrics::readiness(config, draining) {
+            Ok(()) => {
+                let _ = writeln!(details, "ready=true");
+            }
+            // The same answer the administrative `/ready` gives, for an
+            // operator who has a pipe but no HTTP client.
+            Err(reason) => {
+                let _ = writeln!(details, "ready=false reason={}", single_line(&reason));
+            }
+        }
+        if let Some(admin) = config.admin() {
+            let _ = writeln!(details, "admin=http://{}", admin.listen());
+        }
+        if let Some(settings) = config.access_log() {
+            // A log an operator cannot see the health of is a log they have to
+            // trust. `dropped` is the only honest answer to "is this log
+            // complete?", so it is reported beside where the records go.
+            let (queued, written, dropped, failed) = access_log.map_or((0, 0, 0, 0), |log| {
+                (log.queued(), log.written(), log.dropped(), log.failed())
+            });
+            let _ = writeln!(
+                details,
+                "access_log={} queued={queued} written={written} dropped={dropped} failed={failed}",
+                single_line(&settings.target_description())
             );
         }
         let _ = writeln!(
@@ -427,7 +455,7 @@ mod windows {
             PIPE_SDDL, Response, execute, pipe_path,
         },
     };
-    use crate::config::RuntimeConfig;
+    use crate::{access_log::AccessLog, config::RuntimeConfig};
 
     #[repr(C)]
     struct SecurityAttributes {
@@ -531,6 +559,7 @@ mod windows {
             config: Arc<RuntimeConfig>,
             started: Instant,
             draining: Arc<AtomicBool>,
+            access_log: Option<Arc<AccessLog>>,
             stop_tx: mpsc::Sender<()>,
             mut shutdown: oneshot::Receiver<()>,
         ) {
@@ -622,9 +651,18 @@ mod windows {
                 };
                 let config = Arc::clone(&config);
                 let draining = Arc::clone(&draining);
+                let access_log = access_log.clone();
                 let stop_tx = stop_tx.clone();
                 exchanges.spawn(async move {
-                    handle(connected, &config, started, &draining, &stop_tx).await;
+                    handle(
+                        connected,
+                        &config,
+                        started,
+                        &draining,
+                        access_log.as_deref(),
+                        &stop_tx,
+                    )
+                    .await;
                     drop(permit);
                 });
             }
@@ -759,6 +797,7 @@ mod windows {
         config: &Arc<RuntimeConfig>,
         started: Instant,
         draining: &AtomicBool,
+        access_log: Option<&AccessLog>,
         stop_tx: &mpsc::Sender<()>,
     ) {
         let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
@@ -784,7 +823,7 @@ mod windows {
             }
             let line = String::from_utf8_lossy(&request).into_owned();
             let response = match Command::parse(&line) {
-                Some(command) => execute(command, config, started, draining).await,
+                Some(command) => execute(command, config, started, draining, access_log).await,
                 None => Response::unknown_command(),
             };
             Ok(Some(response))
@@ -890,6 +929,7 @@ mod windows {
                 test_config(),
                 Instant::now(),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 stop_tx,
                 shutdown_rx,
             ));
@@ -909,6 +949,7 @@ mod windows {
                 test_config(),
                 Instant::now(),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 stop_tx,
                 shutdown_rx,
             ));
@@ -940,6 +981,7 @@ mod windows {
                 Arc::clone(&config),
                 Instant::now(),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 stop_tx,
                 shutdown_rx,
             ));
@@ -972,6 +1014,7 @@ mod windows {
                 Arc::clone(&config),
                 Instant::now(),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 stop_tx,
                 shutdown_rx,
             ));
@@ -1018,6 +1061,7 @@ mod windows {
                 Arc::clone(&config),
                 Instant::now(),
                 Arc::new(AtomicBool::new(false)),
+                None,
                 stop_tx,
                 shutdown_rx,
             ));

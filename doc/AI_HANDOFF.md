@@ -1,6 +1,197 @@
 # AI Handoff
 
-## Current: two Service lifecycle gaps qualified (2026-10-11)
+## Current: health, readiness and metrics, second 0.8 slice (2026-10-12)
+
+Owner chose to continue 0.8 after the access log. Nothing was committed,
+tagged, pushed, merged or released. The previous section's heading was
+demoted; `doc/OBSERVABILITY_0_8.md` is the behaviour document.
+
+FACT: `[server.admin] listen = "127.0.0.1:9090"` adds a **separate listener**,
+off by default, serving exactly `GET`/`HEAD` on `/health`, `/ready` and
+`/metrics`, 405 for other methods and 404 for other paths. It never receives
+the application `HostRouter`, which is how the 0.8 requirement that this
+surface "must not silently occupy an application route" is met structurally
+rather than by convention: a test asks the application listener for all three
+paths and requires the application's own 404 with no exposition in the body.
+The address is bound before pools start, so a clash fails startup; a
+non-loopback bind logs a warning naming what became reachable. There is no TLS
+and no authentication, deliberately and documented.
+
+FACT: health and readiness are different answers on purpose. `/health` is 200
+for as long as the process can answer, including the whole of a graceful stop.
+`/ready` is 503 `draining` from the moment a stop is triggered, and 503
+`php_pool <label> has no live worker` when a pool cannot serve. A pool below
+its target but still serving stays ready: pulling a partly healthy instance
+during a replacement storm makes an incident worse. FastCGI and proxy backends
+are not in the decision, because Hamster neither owns nor probes them — the
+same reason its startup line does not certify them. `--control status` reports
+the same judgement (`ready=true` / `ready=false reason=...`, plus `admin=`)
+from the same function, so the pipe and `/ready` cannot disagree.
+
+FACT: the exposition is hand-written Prometheus text with cardinality bounded
+by the configuration. New HTTP counters: connections total/active/limit,
+requests by status class, incomplete responses, response bytes, and a
+fixed-bucket duration histogram (1 ms to 10 s, not configurable, because a
+configurable histogram is a configurable cardinality). Everything else —
+pools, proxy upstreams, FastCGI endpoints, TLS certificates and handshake
+outcomes, access-log records and queue depth — is read from the snapshots
+those subsystems already keep for `--control status`, so nothing is counted
+twice. Scrapes are not counted as application traffic. Configured names are
+escaped before reaching a label.
+
+FACT: the request observation point was generalised rather than duplicated.
+The response-body wrapper from the access-log slice is now `MaybeObserved` /
+`ObservedBody` and feeds both the log record and the counters from the one
+place a request finishes, so `requests_incomplete_total` and the log's
+`complete:false` cannot disagree. A server with neither consumer keeps the
+body it always had behind one enum branch, and allocates no counters.
+
+FACT: two findings worth keeping.
+1. `TlsListener::handshakes_started` is `#[cfg(test)]` — the **field** too, so
+   the counter does not exist in a shipped build. A `handshakes_started_total`
+   metric was therefore dropped rather than quietly adding an atomic to every
+   handshake in another subsystem; the TLS outcome counters have no
+   denominator, and `doc/OBSERVABILITY_0_8.md` says so. Reverted cleanly.
+2. The new clash validation rejected `listen = "127.0.0.1:0"` for both the
+   application and the admin listener, because the two addresses compare
+   equal. Port 0 asks the OS for a free port, so they are two sockets; the
+   rule now ignores port 0. Found by the integration test, which could not
+   start at all, and pinned by a configuration test.
+
+Also unconditional now: the `draining` flag, which was `#[cfg(windows)]` for
+the control endpoint. Readiness needs it on every platform.
+
+Gates at this working tree: `cargo fmt --all -- --check`; strict MSVC Clippy
+`--all-targets --all-features -D warnings`; the default suite 278 tests (260
+before this slice: 5 metrics unit, 6 admin unit, 6 admin integration and 1
+configuration test, plus the extended drain rehearsal); ignored
+`windows_control` 14/14, `windows_headless` 2/2, `windows_containment` 4/4,
+`tls_reload_process` 3/3; the non-Windows cfg-flip compile check; MSVC release
+build; `cargo bench --no-run --features profiling` linking all 11 benches. A
+release-binary probe confirmed the startup lines, that the application
+listener answers `/metrics` with 404, that three 200s and two 404s appear as
+`2xx`/`4xx` with five connections and five access-log records, that
+`--control status` reports `ready=true` and `admin=`, and that `--control
+stop` exits 0.
+
+FACT: the release A/B for the counters was taken and is **inconclusive**,
+recorded in `doc/BENCHMARKS.md` (*Observability counters A/B — inconclusive,
+with the reason, 2026-10-12*). Five order-balanced pairs of 100,000-request
+runs, this time on a quiet machine (4% background load, against 81% for the
+access-log run earlier the same day). Balanced RPS -3.5% with a +2.2% ordering
+bias — but the same comparison gave -27.6% in one pair and +18.4% in another.
+
+The spread was diagnosed rather than called variance, and the diagnosis is
+worth keeping for every future benchmark on this machine: across ten runs the
+**server process** used 3.44-3.77 effective cores, a 10% spread, while
+throughput ranged 3,768-6,062 RPS, a 61% spread. The server was CPU-saturated
+in every run and received nearly the same CPU time; what differed is how much
+work that CPU delivered, which on this 2-performance/8-efficient-core
+processor is the signature of per-process thread placement, chosen afresh for
+each server start — and the driver starts a fresh server per run. It follows
+that `CPU_US_PER_REQUEST` from this driver tracks placement rather than
+per-request work (it moves inversely with throughput at constant core usage),
+so the +48.6 µs balanced CPU delta is not the counters and cannot be: five
+relaxed atomics are tens of nanoseconds, four orders of magnitude below it.
+1% of this baseline is about 7 µs per request, so the change being measured is
+roughly three orders of magnitude below the driver's resolution here.
+
+What the run supports: no large regression, and no measurable memory
+difference. No cost figure is claimed for either 0.8 slice. A valid
+measurement needs the server pinned to the performance cores or a homogeneous
+machine, the in-memory `/api` route, and the historical 500,000-request
+parameters; `benchmarks/static_http.ps1` does not set affinity today. The
+500,000-request run on a clean machine is still owed for both slices.
+
+Still missing from 0.8: transactional configuration reload with generation
+identity, lifecycle records of their own, a `validate` CLI operation, and log
+rotation inside Hamster. Linux remains unverified.
+
+## Structured access log, first 0.8 slice (2026-10-12)
+
+Owner asked for a release assessment, accepted that a public release is not
+ready, and chose to start the 0.8 scope with structured access/error logging
+because it is the heaviest missing piece: before this slice a 500 reaching a
+browser left nothing behind at all. Nothing was committed, tagged, pushed,
+merged or released.
+
+FACT: `[server.access_log]` is new and off by default. `path` (omit for
+stdout, relative resolves beside the configuration file), `include_query`
+(default false) and `queue_capacity` (16-65536, default 1024). The file is
+opened before pools start and before listeners bind, so an unwritable path is
+a startup failure. Records are JSON Lines with `kind`, `ts_ms`, `id`, `method`,
+`target`, `host`, `version`, `scheme`, `peer`, `status`, `head_us`,
+`total_us`, `bytes`, `complete` and an optional `error`. Full behaviour,
+including what is deliberately never logged, is in `doc/ACCESS_LOG_0_8.md`.
+
+FACT: the hot path builds one owned record and offers it to a bounded queue
+with a non-waiting send; a single writer task owns all JSON formatting and
+every write. Stdout goes through Tokio `io-std` (a new feature flag on an
+existing dependency), so a stalled log reader occupies a blocking-pool thread
+rather than a runtime worker. A full queue drops and counts, and the count is
+reported both as a `log_dropped` record in the log and as
+`access_log=<target> queued= written= dropped= failed=` in `--control status`.
+Queued records are flushed on a graceful stop: the server drops its sink only
+after every connection task ended, then waits for the writer.
+
+FACT: error reasons needed no plumbing. Every error status in the crate is
+built by `handler::simple_response` or `static_files::text_response`, whose
+`&'static str` body is already the precise reason, so those two constructors
+attach it as a response extension that the logger removes. `FastCGI Response
+Timeout` and `PHP Worker Queue Full` therefore reach the log without touching
+routing, FastCGI, the pool or the proxy.
+
+FACT: two defects were found by the new tests, not by reading the code.
+`complete` read from the body's end-of-stream alone marked **every** fully
+served static file incomplete, because hyper stops polling a body of declared
+length once those bytes are written and drops it without a final
+end-of-stream; a declared length is now satisfied by its byte count. And
+Clippy's `large_enum_variant` showed the response-body wrapper would have
+sized every response — including every response on a server with no log — for
+the logged variant (360 vs 144 bytes); the record state is now boxed.
+
+FACT: a 200-request burst against the smallest queue (16) drops roughly 60% of
+its records while answering every request 200. That is the designed trade and
+it is now a test: written plus dropped equals the traffic, and the gap is
+visible in the log itself. The same burst against the default queue loses
+nothing. A test that asserted "no drops at queue 16" was wrong and was
+rewritten; do not reintroduce it.
+
+Gates at this working tree: `cargo fmt --all -- --check`; strict MSVC Clippy
+`--all-targets --all-features -D warnings`; the default suite 260 tests (244
+before this slice, plus 8 unit, 7 integration and 1 configuration test);
+ignored `windows_control` 14/14, `windows_headless` 2/2,
+`windows_containment` 4/4, `tls_reload_process` 3/3; the non-Windows cfg-flip
+compile check; MSVC release build; `cargo bench --no-run --features profiling`
+linking all 11 benches; and a PowerShell parse check of the modified
+`benchmarks/static_http.ps1`.
+
+FACT: the release A/B was taken and is recorded in `doc/BENCHMARKS.md`
+(*Structured access log A/B — order-balanced paired run, 2026-10-12*). The
+owner declined the full 500,000-request run as too heavy at that moment and
+approved a lighter one, so `benchmarks/static_http.ps1` gained `-ConfigPath`
+(default unchanged, so earlier entries stay comparable) and five pairs of
+100,000-request runs were taken with the arms alternating. The first three
+pairs, all run baseline-first, made the logging arm look 3-9% faster, which a
+change that only adds work cannot be: the ten runs in order show a monotonic
+warm-up drift favouring whichever arm ran second, and reversing the order
+reversed the sign. Order-balanced: RPS **-0.21%** against an ordering bias of
+**±5.6%**, CPU **+19.8 µs/request (+2.0%)**, working set **+0.3-0.4 MiB**. The
+machine was an i5-1235U at 81% background load yielding 3.0-4.0k RPS where
+this project's 0.5 runs recorded 6.9-7.3k, so **no absolute number from this
+run is comparable with any earlier entry**. The honest statement is "no large
+regression found, small cost not excluded"; a clean machine at the historical
+parameters is still owed before any cost claim. Completeness, separately: the
+logging runs wrote 303,000 records for 303,000 requests with zero
+`log_dropped`.
+
+Still missing from 0.8, and therefore from any release: metrics, health and
+readiness; transactional configuration reload with generation identity (the
+`id` field is per process and there are no generations yet); lifecycle records
+of their own; log rotation or reopen inside Hamster; a `validate` CLI
+operation. Linux remains unverified.
+
+## Two Service lifecycle gaps qualified (2026-10-11)
 
 Owner enabled Administrator; actual elevated `OBJECTLAPTOP\cmmph` token was
 verified. Read `doc/WINDOWS_SERVICE_LIFECYCLE_GAPS.md` and the current WinSW

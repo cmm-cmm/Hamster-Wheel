@@ -1272,6 +1272,20 @@ fn the_control_path_still_works_once_the_log_reader_is_gone() {
     eprintln!("control evidence: status, two reloads and a graceful stop with no writable stdout");
 }
 
+/// One complete request on its own connection.
+fn http_get(address: SocketAddr, target: &str) -> String {
+    let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut answer = String::new();
+    let _ = stream.read_to_string(&mut answer);
+    answer
+}
+
 /// Sends one request and leaves the response unread until the caller joins.
 fn request_in_flight(address: SocketAddr, target: &str) -> thread::JoinHandle<String> {
     let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -1291,11 +1305,13 @@ fn status_reports_draining_while_a_stop_finishes_an_in_flight_request() {
     let scratch = Scratch::new("drain");
     let name = control_name("drain");
     let address = reserve_address();
+    let admin = reserve_address();
     let config = scratch.file("server.toml");
     fs::write(
         &config,
         format!(
             "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [server.admin]\nlisten = \"{admin}\"\n\n\
              [[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\n\
              handler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\n\
              workers = 1\nrequest_timeout = 30\n",
@@ -1313,6 +1329,18 @@ fn status_reports_draining_while_a_stop_finishes_an_in_flight_request() {
     });
     let server_pid = server.id();
 
+    // Before the stop, the administrative surface says this server is both
+    // alive and ready, and `status` agrees.
+    let ready = http_get(admin, "/ready");
+    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+    let (ok, status) = control(&config, "status");
+    assert!(ok, "{status}");
+    assert!(status.contains("ready=true"), "{status}");
+    assert!(
+        status.contains(&format!("admin=http://{admin}")),
+        "{status}"
+    );
+
     // The drain cannot finish before this request does, which is what makes
     // the draining state observable rather than a race.
     let in_flight = request_in_flight(address, "/delay?ms=3000");
@@ -1328,6 +1356,29 @@ fn status_reports_draining_while_a_stop_finishes_an_in_flight_request() {
     assert!(
         status.contains("state=draining"),
         "a draining server reported itself as serving: {status}"
+    );
+    assert!(status.contains("ready=false"), "{status}");
+
+    // A load balancer must be able to see the same thing over HTTP: alive, so
+    // not restarted, but refusing traffic while it drains.
+    let health = http_get(admin, "/health");
+    assert!(
+        health.starts_with("HTTP/1.1 200"),
+        "a draining server is still alive: {health}"
+    );
+    let ready = http_get(admin, "/ready");
+    assert!(
+        ready.starts_with("HTTP/1.1 503"),
+        "a draining server must not be sent traffic: {ready}"
+    );
+    assert!(ready.ends_with("draining\n"), "{ready}");
+    let metrics = http_get(admin, "/metrics");
+    assert!(metrics.contains("hamster_draining 1"), "{metrics}");
+    assert!(metrics.contains("hamster_ready 0"), "{metrics}");
+    // The in-flight PHP request is still counted as one live connection.
+    assert!(
+        metrics.contains("hamster_php_pool_workers{pool=\"localhost/\",state=\"live\"} 1"),
+        "{metrics}"
     );
 
     // The request that held the drain open was still answered in full.

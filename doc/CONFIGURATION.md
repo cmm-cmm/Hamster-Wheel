@@ -239,6 +239,52 @@ reaching the running server. The server's answer is printed verbatim and the
 exit code is 0 for `OK`, 1 for `ERR`. See `doc/WINDOWS_OPERATIONS.md` for the
 operator runbook.
 
+An optional per-request log records what the server served. It is off unless
+the section is present, and its absence means no queue, no writer task and no
+per-request work:
+
+```toml
+[server.access_log]
+path = "logs/access.jsonl"   # omit for stdout; relative resolves beside this file
+include_query = false        # default; credential-shaped values are replaced
+queue_capacity = 1024        # 16-65536
+```
+
+Records are JSON Lines, one object per request. The file is opened at startup,
+before pools start and before listeners bind, so a path that cannot be written
+is a startup failure; a path naming an existing directory, an empty path and a
+queue outside the range are configuration errors. Hamster appends and never
+rotates: stream rotation belongs to the Service wrapper or to an out-of-process
+tool.
+
+No headers other than the validated authority are logged, and no bodies. A
+query string is omitted unless `include_query = true`, in which case the values
+of credential-shaped keys are replaced with `REDACTED`. The queue is bounded
+and never waited on: when it is full the record is dropped, counted, reported
+in the log as a `log_dropped` record and shown by the control endpoint's
+`status` as `access_log=<target> queued= written= dropped= failed=`. See
+`doc/ACCESS_LOG_0_8.md` for the record fields and the complete behaviour.
+
+An optional administrative listener serves health, readiness and metrics. It
+is off unless the section is present, and it is a separate socket that never
+receives the application router, so it cannot occupy an application route:
+
+```toml
+[server.admin]
+listen = "127.0.0.1:9090"
+```
+
+`listen` is the only key. It is bound before pools start, so an address already
+in use is a startup failure; naming an address an application listener already
+uses is a configuration error. The listener serves exactly `GET`/`HEAD` on
+`/health`, `/ready` and `/metrics`, answers 405 for other methods and 404 for
+other paths, and has no TLS and no authentication: keep it on loopback and let
+the network decide who reaches it. Binding it to a non-loopback address logs a
+warning naming what became reachable. `/ready` answers 503 while the server
+drains and while a PHP pool has no live worker; `/health` answers 200 whenever
+the process can answer at all. See `doc/OBSERVABILITY_0_8.md` for the metric
+list and the readiness rules.
+
 On Windows, the presence of any `php_worker` location also requires process
 containment to be established before worker startup. Hamster creates and fully
 configures a private kill-on-close Job Object, assigns itself, and only then

@@ -247,6 +247,16 @@ fn transport_response(connection: ConnectionInfo) -> HandlerResponse {
 pub(crate) fn simple_response(status: StatusCode, body: &'static str) -> HandlerResponse {
     let mut response = Response::new(ResponseBody::buffered(Bytes::from_static(body.as_bytes())));
     *response.status_mut() = status;
+    if status.is_client_error() || status.is_server_error() {
+        // The body text is already the precise reason this status was chosen,
+        // and every error status in the crate is built here, so carrying it on
+        // the response is what lets the access log name the cause without
+        // threading an argument through routing, static files, FastCGI, the
+        // worker pool and the proxy. Taken off again by the logger.
+        response
+            .extensions_mut()
+            .insert(crate::access_log::ErrorReason(body));
+    }
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
