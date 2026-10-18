@@ -1791,8 +1791,13 @@ below.
 ## Verified Platform
 
 Windows `x86_64-pc-windows-msvc` with local PHP 8.5 NTS at
-`php/8.5/php.exe`. Do not claim native Linux verification. A Windows-host
-cross-target check is COMPILE-CHECKED ONLY.
+`php/8.5/php.exe`. A Windows-host cross-target check is COMPILE-CHECKED ONLY.
+
+Native Linux (`x86_64-unknown-linux-gnu`, Ubuntu 24.04, PHP 8.5.11 NTS built
+from source) was verified on the `dev-linux` branch on 2026-10-18: gates,
+default suite, ignored PHP suites and release benchmarks. What that covers and
+what it does not (SIGTERM, systemd, Windows effect of `TCP_NODELAY`) is in
+`doc/LINUX_VERIFICATION.md`; claim nothing on Linux beyond it.
 
 ## Architecture Summary
 

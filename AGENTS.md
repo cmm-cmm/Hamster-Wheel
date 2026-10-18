@@ -52,6 +52,8 @@ PHP 8.4 or newer). The FastCGI tests look for `php/8.5/php-cgi`, a symlink to th
   `cargo clippy --all-targets` only checks them and misses linker errors.
 - `./benchmarks/static_http.ps1` and `./benchmarks/php_worker*.ps1` are end-to-end .NET load drivers
   that launch the release binary themselves, so build release first.
+- `benchmarks/linux_http.py` is the Linux counterpart (static, `not_found`, PHP worker and FastCGI
+  cells, client `oha`); `doc/LINUX_VERIFICATION.md` records how Linux was verified and what is not.
 
 Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and
 test conditions.

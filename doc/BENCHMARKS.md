@@ -2204,3 +2204,37 @@ measured here.
 Soak, candidate, same host, C32: 300,000 static requests at 11,178 RPS, Hamster
 RSS 8.4 → 10.4 MiB; 600,000 PHP hello requests (4 workers) at 31,684 RPS,
 Hamster 7.3 → 7.8 MiB and PHP 107.7 MiB unchanged. All responses 200.
+
+## Linux release baseline — `ece1391` (2026-10-18)
+
+Same host and conditions as the TCP_NODELAY A/B above: 4 vCPU Intel Xeon
+@ 2.10 GHz, 16 GiB, Ubuntu 24.04, Linux 6.18, PHP 8.5.11 NTS, `oha` 1.16.0
+on the same host. Driver: `benchmarks/linux_http.py` (checked in with this
+entry), three runs per cell, a fresh server per run, 1,000 warm-up requests
+(200 for FastCGI), keep-alive, nothing else running. The persistent worker
+cells use `fixtures/php-worker/worker.php`; FastCGI uses one `php-cgi -b`
+with `PHP_FCGI_CHILDREN=4` behind `concurrency = 4` and
+`fixtures/php-cgi/bench.php`. Not comparable with the Windows rows: different
+client, kernel and host.
+
+| Cell | Requests | RPS min / median / max | Median-run P50 / P95 / P99 ms | Hamster / PHP CPU us/req | Hamster / PHP RSS MiB | Errors |
+|---|---:|---|---|---|---|---:|
+| static 22 B, C1 | 50,000 | 3,315 / 3,521 / 3,590 | 0.258 / 0.404 / 0.632 | 267.8 / - | 5.8 / - | 0 |
+| static 22 B, C32 | 200,000 | 12,175 / 12,181 / 12,807 | 2.540 / 4.336 / 5.402 | 204.1 / - | 9.6 / - | 0 |
+| not_found, C1 | 100,000 | 17,738 / 18,774 / 19,192 | 0.048 / 0.069 / 0.097 | 25.7 / - | 5.6 / - | 0 |
+| not_found, C32 | 500,000 | 107,791 / 110,920 / 117,799 | 0.237 / 0.619 / 0.986 | 15.4 / - | 6.5 / - | 0 |
+| PHP hello, 1 worker, C1 | 20,000 | 6,364 / 6,408 / 7,466 | 0.132 / 0.216 / 0.419 | 100.0 / 37.5 | 6.1 / 27.2 | 0 |
+| PHP JSON, 1 worker, C1 | 20,000 | 7,237 / 7,847 / 7,965 | 0.117 / 0.172 / 0.252 | 88.5 / 32.5 | 5.8 / 27.2 | 0 |
+| PHP echo 12 B, 1 worker, C1 | 20,000 | 6,487 / 6,697 / 6,848 | 0.137 / 0.194 / 0.257 | 127.0 / 34.5 | 6.0 / 27.2 | 0 |
+| PHP hello, 4 workers, C4 | 50,000 | 19,047 / 19,083 / 19,119 | 0.189 / 0.335 / 0.498 | 70.2 / 35.0 | 6.2 / 108.5 | 0 |
+| PHP hello, 4 workers, C32 | 50,000 | 30,633 / 31,082 / 32,717 | 0.970 / 1.400 / 2.758 | 44.0 / 28.6 | 7.4 / 108.7 | 0 |
+| FastCGI hello, 4 children, C1 | 5,000 | 2,250 / 2,439 / 2,471 | 0.365 / 0.628 / 1.014 | 260.0 / 96.0 | 6.0 / 74.3 | 0 |
+| FastCGI hello, 4 children, C4 | 10,000 | 7,954 / 8,288 / 8,382 | 0.451 / 0.727 / 0.941 | 190.0 / 85.0 | 6.3 / 74.2 | 0 |
+| FastCGI JSON, 4 children, C16 | 10,000 | 11,251 / 11,985 / 12,506 | 1.248 / 2.059 / 2.719 | 152.0 / 78.0 | 7.2 / 76.1 | 0 |
+
+The 1-worker PHP hello median (6,408) sits below the JSON cell (7,847) that
+does more work; its max run (7,466) and the A/B above (7,434-7,737) place it
+with the other two, so read the low median as this cell's run-to-run spread on
+a shared cloud host, not as a hello-specific cost. At C1 the median exchange
+is about 0.12-0.14 ms through a persistent worker and 0.37 ms through FastCGI,
+which starts a fresh PHP request per exchange.
