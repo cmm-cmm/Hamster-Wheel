@@ -6,7 +6,7 @@ use std::{
 };
 
 use hamster_wheel::{
-    config::{self, HttpLimits, SERVER_NAME},
+    config::{HttpLimits, SERVER_NAME},
     router::HostRouter,
     server,
 };
@@ -173,7 +173,7 @@ async fn host_denials_cover_uri_aliases_and_final_file_location() {
         root.path.display(),
         root.path.display()
     );
-    let runtime = config::compile_str(&source, &root.path).unwrap();
+    let runtime = hamster_wheel::config::compile_str(&source, &root.path).unwrap();
     let server = TestServer::start_router(runtime.router_arc()).await;
     for path in [
         "/data/secret.txt",

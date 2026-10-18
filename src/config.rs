@@ -2043,15 +2043,18 @@ path = \"ignored\"
             ),
             Err(ConfigError::Parse { .. })
         ));
-        let runtime = compile_str(
+        let compiled = compile_str(
             &format!(
                 "{base}name = \"edge\"
 "
             ),
             Path::new("."),
-        )
-        .unwrap();
-        assert_eq!(runtime.control_name(), Some("edge"));
+        );
+        #[cfg(windows)]
+        assert_eq!(compiled.unwrap().control_name(), Some("edge"));
+        // The endpoint is a named pipe, so even a valid name is refused here.
+        #[cfg(not(windows))]
+        assert!(matches!(compiled, Err(ConfigError::Validation(_))));
     }
 
     #[test]
