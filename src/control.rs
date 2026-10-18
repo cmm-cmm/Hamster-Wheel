@@ -39,6 +39,8 @@ pub enum Command {
     Status,
     Stop,
     ReloadCertificates,
+    /// Re-read the configuration file and publish it, or refuse it.
+    Reload,
 }
 
 impl Command {
@@ -48,6 +50,7 @@ impl Command {
             "status" => Some(Self::Status),
             "stop" => Some(Self::Stop),
             "reload-certificates" => Some(Self::ReloadCertificates),
+            "reload" => Some(Self::Reload),
             _ => None,
         }
     }
@@ -58,14 +61,16 @@ impl Command {
             Self::Status => "status",
             Self::Stop => "stop",
             Self::ReloadCertificates => "reload-certificates",
+            Self::Reload => "reload",
         }
     }
 
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Ping,
         Self::Status,
         Self::Stop,
         Self::ReloadCertificates,
+        Self::Reload,
     ];
 }
 
@@ -108,7 +113,7 @@ mod protocol {
     };
 
     use super::Command;
-    use crate::{access_log::AccessLog, config::RuntimeConfig};
+    use crate::{access_log::AccessLog, config::RuntimeConfig, server::Generations};
 
     /// Deadline for one control exchange, from connect to the written response.
     ///
@@ -190,21 +195,45 @@ mod protocol {
     /// Runs one command against the live server.
     pub(crate) async fn execute(
         command: Command,
-        config: &Arc<RuntimeConfig>,
+        generations: &Generations,
         started: Instant,
         draining: &AtomicBool,
         access_log: Option<&AccessLog>,
     ) -> Response {
+        let config = generations.current();
         match command {
             Command::Ping => Response::ok(format!("pid={}", std::process::id())),
-            Command::Status => Response::ok(status_details(config, started, draining, access_log)),
+            Command::Status => Response::ok(status_details(&config, started, draining, access_log)),
             Command::Stop => Response {
                 // Answered before the shutdown is triggered, so the client learns
                 // the request was accepted even though the pipe is about to close.
                 body: format!("OK\npid={}\nstopping=true\n\n", std::process::id()),
                 stop_requested: true,
             },
-            Command::ReloadCertificates => reload_certificates(config).await,
+            Command::ReloadCertificates => reload_certificates(&config).await,
+            Command::Reload => reload(generations).await,
+        }
+    }
+
+    /// Re-reads the configuration and publishes it, or reports why not.
+    ///
+    /// A refusal names the generation that is still serving, because that is
+    /// the fact an operator needs: the server did not change.
+    async fn reload(generations: &Generations) -> Response {
+        let serving = generations.current().generation();
+        match generations.reload().await {
+            Ok(published) => Response::ok(format!(
+                "pid={}\ngeneration={}\nprevious_generation={serving}",
+                std::process::id(),
+                published.generation()
+            )),
+            Err(error) => Response {
+                body: format!(
+                    "ERR reload_failed\nmessage={}\nactive_generation={serving}\n\n",
+                    single_line(&error.to_string())
+                ),
+                stop_requested: false,
+            },
         }
     }
 
@@ -216,6 +245,7 @@ mod protocol {
     ) -> String {
         let mut details = String::new();
         let _ = writeln!(details, "pid={}", std::process::id());
+        let _ = writeln!(details, "generation={}", config.generation());
         let _ = writeln!(
             details,
             "uptime_seconds={:.3}",
@@ -455,7 +485,7 @@ mod windows {
             PIPE_SDDL, Response, execute, pipe_path,
         },
     };
-    use crate::{access_log::AccessLog, config::RuntimeConfig};
+    use crate::{access_log::AccessLog, server::Generations};
 
     #[repr(C)]
     struct SecurityAttributes {
@@ -556,7 +586,7 @@ mod windows {
         /// has been written, so the caller owns shutdown ordering.
         pub async fn serve(
             mut self,
-            config: Arc<RuntimeConfig>,
+            generations: Arc<Generations>,
             started: Instant,
             draining: Arc<AtomicBool>,
             access_log: Option<Arc<AccessLog>>,
@@ -649,14 +679,14 @@ mod windows {
                         continue;
                     }
                 };
-                let config = Arc::clone(&config);
+                let generations = Arc::clone(&generations);
                 let draining = Arc::clone(&draining);
                 let access_log = access_log.clone();
                 let stop_tx = stop_tx.clone();
                 exchanges.spawn(async move {
                     handle(
                         connected,
-                        &config,
+                        &generations,
                         started,
                         &draining,
                         access_log.as_deref(),
@@ -794,7 +824,7 @@ mod windows {
 
     async fn handle(
         mut pipe: NamedPipeServer,
-        config: &Arc<RuntimeConfig>,
+        generations: &Generations,
         started: Instant,
         draining: &AtomicBool,
         access_log: Option<&AccessLog>,
@@ -823,7 +853,7 @@ mod windows {
             }
             let line = String::from_utf8_lossy(&request).into_owned();
             let response = match Command::parse(&line) {
-                Some(command) => execute(command, config, started, draining, access_log).await,
+                Some(command) => execute(command, generations, started, draining, access_log).await,
                 None => Response::unknown_command(),
             };
             Ok(Some(response))
@@ -911,11 +941,13 @@ mod windows {
             )
         }
 
-        fn test_config() -> Arc<RuntimeConfig> {
-            Arc::new(crate::config::compile_str(
+        /// The generations a control test serves from: one fixed generation,
+        /// because these tests are about the endpoint rather than reload.
+        fn test_config() -> Arc<Generations> {
+            Generations::new(Arc::new(crate::config::compile_str(
                 "[server]\nlisten = '127.0.0.1:8080'\n[[hosts]]\nname = 'localhost'\nlocations = [{path = '/', handler = 'not_found'}]",
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-            ).unwrap())
+            ).unwrap()))
         }
 
         #[tokio::test]
@@ -1051,14 +1083,11 @@ mod windows {
         async fn aborting_the_listener_releases_its_inflight_clients() {
             let name = endpoint_name("ownership");
             let listener = ControlListener::bind(&name).unwrap();
-            let config = Arc::new(crate::config::compile_str(
-                "[server]\nlisten = '127.0.0.1:8080'\n[[hosts]]\nname = 'localhost'\nlocations = [{path = '/', handler = 'not_found'}]",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-            ).unwrap());
+            let generations = test_config();
             let (stop_tx, _stop_rx) = mpsc::channel(1);
             let (_shutdown_tx, shutdown_rx) = oneshot::channel();
             let task = tokio::spawn(listener.serve(
-                Arc::clone(&config),
+                Arc::clone(&generations),
                 Instant::now(),
                 Arc::new(AtomicBool::new(false)),
                 None,
@@ -1067,7 +1096,7 @@ mod windows {
             ));
             let mut client = ClientOptions::new().open(pipe_path(&name)).unwrap();
             timeout(Duration::from_secs(1), async {
-                while Arc::strong_count(&config) < 3 {
+                while Arc::strong_count(&generations) < 3 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -1119,7 +1148,18 @@ mod tests {
                 Some(command)
             );
         }
-        for unknown in ["", "sto", "stop now", "STATUS", "reload", "ping;status"] {
+        // `reload` became a command; these stay unknown, including the
+        // near-misses an operator is most likely to type for it.
+        for unknown in [
+            "",
+            "sto",
+            "stop now",
+            "STATUS",
+            "RELOAD",
+            "reload-config",
+            "reload config",
+            "ping;status",
+        ] {
             assert_eq!(Command::parse(unknown), None, "{unknown}");
         }
     }

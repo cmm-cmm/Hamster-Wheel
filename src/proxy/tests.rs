@@ -536,7 +536,7 @@ async fn replaces_client_supplied_forwarding_metadata() {
 #[tokio::test]
 async fn an_https_client_is_forwarded_with_the_scheme_its_listener_established() {
     use crate::{
-        server::{Listener, serve_listeners},
+        server::{Listener, Serving, serve_listeners},
         tls::test_support::{Pki, connect, listener as tls_listener, source},
     };
 
@@ -566,8 +566,7 @@ async fn an_https_client_is_forwarded_with_the_scheme_its_listener_established()
     let (shutdown, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn(serve_listeners(
         vec![Listener::tls(socket, tls)],
-        router,
-        limits(),
+        Serving::Fixed(router, limits()),
         None,
         None,
         async move {

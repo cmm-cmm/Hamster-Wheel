@@ -15,7 +15,7 @@ use hamster_wheel::{
     admin::{self, AdminState},
     config,
     metrics::ServerMetrics,
-    server,
+    server::{self, Generations},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -41,6 +41,7 @@ const SOURCE: &str = "[server]\nlisten = \"127.0.0.1:0\"\n\n[server.admin]\nlist
 async fn start() -> Servers {
     let runtime = Arc::new(config::compile_str(SOURCE, std::path::Path::new(".")).unwrap());
     let settings = runtime.admin().expect("the configuration asked for admin");
+    let generations = Generations::new(Arc::clone(&runtime));
     let metrics = ServerMetrics::new();
     let draining = Arc::new(AtomicBool::new(false));
 
@@ -49,7 +50,7 @@ async fn start() -> Servers {
     let admin_socket = admin::bind(settings).await.expect("admin bind");
     let admin_address = admin_socket.local_addr().unwrap();
     let state = Arc::new(AdminState {
-        config: Arc::clone(&runtime),
+        generations: Arc::clone(&generations),
         started: Instant::now(),
         draining: Arc::clone(&draining),
         access_log: None,
@@ -63,8 +64,7 @@ async fn start() -> Servers {
     let (stop_application, application_stop_rx) = oneshot::channel::<()>();
     tokio::spawn(server::serve_listeners(
         vec![server::Listener::cleartext(application_socket)],
-        runtime.router_arc(),
-        runtime.http_limits(),
+        server::Serving::Fixed(runtime.router_arc(), runtime.http_limits()),
         None,
         Some(Arc::clone(&metrics)),
         async move {

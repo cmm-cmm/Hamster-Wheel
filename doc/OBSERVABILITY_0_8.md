@@ -98,6 +98,7 @@ HTTP, from counters this slice adds:
 ```text
 hamster_up 1
 hamster_ready 1
+hamster_config_generation 1
 hamster_draining 0
 hamster_uptime_seconds 412.880
 hamster_connections_total 5
@@ -244,6 +245,6 @@ affinity today.
   cardinality.
 - No TLS handshake denominator, as above.
 - Readiness does not consider FastCGI or proxy backends, by design.
-- No generation identity in the exposition, because there is no configuration
-  reload yet to have generations.
+- `hamster_config_generation` names the configuration serving new connections;
+  see `doc/CONFIG_RELOAD_0_8.md` for what a reload may change.
 - Linux is unverified, as everywhere else in this project.

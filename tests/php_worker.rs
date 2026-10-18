@@ -3878,8 +3878,7 @@ async fn protocol_v3_carries_the_listener_scheme_not_a_forwarding_header() {
             server::Listener::cleartext(clear_socket),
             server::Listener::tls(tls_socket, tls),
         ],
-        runtime.router_arc(),
-        runtime.http_limits(),
+        server::Serving::Fixed(runtime.router_arc(), runtime.http_limits()),
         None,
         None,
         async {
@@ -3990,8 +3989,7 @@ async fn laravel_sees_https_from_the_tls_listener_and_not_from_a_forged_header()
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let task = tokio::spawn(server::serve_listeners(
         vec![server::Listener::tls(socket, tls)],
-        runtime.router_arc(),
-        runtime.http_limits(),
+        server::Serving::Fixed(runtime.router_arc(), runtime.http_limits()),
         None,
         None,
         async {

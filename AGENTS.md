@@ -5,7 +5,7 @@
 Hamster Wheel is one Rust package (`hamster-wheel`, edition 2024, currently 0.3.1). Architecture and
 milestones live in `doc/HAMSTER_WHEEL_SERVER_PLAN.md`; each shipped milestone also has a behavior
 document in `doc/` (`ROUTING.md`, `CONFIGURATION.md`, `PHP_WORKER.md`, `BENCHMARKS.md`,
-`WINDOWS_STATIC_PROFILING.md`, `ACCESS_LOG_0_8.md`, `OBSERVABILITY_0_8.md`). The accepted 0.3 lifecycle contract is
+`WINDOWS_STATIC_PROFILING.md`, `ACCESS_LOG_0_8.md`, `OBSERVABILITY_0_8.md`, `CONFIG_RELOAD_0_8.md`). The accepted 0.3 lifecycle contract is
 `doc/WORKER_LIFECYCLE_0_3.md`.
 
 `src/` holds `main.rs`, `lib.rs`, and the runtime modules `server`, `config`, `router`, `handler`,

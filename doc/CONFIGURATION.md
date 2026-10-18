@@ -273,11 +273,24 @@ hamster-wheel.exe --config D:\site\hamster.toml --validate
 
 This compiles the file exactly as a server start would — resolving roots,
 loading certificates, validating pool, proxy and FastCGI settings — then prints
-the resources it would serve as `key=value` lines and exits 0. Any error is
+the resources it would serve as `key=value` lines and exits 0. Run it before
+`--control reload`, which compiles the same file inside the running server. Any error is
 reported on stderr with exit 1. It starts nothing: no listener is bound, no PHP
 worker is spawned, no log file is created, so it is safe to run on the machine
 that is currently serving. The last line names what it did **not** check:
 `not_checked=listener_bind,log_write,worker_startup,backend_reachability`.
+
+A running server can re-read this file with `--control reload`. It publishes
+the next **generation** when the change is one a reload may make — the route
+graph, static roots, `deny_paths`, `deny_names`, host aliases, and the
+per-connection timeouts — and refuses it by name otherwise. Everything that
+owns operating-system state is carried unchanged into the published
+generation, so `server.listen`, `server.tls`, `server.control`,
+`server.admin`, `server.access_log`, `server.max_body_memory`,
+`server.http1_max_buffer_size`, and any change to a PHP pool, proxy upstream
+or FastCGI endpoint (including adding or removing one) need a restart instead.
+`max_connections` is read once by the accept loop. See
+`doc/CONFIG_RELOAD_0_8.md`.
 
 An optional administrative listener serves health, readiness and metrics. It
 is off unless the section is present, and it is a separate socket that never

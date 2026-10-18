@@ -121,6 +121,7 @@ hamster-wheel.exe --config C:\hamster\hamster.toml --control stop
 | `status` | PID, uptime, lifecycle state, listeners, certificate expiry, pool readiness with exact worker PIDs, upstreams, FastCGI endpoints and the connection ceiling |
 | `stop` | Starts the same graceful drain as Ctrl+C; `OK stopping=true` acknowledges the command, **not** process exit. Wait for Hamster's process handle to signal before reporting shutdown complete. |
 | `reload-certificates` | The same transactional reload as Ctrl+Break |
+| `reload` | Re-reads the configuration file and publishes it as the next generation, or refuses it by name and keeps serving |
 
 The exit code is 0 for `OK` and 1 for `ERR`, and the server's own answer is
 printed verbatim. A refused reload answers `ERR reload_failed` with
@@ -133,6 +134,44 @@ listener, and only then creates the control pipe (`src/server.rs`, in that
 order), so a `status` that answers at all means the initial workers reached
 READY and the sockets are bound. It does not mean the pools are healthy *now*;
 that is what the live fields are for.
+
+### Reloading a configuration
+
+```powershell
+.\hamster-wheel.exe --config D:\site\hamster.toml --validate
+.\hamster-wheel.exe --config D:\site\hamster.toml --control reload
+```
+
+Validate first, always: `--validate` catches in a safe place the errors the
+reload would refuse anyway. A published reload answers `generation=N` with
+`previous_generation=`; a refusal answers `ERR reload_failed` with
+`active_generation=`, and the server is unchanged because nothing is built
+before the refusal.
+
+A reload changes routing and static serving. It refuses, by name, any change
+to something that owns operating-system state — `server.listen`,
+`server.tls`, `server.control`, `server.admin`, `server.access_log`,
+`server.max_body_memory`, `server.http1_max_buffer_size`, and any PHP pool,
+proxy upstream or FastCGI endpoint that is new, removed or altered. Those are
+restarts. The upside of that boundary is that a published reload never
+restarts a PHP worker: warm workers stay warm, and in-flight transactions keep
+their at-most-once guarantee.
+
+A connection keeps the generation it was accepted under until it ends, so a
+keep-alive client does not change behaviour mid-conversation. `status` reports
+`generation=`, `/metrics` reports `hamster_config_generation`, and every
+access-log record carries its `generation`, so a request can always be placed
+in the configuration that served it.
+
+**Keep `[server.control]` intact in the file.** The control client reads the
+endpoint name from the configuration, so a file broken badly enough to lose
+that section, or to stop parsing as TOML, cannot be used to reach the server
+at all — including to stop it. That is the strongest reason to validate before
+writing over a serving configuration.
+
+Certificates are separate: `--control reload-certificates` and Ctrl+Break
+reload certificate contents, while a configuration reload carries the TLS
+listener unchanged and refuses any change to `[server.tls]`.
 
 ### Health, readiness and metrics
 

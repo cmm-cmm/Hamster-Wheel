@@ -125,8 +125,7 @@ async fn serve(scratch: &Scratch, access_log_body: &str, locations: &str) -> Ser
     let (shutdown, shutdown_rx) = oneshot::channel::<()>();
     let task = tokio::spawn(server::serve_listeners(
         vec![server::Listener::cleartext(socket)],
-        runtime.router_arc(),
-        runtime.http_limits(),
+        server::Serving::Fixed(runtime.router_arc(), runtime.http_limits()),
         Some(Arc::clone(&log)),
         None,
         async move {

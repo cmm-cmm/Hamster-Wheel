@@ -1,6 +1,104 @@
 # AI Handoff
 
-## Current: the validate CLI operation, third 0.8 slice (2026-10-12)
+## Current: transactional configuration reload (2026-10-18)
+
+The slices below were committed and pushed as `e91fd65` (access log, health,
+readiness, metrics) and `abeffa5` (`--validate`). This is uncommitted work on
+top of them and closes the last large 0.8 item.
+`doc/CONFIG_RELOAD_0_8.md` is the behaviour document.
+
+FACT: `--control reload` re-reads the file the server was started from,
+compiles it, and either publishes it as the next generation or refuses it and
+keeps serving. A refusal costs the serving generation nothing, because the
+refusal happens before anything is built. The answers are
+`OK generation=N previous_generation=M` and
+`ERR reload_failed ... active_generation=N`.
+
+FACT: the boundary is wider than the roadmap's "which listener changes require
+a handoff", and simpler to state: **a reload may change the route graph and
+the limits read per connection; it may not create, destroy or alter anything
+that owns operating-system state.** Pools, proxy upstreams, FastCGI endpoints,
+the TLS listener, the control pipe, the administrative listener and the access
+log's file and queue are carried into the published generation as the same
+objects, each fingerprinted from the settings it was built with, and a
+configuration that disagrees is refused naming the resource. So a static root,
+a new or removed static location, `deny_paths`, `deny_names`, aliases and the
+three per-connection timeouts reload; `server.listen`, `server.tls`,
+`server.control`, `server.admin`, `server.access_log`,
+`server.max_body_memory`, `server.http1_max_buffer_size` and any pool,
+upstream or endpoint that is new, removed or altered are restarts.
+
+The reason for that line is not caution for its own sake: retiring or
+re-pointing those resources safely needs drain semantics for in-flight
+requests that this slice does not implement, and the at-most-once guarantee for
+a PHP transaction is a correctness requirement in this project. The upside is
+concrete — a published reload never restarts a worker, so warm workers stay
+warm, which is exactly what made a full restart expensive.
+
+FACT: generations are per connection. `RuntimeConfig` carries a generation
+number from 1; `Generations` in `src/server.rs` holds the current one behind an
+`RwLock` with a reload gate, mirroring the TLS listener's existing pattern. A
+connection reads the generation current **when it is accepted** and keeps it
+until it ends, so a keep-alive client does not change behaviour
+mid-conversation and a request always finishes under the configuration that
+admitted it. The generation is reported by `--control status`
+(`generation=`), by `/metrics` (`hamster_config_generation`) and in every
+access-log record (`"generation"`), which is the request/generation
+correlation 0.8 asked for.
+
+FACT (`tests/reload.rs`): a connection kept open across a publish still serves
+the old static root, one opened afterwards serves the new one, and the three
+access-log records read generation 1, 1, 2. That is the 0.8 exit evidence
+stated as a test. An invalid file and a listener change both leave the serving
+generation at 1 with the server answering as before.
+
+FACT (`src/config.rs` unit tests): generation 2 then 3 publish while the
+generation that asked stays complete; each process-owned field is refused by
+name; a proxy upstream is the same object (`Arc::ptr_eq`) after a reload that
+changed a static root beside it, while changing, removing or adding one is
+refused with the label and whether it was new, changed or retired; the
+built-in configuration and any in-memory compilation have no file to re-read.
+
+FACT (`tests/windows_control.rs`, ignored, detached server): `generation=1`,
+then a published static-root change answered `generation=2
+previous_generation=1` with HTTP serving the new root, then an invalid file
+answered `ERR reload_failed active_generation=2`, then a listener change
+refused naming `server.listen`, with the server still serving generation 2 and
+then exiting 0.
+
+FACT: two findings worth carrying forward.
+1. The control client reads the endpoint name **from the configuration file**,
+   so a file broken badly enough to lose `[server.control]`, or to stop
+   parsing as TOML, cannot be used to reach the server at all — including to
+   stop it. Found when the first version of the process-level test wrote a
+   minimal invalid file and could no longer address the server. It is a
+   property of the client, not of the reload, and it is now the runbook's
+   strongest reason to run `--validate` before writing over a serving
+   configuration.
+2. A lost string continuation left a run of indentation inside the refusal
+   message, visible in the release probe as "that a          reload must not
+   replace". A refusal is read by a person in a terminal, so a unit test now
+   asserts the message is one line with no double space.
+
+Gates at this working tree: `cargo fmt --all -- --check`; strict MSVC Clippy
+`--all-targets --all-features -D warnings`; the default suite 296 tests (290
+at `abeffa5`, plus 4 reload unit tests and 2 integration tests); ignored
+`windows_control` 15/15, `windows_headless` 2/2, `windows_containment` 4/4,
+`tls_reload_process` 3/3, `validate_cli` 1/1; MSVC release build. A release
+probe published generation 2 end to end and showed
+`hamster_config_generation` move from 1 to 2 in a scrape.
+
+No benchmark: the per-connection change is reading one `Arc` from an `RwLock`
+at accept time instead of cloning a prebuilt value, which is not a per-request
+change. If the owner wants it measured, the order-balanced paired method in
+`doc/BENCHMARKS.md` applies, and the machine caveats recorded there still
+stand.
+
+Remaining in 0.8: lifecycle records of their own (the access log covers
+requests, not lifecycle), log rotation or reopen inside Hamster, and resource
+lifecycle in a reload if that is ever wanted. Linux remains unverified.
+
+## The validate CLI operation, third 0.8 slice (2026-10-12, in abeffa5)
 
 The two slices below were committed and pushed as `e91fd65`
 (`observability: add a structured access log, health, readiness and metrics`)

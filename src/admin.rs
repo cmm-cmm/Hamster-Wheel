@@ -44,9 +44,9 @@ use tokio::{
 
 use crate::{
     access_log::AccessLog,
-    config::{RuntimeConfig, SERVER_NAME},
+    config::SERVER_NAME,
     metrics::{MetricsView, ServerMetrics},
-    server::should_report_connection_error,
+    server::{Generations, should_report_connection_error},
 };
 
 /// Connections this listener serves at once.
@@ -84,7 +84,7 @@ impl Settings {
 
 /// Everything the three routes read.
 pub struct AdminState {
-    pub config: Arc<RuntimeConfig>,
+    pub generations: Arc<Generations>,
     pub started: Instant,
     pub draining: Arc<AtomicBool>,
     pub access_log: Option<Arc<AccessLog>>,
@@ -94,7 +94,7 @@ pub struct AdminState {
 impl AdminState {
     fn view(&self) -> MetricsView<'_> {
         MetricsView {
-            config: &self.config,
+            config: self.generations.current(),
             started: self.started,
             draining: &self.draining,
             access_log: self.access_log.as_deref(),
@@ -229,7 +229,9 @@ mod tests {
         let source = "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\
                       locations = [{ path = \"/\", handler = \"not_found\" }]\n";
         AdminState {
-            config: Arc::new(config::compile_str(source, std::path::Path::new(".")).unwrap()),
+            generations: Generations::new(Arc::new(
+                config::compile_str(source, std::path::Path::new(".")).unwrap(),
+            )),
             started: Instant::now(),
             draining: Arc::new(AtomicBool::new(draining)),
             access_log: None,

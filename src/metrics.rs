@@ -152,7 +152,9 @@ pub(crate) fn readiness(config: &RuntimeConfig, draining: &AtomicBool) -> Result
 
 /// Everything the exposition reads, gathered once per scrape.
 pub(crate) struct MetricsView<'a> {
-    pub(crate) config: &'a Arc<RuntimeConfig>,
+    /// The generation being reported. Owned rather than borrowed because it is
+    /// read from the generations holder for each scrape.
+    pub(crate) config: Arc<RuntimeConfig>,
     pub(crate) started: Instant,
     pub(crate) draining: &'a AtomicBool,
     pub(crate) access_log: Option<&'a AccessLog>,
@@ -161,7 +163,7 @@ pub(crate) struct MetricsView<'a> {
 
 impl MetricsView<'_> {
     pub(crate) fn readiness(&self) -> Result<(), String> {
-        readiness(self.config, self.draining)
+        readiness(&self.config, self.draining)
     }
 
     /// The whole exposition, in Prometheus text format.
@@ -175,6 +177,12 @@ impl MetricsView<'_> {
             "hamster_ready",
             "1 when this server should be sent application traffic",
             u64::from(ready),
+        );
+        gauge(
+            &mut out,
+            "hamster_config_generation",
+            "Which compilation of the configuration is serving new connections",
+            self.config.generation(),
         );
         gauge(
             &mut out,

@@ -83,6 +83,9 @@ impl From<PhpPoolsError> for ServerError {
 }
 
 pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
+    // Generation 1 is what starts; a reload publishes into this holder, and
+    // every later reader takes the generation that is current for it.
+    let generations = Generations::new(Arc::clone(&config));
     // Reported by the control endpoint's `status`, so it is taken before any
     // startup work rather than when the endpoint happens to be bound.
     #[cfg(windows)]
@@ -212,12 +215,11 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         match crate::control::ControlListener::bind(name) {
             Ok(listener) => {
                 outln!("Control endpoint listening on {}", listener.path());
-                let config = Arc::clone(&config);
                 let (shutdown_tx, shutdown_rx) = oneshot::channel();
                 control_task = Some((
                     shutdown_tx,
                     tokio::spawn(listener.serve(
-                        config,
+                        Arc::clone(&generations),
                         started,
                         Arc::clone(&draining),
                         access_log.clone(),
@@ -280,7 +282,6 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         }
     }
 
-    let router = config.router_arc();
     // Started after the application listeners are bound and reported, and
     // stopped after they drain: a load balancer must be able to read `/ready`
     // for the whole of a graceful stop.
@@ -298,7 +299,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
                 );
             }
             let state = Arc::new(AdminState {
-                config: Arc::clone(&config),
+                generations: Arc::clone(&generations),
                 started: admin_started(),
                 draining: Arc::clone(&draining),
                 access_log: access_log.clone(),
@@ -316,8 +317,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
 
     let serve_result = serve_listeners(
         listeners,
-        router,
-        config.http_limits(),
+        Serving::Published(Arc::clone(&generations)),
         access_log.clone(),
         metrics.clone(),
         shutdown,
@@ -431,6 +431,109 @@ fn admin_bind_error(settings: AdminSettings, error: io::Error) -> ServerError {
     ))
 }
 
+/// The configuration generations this process has served.
+///
+/// A reload compiles a candidate from the same file the serving generation
+/// came from, carrying every resource that owns operating-system state, and
+/// publishes it by replacing one pointer. Connections already accepted keep
+/// the graph they were accepted under until they end, so a request finishes
+/// under the generation that admitted it; connections accepted afterwards see
+/// the published one. A refused reload replaces nothing.
+pub struct Generations {
+    current: std::sync::RwLock<Arc<RuntimeConfig>>,
+    /// One reload at a time. Two concurrent reloads could both read the
+    /// serving generation and publish over each other, so the second would
+    /// silently lose.
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl Generations {
+    pub fn new(config: Arc<RuntimeConfig>) -> Arc<Self> {
+        Arc::new(Self {
+            current: std::sync::RwLock::new(config),
+            gate: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// The generation new connections are served under.
+    pub fn current(&self) -> Arc<RuntimeConfig> {
+        Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Re-reads the configuration and publishes it, or refuses it.
+    ///
+    /// On any error the serving generation is untouched, because nothing is
+    /// written until a candidate has compiled. The compile itself runs on the
+    /// blocking pool: it reads a file and canonicalizes paths, which must not
+    /// happen on a runtime worker.
+    pub async fn reload(&self) -> Result<Arc<RuntimeConfig>, crate::config::ConfigError> {
+        let _gate = self.gate.lock().await;
+        let serving = self.current();
+        let compiled = tokio::task::spawn_blocking(move || crate::config::reload(&serving))
+            .await
+            .map_err(|error| {
+                crate::config::ConfigError::Reload(format!("the reload task failed: {error}"))
+            })??;
+        let published = Arc::new(compiled);
+        *self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&published);
+        Ok(published)
+    }
+}
+
+/// Where each accepted connection takes its route graph and limits from.
+pub enum Serving {
+    /// One fixed graph, which is what in-process tests and probes use.
+    Fixed(Arc<HostRouter>, HttpLimits),
+    /// The generations a reload publishes into.
+    Published(Arc<Generations>),
+}
+
+impl Serving {
+    /// Reads the graph one accepted connection will be served with.
+    fn accept(
+        &self,
+        access_log: Option<Arc<AccessLog>>,
+        metrics: Option<Arc<ServerMetrics>>,
+    ) -> ServeContext {
+        match self {
+            Self::Fixed(router, http_limits) => ServeContext {
+                router: Arc::clone(router),
+                http_limits: *http_limits,
+                generation: 1,
+                access_log,
+                metrics,
+            },
+            Self::Published(generations) => {
+                let serving = generations.current();
+                ServeContext {
+                    router: serving.router_arc(),
+                    http_limits: serving.http_limits(),
+                    generation: serving.generation(),
+                    access_log,
+                    metrics,
+                }
+            }
+        }
+    }
+
+    /// The admission bound, which belongs to the accept loop rather than to a
+    /// connection and is therefore read once.
+    fn max_connections(&self) -> usize {
+        match self {
+            Self::Fixed(_, http_limits) => http_limits.max_connections(),
+            Self::Published(generations) => generations.current().http_limits().max_connections(),
+        }
+    }
+}
+
 /// What every connection served by one accept loop shares.
 ///
 /// These three are cloned per connection and never change for its lifetime.
@@ -440,6 +543,9 @@ fn admin_bind_error(settings: AdminSettings, error: io::Error) -> ServerError {
 struct ServeContext {
     router: Arc<HostRouter>,
     http_limits: HttpLimits,
+    /// The generation this connection was accepted under, reported with every
+    /// request it serves.
+    generation: u64,
     access_log: Option<Arc<AccessLog>>,
     metrics: Option<Arc<ServerMetrics>>,
 }
@@ -457,8 +563,7 @@ where
 {
     serve_listeners(
         vec![Listener::cleartext(listener)],
-        router,
-        http_limits,
+        Serving::Fixed(router, http_limits),
         None,
         None,
         shutdown,
@@ -474,8 +579,7 @@ where
 /// bound on how long a silent peer can occupy one.
 pub async fn serve_listeners<F>(
     listeners: Vec<Listener>,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    serving: Serving,
     access_log: Option<Arc<AccessLog>>,
     metrics: Option<Arc<ServerMetrics>>,
     shutdown: F,
@@ -485,19 +589,16 @@ where
 {
     tokio::pin!(shutdown);
 
-    let context = ServeContext {
-        router,
-        http_limits,
-        access_log,
-        metrics,
-    };
+    // Admission is the accept loop's own bound, read once: changing it is a
+    // restart-only setting, so it cannot drift under a reload.
+    let max_connections = serving.max_connections();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut next_listener = 0;
 
     loop {
         tokio::select! {
-            accept_result = accept_any(&listeners, &mut next_listener), if connections.len() < http_limits.max_connections() => {
+            accept_result = accept_any(&listeners, &mut next_listener), if connections.len() < max_connections => {
                 let (index, stream, peer_addr) = accept_result?;
                 let accepted_at = Instant::now();
                 let local_addr = match stream.local_addr() {
@@ -510,7 +611,9 @@ where
                 let transport = TransportInfo::new(peer_addr, local_addr);
                 let tls = listeners[index].tls.clone();
                 let shutdown_rx = shutdown_rx.clone();
-                let context = context.clone();
+                // Read here, so a connection is served by the generation that
+                // was published when it was accepted.
+                let context = serving.accept(access_log.clone(), metrics.clone());
 
                 connections.spawn(async move {
                     serve_connection(stream, transport, tls, accepted_at, context, shutdown_rx)
@@ -651,6 +754,7 @@ async fn serve_http<I>(
     let ServeContext {
         router,
         http_limits,
+        generation,
         access_log,
         metrics,
     } = context;
@@ -668,7 +772,7 @@ async fn serve_http<I>(
             let started = std::time::Instant::now();
             let start = access_log
                 .as_ref()
-                .map(|log| log.begin(&request, connection_info));
+                .map(|log| log.begin(&request, connection_info, generation));
             let access_log = access_log.clone();
             let metrics = metrics.clone();
             async move {

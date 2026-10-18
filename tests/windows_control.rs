@@ -1300,6 +1300,96 @@ fn request_in_flight(address: SocketAddr, target: &str) -> thread::JoinHandle<St
 }
 
 #[test]
+#[ignore = "starts a detached server and reloads its configuration"]
+fn reload_publishes_a_new_generation_and_refuses_what_needs_a_restart() {
+    let scratch = Scratch::new("reload");
+    let name = control_name("reload");
+    let address = reserve_address();
+    for (directory, body) in [("one", "one"), ("two", "two")] {
+        fs::create_dir_all(scratch.file(directory)).unwrap();
+        fs::write(scratch.file(&format!("{directory}/index.html")), body).unwrap();
+    }
+    let config = scratch.file("server.toml");
+    let source = |root: &str, listen: &SocketAddr| {
+        format!(
+            "[server]\nlisten = \"{listen}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [[hosts]]\nname = \"localhost\"\naliases = [\"127.0.0.1\"]\n\n\
+             [[hosts.locations]]\npath = \"/\"\nhandler = \"static\"\nroot = \"{root}\"\n"
+        )
+    };
+    fs::write(&config, source("one", &address)).unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+
+    let (ok, status) = control(&config, "status");
+    assert!(ok, "{status}");
+    assert!(status.contains("generation=1"), "{status}");
+    let served = http_get(address, "/index.html");
+    assert!(served.ends_with("one"), "{served}");
+
+    // A change that owns no process state is published in place.
+    fs::write(&config, source("two", &address)).unwrap();
+    let (ok, reloaded) = control(&config, "reload");
+    assert!(ok, "the reload was refused: {reloaded}");
+    assert!(reloaded.contains("generation=2"), "{reloaded}");
+    assert!(reloaded.contains("previous_generation=1"), "{reloaded}");
+    let (ok, status) = control(&config, "status");
+    assert!(ok, "{status}");
+    assert!(status.contains("generation=2"), "{status}");
+    let served = http_get(address, "/index.html");
+    assert!(
+        served.ends_with("two"),
+        "the published generation is not serving: {served}"
+    );
+
+    // A file that no longer compiles changes nothing, and says which
+    // generation is still serving. It keeps `[server.control]`, because the
+    // client reads the endpoint name from the file: a file broken badly
+    // enough to lose that section cannot be used to reach the server at
+    // all, which is why the runbook says to validate before reloading.
+    fs::write(
+        &config,
+        format!("[server]\nlisten = \"nonsense\"\n\n[server.control]\nname = \"{name}\"\n"),
+    )
+    .unwrap();
+    let (ok, refused) = control(&config, "reload");
+    assert!(!ok, "an invalid configuration was published: {refused}");
+    assert!(refused.contains("ERR reload_failed"), "{refused}");
+    assert!(refused.contains("active_generation=2"), "{refused}");
+
+    // A valid file that would have to replace the listener is refused by
+    // name, because that is a restart rather than a reload.
+    let elsewhere = reserve_address();
+    fs::write(&config, source("two", &elsewhere)).unwrap();
+    let (ok, refused) = control(&config, "reload");
+    assert!(!ok, "a listener change was published: {refused}");
+    assert!(refused.contains("server.listen"), "{refused}");
+    assert!(refused.contains("active_generation=2"), "{refused}");
+
+    // Through all of that the server kept serving generation 2.
+    let served = http_get(address, "/index.html");
+    assert!(served.ends_with("two"), "{served}");
+    assert_eq!(server.exited(), None, "the server stopped during a reload");
+
+    // The configuration on disk is the invalid-listener one, so put the
+    // serving file back before stopping: a stop with a broken file on disk is
+    // a restart that would not come back.
+    fs::write(&config, source("two", &address)).unwrap();
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "{stopped}");
+    assert!(wait_for_exit(server.id(), Duration::from_secs(10)));
+    assert_eq!(server.exited(), Some(0));
+    eprintln!(
+        "control evidence: generation 1 -> 2 published; invalid and restart-only changes refused"
+    );
+}
+
+#[test]
 #[ignore = "starts a detached server and stops it with a request in flight; requires php/8.5/php.exe"]
 fn status_reports_draining_while_a_stop_finishes_an_in_flight_request() {
     let scratch = Scratch::new("drain");

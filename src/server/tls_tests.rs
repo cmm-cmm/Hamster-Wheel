@@ -21,7 +21,7 @@ use tokio::{
 };
 use tokio_rustls::rustls::{ClientConnection, pki_types::ServerName};
 
-use super::{Listener, serve_listeners};
+use super::{Listener, Serving, serve_listeners};
 use crate::{
     config::HttpLimits,
     router::{Handler, HostRouter, LocationRouter, VirtualHost},
@@ -66,8 +66,7 @@ impl Server {
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(serve_listeners(
             listeners,
-            Arc::new(router),
-            limits,
+            Serving::Fixed(Arc::new(router), limits),
             None,
             None,
             async move {

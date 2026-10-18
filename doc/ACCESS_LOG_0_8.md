@@ -51,6 +51,7 @@ second record.
 | `kind` | `access` for a request, `log_dropped` for the log's own note |
 | `ts_ms` | Unix epoch milliseconds when the request was accepted by the handler path |
 | `id` | Per-process request counter, starting at 1; the correlation key |
+| `generation` | The configuration generation that admitted the request (`doc/CONFIG_RELOAD_0_8.md`) |
 | `method`, `target`, `version` | As received; `target` is the path, plus the query only when configured |
 | `host` | The authority the router validated. The only header value a record carries |
 | `scheme` | `http` or `https` as established by the listener, never from a header |
@@ -219,8 +220,9 @@ that rate through the real release binary.
 - No lifecycle or error records of their own yet: lifecycle output still goes
   to stdout/stderr as operational lines. The `error` field is a request-scoped
   label, not a separate error stream.
-- No generation identity, because there is no configuration reload to have
-  generations. The `id` field is per process; it restarts at 1 on restart.
+- The `id` field is per process; it restarts at 1 on restart. The
+  `generation` field names the configuration that served the request, and also
+  restarts at 1.
 - No rotation, no reopen, no size or age bound inside Hamster.
 - No sampling and no per-location control: a configured log logs every request.
 - Linux is unverified, as everywhere else in this project.

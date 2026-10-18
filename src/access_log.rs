@@ -198,6 +198,7 @@ impl AccessLog {
         &self,
         request: &Request<B>,
         connection: ConnectionInfo,
+        generation: u64,
     ) -> RequestStart {
         let path = request.uri().path();
         let target = match (self.include_query, request.uri().query()) {
@@ -218,6 +219,7 @@ impl AccessLog {
             .map(Box::from);
         RequestStart {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            generation,
             at_ms: unix_millis(),
             method: Box::from(request.method().as_str()),
             target,
@@ -259,6 +261,9 @@ impl AccessLog {
 /// Everything known about a request before its response exists.
 pub(crate) struct RequestStart {
     id: u64,
+    /// The configuration generation that admitted this request, so a record
+    /// can be placed in the configuration it was served under.
+    generation: u64,
     at_ms: u64,
     method: Box<str>,
     target: Box<str>,
@@ -297,8 +302,8 @@ impl Record {
                 let start = &record.start;
                 let _ = write!(
                     out,
-                    r#"{{"kind":"access","ts_ms":{},"id":{},"method":""#,
-                    start.at_ms, start.id
+                    r#"{{"kind":"access","ts_ms":{},"id":{},"generation":{},"method":""#,
+                    start.at_ms, start.id, start.generation
                 );
                 escape_json(&start.method, out);
                 out.push_str(r#"","target":""#);
@@ -776,11 +781,11 @@ mod tests {
             .header(HOST, "localhost")
             .body(())
             .unwrap();
-        let start_without = log.begin(&request, connection());
+        let start_without = log.begin(&request, connection(), 1);
         assert_eq!(&*start_without.target, "/search");
 
         let (log, _writer) = super::start(&settings(true)).unwrap();
-        let start_with = log.begin(&request, connection());
+        let start_with = log.begin(&request, connection(), 1);
         assert_eq!(&*start_with.target, "/search?q=hamster&token=REDACTED");
         assert_eq!(start_with.host.as_deref(), Some("localhost"));
         assert_eq!(&*start_with.method, "GET");
@@ -796,7 +801,7 @@ mod tests {
             .body(())
             .unwrap();
         let mut line = String::new();
-        record_of(log.begin(&request, connection()), 200, 1_234, true).write_json(&mut line);
+        record_of(log.begin(&request, connection(), 1), 200, 1_234, true).write_json(&mut line);
         assert!(!line.contains('\n'), "{line}");
         assert!(line.starts_with(r#"{"kind":"access","ts_ms":"#), "{line}");
         for field in [
@@ -822,8 +827,8 @@ mod tests {
     async fn ids_are_unique_per_request_so_records_can_be_correlated() {
         let (log, _writer) = start(&settings(false)).unwrap();
         let request = Request::builder().uri("/").body(()).unwrap();
-        let first = log.begin(&request, connection());
-        let second = log.begin(&request, connection());
+        let first = log.begin(&request, connection(), 1);
+        let second = log.begin(&request, connection(), 1);
         assert_eq!((first.id, second.id), (1, 2));
     }
 
@@ -840,7 +845,12 @@ mod tests {
         };
         let request = Request::builder().uri("/").body(()).unwrap();
         for _ in 0..5 {
-            log.submit(record_of(log.begin(&request, connection()), 200, 0, true));
+            log.submit(record_of(
+                log.begin(&request, connection(), 1),
+                200,
+                0,
+                true,
+            ));
         }
         assert_eq!(log.dropped(), 3);
         assert_eq!(log.queued(), 2);

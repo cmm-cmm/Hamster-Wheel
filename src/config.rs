@@ -285,6 +285,17 @@ const fn default_php_workers() -> usize {
 }
 
 pub struct RuntimeConfig {
+    /// Which compilation of the configuration this is, counting from 1.
+    ///
+    /// A reload publishes the next generation; everything that reports about a
+    /// request or about the server names the generation it belongs to, so two
+    /// reports can be placed in the same configuration without guessing.
+    generation: u64,
+    /// Where this generation was compiled from, so a reload can read it again.
+    source: ConfigSelection,
+    /// What a reload may not change in place, and how carried resources are
+    /// recognised. See `ReloadIdentity`.
+    identity: ReloadIdentity,
     listen: Option<SocketAddr>,
     tls: Option<Arc<TlsListener>>,
     http_limits: HttpLimits,
@@ -477,6 +488,37 @@ impl RuntimeConfig {
         self.admin
     }
 
+    /// Which compilation of the configuration is serving.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The configuration this generation was compiled from.
+    pub fn source(&self) -> &ConfigSelection {
+        &self.source
+    }
+
+    fn php_worker_pool(&self, label: &str) -> Option<Arc<PhpWorkerPool>> {
+        self.php_pools
+            .iter()
+            .find(|pool| pool.label() == label)
+            .map(Arc::clone)
+    }
+
+    fn upstream(&self, label: &str) -> Option<Arc<Upstream>> {
+        self.upstreams
+            .iter()
+            .find(|upstream| upstream.label() == label)
+            .map(Arc::clone)
+    }
+
+    fn fastcgi_backend(&self, label: &str) -> Option<Arc<FastCgiBackend>> {
+        self.fastcgi_backends
+            .iter()
+            .find(|backend| backend.label() == label)
+            .map(Arc::clone)
+    }
+
     /// The HTTPS listener, with its certificates already loaded and checked.
     pub fn tls(&self) -> Option<&Arc<TlsListener>> {
         self.tls.as_ref()
@@ -584,6 +626,9 @@ pub enum ConfigError {
     },
     Validation(String),
     Compile(String),
+    /// A valid configuration that cannot be published into the running
+    /// process. The serving generation is untouched.
+    Reload(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -604,6 +649,9 @@ impl fmt::Display for ConfigError {
             Self::Compile(message) => {
                 write!(formatter, "failed to compile configuration: {message}")
             }
+            Self::Reload(message) => {
+                write!(formatter, "cannot reload in place: {message}")
+            }
         }
     }
 }
@@ -613,7 +661,7 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::Arguments(_) | Self::Validation(_) | Self::Compile(_) => None,
+            Self::Arguments(_) | Self::Validation(_) | Self::Compile(_) | Self::Reload(_) => None,
         }
     }
 }
@@ -719,11 +767,14 @@ pub fn load_file(path: &Path) -> Result<RuntimeConfig, ConfigError> {
         &contents,
         base_directory,
         &canonical_path.display().to_string(),
+        ConfigSelection::File(canonical_path.clone()),
     )
 }
 
 pub fn compile_str(source: &str, base_directory: &Path) -> Result<RuntimeConfig, ConfigError> {
-    compile_str_named(source, base_directory, "<memory>")
+    // An in-memory configuration has no file to re-read, so a reload of the
+    // result is refused rather than silently recompiling something else.
+    compile_str_named(source, base_directory, "<memory>", ConfigSelection::BuiltIn)
 }
 
 fn load_builtin() -> Result<RuntimeConfig, ConfigError> {
@@ -780,9 +831,10 @@ fn compile_str_named(
     source: &str,
     base_directory: &Path,
     source_name: &str,
+    selection: ConfigSelection,
 ) -> Result<RuntimeConfig, ConfigError> {
     let raw = parse_raw(source, source_name)?;
-    compile_raw(raw, base_directory)
+    compile_raw_from(raw, base_directory, selection, None)
 }
 
 pub(crate) fn parse_raw(source: &str, source_name: &str) -> Result<RawConfig, ConfigError> {
@@ -796,8 +848,58 @@ pub(crate) fn compile_raw(
     raw: RawConfig,
     base_directory: &Path,
 ) -> Result<RuntimeConfig, ConfigError> {
+    compile_raw_from(raw, base_directory, ConfigSelection::BuiltIn, None)
+}
+
+/// Compiles a configuration, optionally carrying a serving generation.
+///
+/// With `carry`, every resource that owns operating-system state is taken from
+/// that generation instead of being built, and a configuration that disagrees
+/// about any of them is refused. Without it, this is an ordinary first
+/// compilation.
+pub(crate) fn compile_raw_from(
+    raw: RawConfig,
+    base_directory: &Path,
+    source: ConfigSelection,
+    carry: Option<&RuntimeConfig>,
+) -> Result<RuntimeConfig, ConfigError> {
     let validated = validate_raw(raw, base_directory)?;
-    compile_validated(validated)
+    compile_validated_from(validated, source, carry)
+}
+
+/// Re-reads and recompiles the configuration a generation was compiled from,
+/// carrying that generation's process-owned resources.
+///
+/// Nothing here touches the running server: the caller publishes the result,
+/// or keeps serving the generation it already had.
+pub fn reload(previous: &RuntimeConfig) -> Result<RuntimeConfig, ConfigError> {
+    let ConfigSelection::File(path) = previous.source() else {
+        return Err(ConfigError::Reload(
+            "this server was started from the built-in configuration, which has no file to \
+             re-read"
+                .to_owned(),
+        ));
+    };
+    let canonical_path = fs::canonicalize(path).map_err(|source| ConfigError::Io {
+        context: format!("cannot resolve config file {}", path.display()),
+        source,
+    })?;
+    let contents = fs::read_to_string(&canonical_path).map_err(|source| ConfigError::Io {
+        context: format!("cannot read config file {}", canonical_path.display()),
+        source,
+    })?;
+    let base_directory = canonical_path.parent().ok_or_else(|| {
+        ConfigError::Validation(format!(
+            "config file {} has no parent directory",
+            canonical_path.display()
+        ))
+    })?;
+    let raw: RawConfig = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        source_name: canonical_path.display().to_string(),
+        source,
+    })?;
+    let selection = ConfigSelection::File(canonical_path.clone());
+    compile_raw_from(raw, base_directory, selection, Some(previous))
 }
 
 pub(crate) struct ValidatedConfig {
@@ -1572,11 +1674,34 @@ fn register_hostname(
 }
 
 pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeConfig, ConfigError> {
-    let tls = validated
-        .tls
-        .map(|source| TlsListener::compile(source).map(Arc::new))
-        .transpose()
-        .map_err(ConfigError::Compile)?;
+    compile_validated_from(validated, ConfigSelection::BuiltIn, None)
+}
+
+pub(crate) fn compile_validated_from(
+    validated: ValidatedConfig,
+    source: ConfigSelection,
+    carry: Option<&RuntimeConfig>,
+) -> Result<RuntimeConfig, ConfigError> {
+    let mut identity = ReloadIdentity::from_validated(&validated);
+    // Refused before anything is built, so a configuration that needs a
+    // restart costs the serving generation nothing at all.
+    if let Some(previous) = carry
+        && let Some(reason) = previous.identity.refuse_process_change(&identity)
+    {
+        return Err(ConfigError::Reload(reason));
+    }
+    let tls = match carry {
+        // The identity above proved the TLS section identical, so the serving
+        // listener is carried with its certificate generation and its
+        // handshake counters intact. Certificate *contents* are reloaded by
+        // the separate transactional certificate reload.
+        Some(previous) => previous.tls.clone(),
+        None => validated
+            .tls
+            .map(|source| TlsListener::compile(source).map(Arc::new))
+            .transpose()
+            .map_err(ConfigError::Compile)?,
+    };
     let mut virtual_hosts = Vec::new();
     let mut php_pools = Vec::new();
     let mut upstreams = Vec::new();
@@ -1616,15 +1741,30 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                             host.name
                         ),
                     )?;
-                    let backend = FastCgiBackend::new(FastCgiConfig {
-                        label: Arc::from(format!("{}{}", host.name, location.path).as_str()),
-                        document_root,
-                        index,
-                        servers,
-                        concurrency,
-                        connect_timeout,
-                        response_timeout,
-                    });
+                    let label = format!("{}{}", host.name, location.path);
+                    let fingerprint = format!(
+                        "{}|{index:?}|{servers:?}|{concurrency}|{connect_timeout:?}|{response_timeout:?}",
+                        document_root.display()
+                    );
+                    identity.fastcgi.insert(label.clone(), fingerprint.clone());
+                    let backend = match carry {
+                        Some(previous) => carried(
+                            previous.fastcgi_backend(&label),
+                            &previous.identity.fastcgi,
+                            &label,
+                            &fingerprint,
+                            "fastcgi endpoint",
+                        )?,
+                        None => FastCgiBackend::new(FastCgiConfig {
+                            label: Arc::from(label.as_str()),
+                            document_root,
+                            index,
+                            servers,
+                            concurrency,
+                            connect_timeout,
+                            response_timeout,
+                        }),
+                    };
                     fastcgi_backends.push(Arc::clone(&backend));
                     Handler::fastcgi_with_access(backend, Arc::clone(&host.access))
                 }
@@ -1659,21 +1799,38 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     // the operator already wrote in their configuration.
                     let label: Arc<str> =
                         Arc::from(format!("{}{}", host.name, location.path).as_str());
-                    let pool = Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
-                        worker: PhpWorkerConfig {
-                            executable,
-                            script,
-                            env,
-                        },
-                        label,
-                        workers,
-                        queue_capacity,
-                        request_timeout,
-                        startup_timeout,
-                        max_requests,
-                        max_worker_age,
-                        body_budget: Arc::clone(&body_budget),
-                    }));
+                    let fingerprint = format!(
+                        "{}|{}|{workers}|{queue_capacity}|{request_timeout:?}|{startup_timeout:?}|{max_requests:?}|{max_worker_age:?}|{env:?}",
+                        executable.display(),
+                        script.display()
+                    );
+                    identity
+                        .pools
+                        .insert(label.to_string(), fingerprint.clone());
+                    let pool = match carry {
+                        Some(previous) => carried(
+                            previous.php_worker_pool(&label),
+                            &previous.identity.pools,
+                            &label,
+                            &fingerprint,
+                            "php pool",
+                        )?,
+                        None => Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
+                            worker: PhpWorkerConfig {
+                                executable,
+                                script,
+                                env,
+                            },
+                            label,
+                            workers,
+                            queue_capacity,
+                            request_timeout,
+                            startup_timeout,
+                            max_requests,
+                            max_worker_age,
+                            body_budget: Arc::clone(&body_budget),
+                        })),
+                    };
                     php_pools.push(Arc::clone(&pool));
                     Handler::php_worker(pool)
                 }
@@ -1697,18 +1854,34 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         hyper::header::HeaderValue::from_str(&authority).map_err(|error| {
                             ConfigError::Compile(format!("{field} authority: {error}"))
                         })?;
-                    let upstream = Upstream::new(ProxyConfig {
-                        label: Arc::from(format!("{}{}", host.name, location.path).as_str()),
-                        address,
-                        authority,
-                        connect_timeout,
-                        response_header_timeout,
-                        progress_timeout,
-                        idle_timeout,
-                        max_idle,
-                        preserve_host,
-                        max_buf_size: validated.http_limits.http1_max_buffer_size(),
-                    });
+                    let label = format!("{}{}", host.name, location.path);
+                    let fingerprint = format!(
+                        "{address}|{authority:?}|{connect_timeout:?}|{response_header_timeout:?}|{progress_timeout:?}|{idle_timeout:?}|{max_idle}|{preserve_host}"
+                    );
+                    identity
+                        .upstreams
+                        .insert(label.clone(), fingerprint.clone());
+                    let upstream = match carry {
+                        Some(previous) => carried(
+                            previous.upstream(&label),
+                            &previous.identity.upstreams,
+                            &label,
+                            &fingerprint,
+                            "proxy upstream",
+                        )?,
+                        None => Upstream::new(ProxyConfig {
+                            label: Arc::from(label.as_str()),
+                            address,
+                            authority,
+                            connect_timeout,
+                            response_header_timeout,
+                            progress_timeout,
+                            idle_timeout,
+                            max_idle,
+                            preserve_host,
+                            max_buf_size: validated.http_limits.http1_max_buffer_size(),
+                        }),
+                    };
                     upstreams.push(Arc::clone(&upstream));
                     Handler::proxy(upstream)
                 }
@@ -1738,7 +1911,36 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
     }
     let router = HostRouter::new(virtual_hosts)
         .map_err(|error| ConfigError::Compile(format!("host router: {error}")))?;
+    if let Some(previous) = carry {
+        // A resource the serving generation owns and the new configuration
+        // does not would have to be destroyed, which is the same decision as
+        // creating one: it needs a restart, not a reload.
+        for (kind, serving, published) in [
+            ("php pool", &previous.identity.pools, &identity.pools),
+            (
+                "proxy upstream",
+                &previous.identity.upstreams,
+                &identity.upstreams,
+            ),
+            (
+                "fastcgi endpoint",
+                &previous.identity.fastcgi,
+                &identity.fastcgi,
+            ),
+        ] {
+            if let Some(label) = serving.keys().find(|label| !published.contains_key(*label)) {
+                return Err(ConfigError::Reload(format!(
+                    "{kind} {label} is no longer configured; a reload cannot retire a running \
+                     resource, so restart to apply it"
+                )));
+            }
+        }
+    }
+    let generation = carry.map_or(1, |previous| previous.generation + 1);
     Ok(RuntimeConfig {
+        generation,
+        source,
+        identity,
         listen: validated.listen,
         tls,
         http_limits: validated.http_limits,
@@ -1750,6 +1952,143 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         upstreams,
         fastcgi_backends,
     })
+}
+
+/// Takes a resource from the serving generation, or says why it cannot.
+///
+/// `existing` is the resource with this label in the serving generation and
+/// `serving` its fingerprints. A label that is new, or whose settings differ,
+/// means the published generation would have to build something that owns
+/// operating-system state.
+fn carried<T>(
+    existing: Option<T>,
+    serving: &BTreeMap<String, String>,
+    label: &str,
+    fingerprint: &str,
+    kind: &str,
+) -> Result<T, ConfigError> {
+    match (existing, serving.get(label)) {
+        (Some(resource), Some(previous)) if previous == fingerprint => Ok(resource),
+        (Some(_), _) => Err(ConfigError::Reload(format!(
+            "{kind} {label} changed; its settings are held by a running resource, so restart to \
+             apply them"
+        ))),
+        (None, _) => Err(ConfigError::Reload(format!(
+            "{kind} {label} is new; a reload cannot start one, so restart to apply it"
+        ))),
+    }
+}
+
+/// What a reload may not change in place, plus a fingerprint per resource.
+///
+/// A reload must never create or destroy something that owns operating-system
+/// state: a listening socket, a named pipe, a log file, a PHP worker process,
+/// an upstream connection pool. Those are carried from the serving generation
+/// into the published one, unchanged, which is also what keeps warm PHP
+/// workers warm across a reload. So every such resource is fingerprinted from
+/// the settings it was built with, and a reload whose configuration disagrees
+/// with the fingerprint is refused, naming the resource, rather than quietly
+/// restarting it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReloadIdentity {
+    listen: Option<SocketAddr>,
+    tls: Option<String>,
+    control: Option<String>,
+    admin: Option<SocketAddr>,
+    access_log: Option<String>,
+    /// The body budget is one allocation shared by every pool, so its size is
+    /// fixed for the life of the process.
+    max_body_memory: usize,
+    /// Buffer size is baked into each upstream's client at construction.
+    http1_max_buffer_size: usize,
+    pools: BTreeMap<String, String>,
+    upstreams: BTreeMap<String, String>,
+    fastcgi: BTreeMap<String, String>,
+}
+
+impl ReloadIdentity {
+    /// The parts that are decided before any host is walked.
+    fn from_validated(validated: &ValidatedConfig) -> Self {
+        Self {
+            listen: validated.listen,
+            tls: validated.tls.as_ref().map(fingerprint_tls),
+            control: validated.control.clone(),
+            admin: validated.admin.map(|admin| admin.listen()),
+            access_log: validated.access_log.as_ref().map(fingerprint_access_log),
+            max_body_memory: validated.http_limits.max_body_memory(),
+            http1_max_buffer_size: validated.http_limits.http1_max_buffer_size(),
+            pools: BTreeMap::new(),
+            upstreams: BTreeMap::new(),
+            fastcgi: BTreeMap::new(),
+        }
+    }
+
+    /// Why a reload cannot publish this configuration in place, if it cannot.
+    ///
+    /// Only the process-owned parts are compared here; resources are compared
+    /// one at a time as they are reached, so the refusal can name the exact
+    /// pool, upstream or endpoint rather than the whole section.
+    fn refuse_process_change(&self, next: &Self) -> Option<String> {
+        let changed = [
+            (self.listen != next.listen, "server.listen"),
+            (self.tls != next.tls, "server.tls"),
+            (self.control != next.control, "server.control"),
+            (self.admin != next.admin, "server.admin"),
+            (self.access_log != next.access_log, "server.access_log"),
+            (
+                self.max_body_memory != next.max_body_memory,
+                "server.max_body_memory",
+            ),
+            (
+                self.http1_max_buffer_size != next.http1_max_buffer_size,
+                "server.http1_max_buffer_size",
+            ),
+        ];
+        changed
+            .into_iter()
+            .find_map(|(differs, field)| differs.then_some(field))
+            .map(|field| {
+                format!(
+                    "{field} changed, which owns a socket, a pipe, a file or a client that a reload must not replace; restart to apply it"
+                )
+            })
+    }
+}
+
+fn fingerprint_tls(source: &TlsSource) -> String {
+    let certificates = source
+        .certificates
+        .iter()
+        .map(|certificate| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                certificate.field,
+                certificate.cert.display(),
+                certificate.key.display(),
+                certificate
+                    .names
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                certificate.default
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "{}|{:?}|{certificates}",
+        source.listen, source.handshake_timeout
+    )
+}
+
+fn fingerprint_access_log(settings: &crate::access_log::Settings) -> String {
+    format!(
+        "{:?}|{}|{}",
+        settings.path(),
+        settings.include_query(),
+        settings.queue_capacity()
+    )
 }
 
 /// Validates `[server.admin]`.
@@ -2088,6 +2427,212 @@ path = \"ignored\"
             compile_str(&port, Path::new(".")),
             Err(ConfigError::Validation(_))
         ));
+    }
+
+    /// A configuration file this test owns, so a reload has something to read.
+    struct ReloadScratch(PathBuf);
+
+    impl ReloadScratch {
+        fn new(tag: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "hamster-reload-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(directory.join("public")).unwrap();
+            fs::create_dir_all(directory.join("other")).unwrap();
+            Self(directory)
+        }
+
+        fn write(&self, body: &str) -> PathBuf {
+            let path = self.0.join("hamster.toml");
+            fs::write(&path, body).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ReloadScratch {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    /// A configuration whose only resources are a listener and static roots.
+    fn reloadable(address: &str, root: &str) -> String {
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[[hosts]]\nname = \"localhost\"\n\n\
+             [[hosts.locations]]\npath = \"/\"\nhandler = \"static\"\nroot = \"{root}\"\n"
+        )
+    }
+
+    #[test]
+    fn a_reload_publishes_the_next_generation_and_keeps_serving_the_old_one_on_refusal() {
+        let scratch = ReloadScratch::new("generation");
+        let path = scratch.write(&reloadable("127.0.0.1:8080", "public"));
+        let first = load_file(&path).unwrap();
+        assert_eq!(first.generation(), 1);
+
+        // A change that owns nothing: the published generation is next, and
+        // the serving one is untouched because the caller still holds it.
+        fs::write(&path, reloadable("127.0.0.1:8080", "other")).unwrap();
+        let second = reload(&first).unwrap();
+        assert_eq!(second.generation(), 2);
+        assert_eq!(first.generation(), 1);
+        let third = reload(&second).unwrap();
+        assert_eq!(third.generation(), 3);
+
+        // A file that no longer compiles is an ordinary error, and the
+        // generation that asked for the reload is still complete.
+        fs::write(&path, "[server]\nlisten = \"nonsense\"\n").unwrap();
+        assert!(matches!(
+            reload(&third),
+            Err(ConfigError::Validation(_) | ConfigError::Parse { .. })
+        ));
+        assert_eq!(third.generation(), 3);
+    }
+
+    #[test]
+    fn a_reload_cannot_change_anything_that_owns_process_state() {
+        let scratch = ReloadScratch::new("refuse");
+        let base = format!(
+            "{}\n[server.admin]\nlisten = \"127.0.0.1:9090\"\n\n[server.access_log]\npath = \"access.jsonl\"\n",
+            reloadable("127.0.0.1:8080", "public")
+        );
+        let path = scratch.write(&base);
+        let serving = load_file(&path).unwrap();
+
+        for (change, replacement, field) in [
+            (
+                "listener",
+                base.replace("127.0.0.1:8080", "127.0.0.1:8081"),
+                "server.listen",
+            ),
+            (
+                "admin",
+                base.replace("127.0.0.1:9090", "127.0.0.1:9091"),
+                "server.admin",
+            ),
+            (
+                "access log",
+                base.replace("access.jsonl", "other.jsonl"),
+                "server.access_log",
+            ),
+            (
+                "body budget",
+                format!("{base}max_body_memory_marker = 0\n").replace(
+                    "[server]\nlisten",
+                    "[server]\nmax_body_memory = 1048576\nlisten",
+                ),
+                "server.max_body_memory",
+            ),
+        ] {
+            fs::write(
+                &path,
+                replacement.replace("max_body_memory_marker = 0\n", ""),
+            )
+            .unwrap();
+            let refusal = reload(&serving);
+            match refusal {
+                Err(ConfigError::Reload(message)) => assert!(
+                    message.contains(field),
+                    "{change}: expected {field} in {message}"
+                ),
+                Err(other) => panic!("{change}: {other}"),
+                Ok(_) => panic!("{change} was not refused"),
+            }
+            // Refused before anything was built, so the serving generation is
+            // exactly as it was.
+            assert_eq!(serving.generation(), 1);
+            // A refusal is read by a person in a terminal, so it stays one
+            // sentence on one line: a lost string continuation once left a run
+            // of indentation inside this message.
+            if let Err(ConfigError::Reload(message)) = reload(&serving) {
+                assert!(!message.contains("  "), "{message:?}");
+                assert!(!message.contains('\n'), "{message:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_reload_carries_a_proxy_upstream_and_refuses_to_change_one() {
+        let scratch = ReloadScratch::new("upstream");
+        let proxy = |upstream: &str, root: &str| {
+            format!(
+                "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n\
+                 [[hosts.locations]]\npath = \"/static\"\nhandler = \"static\"\nroot = \"{root}\"\n\n\
+                 [[hosts.locations]]\npath = \"/\"\nhandler = \"proxy\"\n\n\
+                 [hosts.locations.proxy]\nupstream = \"{upstream}\"\n"
+            )
+        };
+        let path = scratch.write(&proxy("http://127.0.0.1:3000", "public"));
+        let serving = load_file(&path).unwrap();
+        let before = Arc::clone(&serving.upstreams()[0]);
+
+        // A static change beside an upstream: the upstream is the same object,
+        // so its idle connections and counters survive the reload.
+        fs::write(&path, proxy("http://127.0.0.1:3000", "other")).unwrap();
+        let published = reload(&serving).unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &published.upstreams()[0]),
+            "the upstream was rebuilt instead of carried"
+        );
+
+        // Changing it is refused by name.
+        fs::write(&path, proxy("http://127.0.0.1:3001", "public")).unwrap();
+        match reload(&serving) {
+            Err(ConfigError::Reload(message)) => {
+                assert!(message.contains("proxy upstream localhost/"), "{message}");
+                assert!(message.contains("changed"), "{message}");
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a changed upstream was not refused"),
+        }
+
+        // So is removing it.
+        fs::write(&path, reloadable("127.0.0.1:8080", "public")).unwrap();
+        match reload(&serving) {
+            Err(ConfigError::Reload(message)) => {
+                assert!(message.contains("no longer configured"), "{message}");
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a retired upstream was not refused"),
+        }
+
+        // And adding one.
+        let with_two = format!(
+            "{}\n[[hosts.locations]]\npath = \"/api\"\nhandler = \"proxy\"\n\n\
+             [hosts.locations.proxy]\nupstream = \"http://127.0.0.1:3002\"\n",
+            proxy("http://127.0.0.1:3000", "public")
+        );
+        fs::write(&path, with_two).unwrap();
+        match reload(&serving) {
+            Err(ConfigError::Reload(message)) => {
+                assert!(message.contains("is new"), "{message}");
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a new upstream was not refused"),
+        }
+    }
+
+    #[test]
+    fn the_built_in_configuration_has_no_file_to_reload() {
+        let built_in = load_builtin().unwrap();
+        match reload(&built_in) {
+            Err(ConfigError::Reload(message)) => {
+                assert!(message.contains("built-in"), "{message}");
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("the built-in configuration was reloaded"),
+        }
+        // An in-memory compilation is in the same position, and must not
+        // silently reload something else.
+        let in_memory = compile_str(&reloadable("127.0.0.1:8080", "."), Path::new(".")).unwrap();
+        assert!(matches!(reload(&in_memory), Err(ConfigError::Reload(_))));
     }
 
     #[test]
