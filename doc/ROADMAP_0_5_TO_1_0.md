@@ -325,13 +325,30 @@ Required for an edge-capable 1.0:
 - HTTP/2 over negotiated TLS, using the same request context, limits,
   cancellation and backend contracts;
 - cross-platform packaging, upgrade/rollback instructions and compatibility
-  matrices;
+  matrices (`doc/PACKAGING_UPGRADE_ROLLBACK.md` covers deployment, the upgrade
+  and rollback sequences and the compatibility rule; still open there: an
+  installer or package, code signing, a version resource in the executable and
+  a version number that identifies the build);
 - long mixed-workload, connection, memory, worker, FastCGI, proxy, reload and
   TLS failure soaks;
 - security review of HTTP parsing policy, forwarding trust, filesystem
-  containment, configuration secrets, admin exposure and backend isolation;
+  containment, configuration secrets, admin exposure and backend isolation.
+  Filesystem containment has a known opening: off Windows the file is opened by
+  its canonical pathname after the containment check, which
+  `src/static_files.rs` states and which is not qualified against concurrent
+  namespace changes. The
+  Windows path opens a handle and verifies its final location. Qualifying or
+  closing the non-Windows gap belongs in this review, not in a note;
 - reproducible Windows and Linux release benchmarks with declared saturation
-  points rather than best-run headlines.
+  points rather than best-run headlines;
+- the Linux static-file path, which `doc/LINUX_VERIFICATION.md` measured at
+  268 us of Hamster CPU per request against 26 us for `not_found`, and which
+  `doc/FRANKENPHP_LINUX_COMPARISON.md` measured at 2 to 3.4 times slower than
+  Caddy serving the same file. The stated hypothesis is that the non-Windows
+  `resolve_file` makes four `tokio::fs` calls, each a blocking-pool round trip,
+  where the Windows path resolves in one blocking task. It has not been
+  profiled. This is the largest measured gap to a comparable server and is a
+  named item rather than an observation.
 
 An origin-only 1.0 may defer TLS and HTTP/2 only if the owner explicitly makes
 an external TLS terminator/load balancer part of the supported deployment

@@ -2312,3 +2312,63 @@ Latency percentiles, ranges, RSS and the static-binary run are in the report. No
 - a database-backed application;
 - failure, recycle or soak behaviour;
 - any host other than this one.
+
+## Downstream TCP_NODELAY — Windows A/B (2026-10-18)
+
+The Linux entry above measured `set_nodelay(true)` on accepted connections as
+a 141x fix at C1. The option applies on Windows too and was unmeasured there,
+which `AGENTS.md` requires for a hot-path change. This is that measurement.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc            # candidate
+# base: the same tree with the one `set_nodelay` line removed
+./benchmarks/static_http.ps1 -Executable <arm>.exe -ConfigPath <shared>.toml `
+  -Runs 1 -Requests 20000 -Concurrency 1 -WarmupRequests 1000     # C1
+./benchmarks/static_http.ps1 -Executable <arm>.exe -ConfigPath <shared>.toml `
+  -Runs 1 -Requests 100000 -Concurrency 32 -WarmupRequests 1000   # C32
+```
+
+Conditions: Intel i5-1235U (2 performance cores + 8 efficient cores, 12
+threads, 1.3 GHz base), Windows 11 Home 10.0.26300, 12% background load before
+the run. Both arms built from this tree and differ only by that one line; both
+serve the same static file through the same configuration file, with the .NET
+driver's keep-alive client on the same host. Three pairs per cell, arms
+alternating, pair 2 reversed so the order bias can be seen.
+
+| Cell | Pair | Order | base RPS | candidate RPS | candidate vs base |
+|---|---|---|---:|---:|---:|
+| static, C1 | 1 | base first | 2,797 | 2,964 | +6.0% |
+| static, C1 | 2 | candidate first | 2,973 | 3,911 | +31.6% |
+| static, C1 | 3 | base first | 3,669 | 3,603 | -1.8% |
+| static, C32 | 1 | base first | 4,939 | 4,708 | -4.7% |
+| static, C32 | 2 | candidate first | 5,061 | 3,910 | -22.7% |
+| static, C32 | 3 | base first | 5,120 | 4,890 | -4.5% |
+
+**Windows has no delayed-ACK stall to fix.** That is the result that matters,
+and it does not depend on the spread: the base arm's C1 p50 was 0.245-0.328 ms
+against the candidate's 0.243-0.316 ms, where the Linux base arm sat at 44 ms.
+Nagle and the client's delayed acknowledgement do not interact this way on
+Windows loopback with this client, so the option buys nothing here.
+
+At C32 every pair made the candidate slower: -4.7%, -22.7%, -4.5%. The two
+same-order pairs agree at -4.6%; including the reversed pair the balanced
+estimate is -13.7%, but that pair's candidate run is the slowest of all six and
+ran first, so the honest reading is "a consistent cost of roughly 5%, which
+this host cannot resolve more precisely". A cost is physically plausible: with
+Nagle off, a head and a body go out as two packets instead of one coalesced
+one, and on loopback the packet rate is the whole cost. The C1 spread (2,797 to
+3,911 RPS, 40%) is the machine, as recorded in the two 0.8 entries above.
+
+**The option is kept on Windows even so, and this is the reason.** Both arms
+here are loopback, where the local stack acknowledges immediately and no
+delayed-ACK period can appear. A remote Windows client delays acknowledgements
+by up to 200 ms by default, and a head-then-body response is exactly the shape
+that waits for one. This run cannot rule that in or out, so it cannot justify
+removing a guard against a 200 ms stall to recover about 5% of a loopback
+packet-rate cell. What it does justify is not claiming the Linux fix as a
+Windows improvement.
+
+Not measured: any remote client, on either platform; TLS; and the PHP and
+FastCGI cells on Windows, which are single-write responses that the Linux A/B
+found unaffected.
+

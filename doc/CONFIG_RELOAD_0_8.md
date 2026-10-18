@@ -13,6 +13,21 @@ serve, status, reload and stop" item together with `--validate`.
 hamster-wheel.exe --config D:\site\hamster.toml --control reload
 ```
 
+Off Windows there is no control endpoint, so the trigger is a signal:
+
+```sh
+kill -USR1 "$(cat /run/hamster-wheel.pid)"
+```
+
+SIGUSR1 publishes a configuration reload and SIGHUP keeps its single tested
+meaning, reloading the certificate files transactionally. They are separate so
+an operator rotating a certificate cannot also publish configuration edits
+they did not mean to. The result goes to stdout or stderr and to the
+`reload_published` or `reload_refused` lifecycle record, carrying the same
+facts the endpoint's answer carries. **NOT VERIFIED on Linux**: the handler is
+compile-checked by the non-Windows cfg-flip check, and no signal has been
+delivered to a running process on a Linux host.
+
 The server re-reads the file it was started from, compiles it, and either
 publishes it as the next **generation** or refuses it and keeps serving the
 one it has. A refusal costs the serving generation nothing: it happens before

@@ -1,6 +1,113 @@
 # AI Handoff
 
-## Current: lifecycle records and log rotation (2026-10-18)
+## Current: dev-linux merged, and the follow-ups it left (2026-10-18)
+
+`dev-linux` is merged at `a3c4412`, the two signal gaps are fixed at
+`96aa0b1`, and this section covers the rest. The Linux work itself is
+documented by its own records: `doc/LINUX_VERIFICATION.md` and
+`doc/FRANKENPHP_LINUX_COMPARISON.md`.
+
+FACT: the merge was reviewed rather than taken on trust, and it stands up.
+The `TCP_NODELAY` regression test asserts a median keep-alive exchange under
+20 ms over 20 exchanges, so the 44 ms stall cannot come back unnoticed. The
+benchmark records carry machine, kernel, PHP build, binary identity, client,
+warm-up, three runs per arm interleaved A B B A A B, min/median/max and
+per-run percentiles, and say they are not comparable with the Windows rows.
+The proxy backpressure bound keeps its calibrated 8 MiB on Windows and widens
+only off it. The comparison document reports where Hamster loses — static
+files 2 to 3.4 times slower than Caddy, classic mode 32-34% slower, 240-260
+MiB against 140-170 — as prominently as where it wins.
+
+FACT: Windows gates on the merged tree: fmt, strict MSVC clippy
+`--all-targets --all-features -D warnings`, the default suite 302 passed,
+`static_files` 8/8, `timeout_probe` 10/10 ignored, `pool_visibility_probe`
+1/1 ignored, `php_worker` 58/60 ignored. Those two, and five more in the same
+suite, need `HAMSTER_LARAVEL_TEST_PATH` pointing at a prepared PMS-shaped
+application. That expectation predates the merge, and the stand-in app this
+host had from an earlier session no longer reaches READY against the branch's
+worker script, so it is a host gap. Building `www/pms-scratch` here needs the
+branch's bash builder, composer and network access.
+
+FACT: **SIGTERM now drains** and **SIGUSR1 publishes a configuration reload**
+(`96aa0b1`). SIGHUP deliberately keeps its single tested meaning so a
+certificate rotation cannot also publish configuration edits. The shutdown
+signal names itself, so the `draining` record says `sigint`, `sigterm`,
+`console` or `control`. Both are **NOT VERIFIED on Linux**: this host cannot
+build for Linux, so no signal has been delivered to a running process. The
+non-Windows cfg-flip check compiles them, and it now stubs tokio's unix
+signals generically — four call sites.
+
+FACT: the Windows `TCP_NODELAY` A/B is recorded in `doc/BENCHMARKS.md`
+(*Downstream TCP_NODELAY — Windows A/B*), which closes the one gate the merge
+left open. The result is the opposite of the Linux one and the important half
+does not depend on the spread: **Windows has no delayed-ACK stall to fix.**
+The base arm's C1 p50 was 0.245-0.328 ms against the candidate's
+0.243-0.316 ms, where the Linux base arm sat at 44 ms. At C32 every pair made
+the candidate slower (-4.7%, -22.7%, -4.5%); the two same-order pairs agree at
+-4.6%, and a cost is physically plausible because a head and a body leave as
+two packets instead of one coalesced one.
+
+The option is kept on Windows anyway, and the reason is recorded with the
+numbers: both arms are loopback, where the local stack acknowledges at once
+and no delayed-ACK period can appear, while a remote Windows client delays
+acknowledgements by up to 200 ms by default and a head-then-body response is
+exactly the shape that waits for one. The run cannot rule that in or out, so
+it cannot justify removing a guard against a 200 ms stall to recover about 5%
+of a loopback packet-rate cell. What it does justify is not repeating the
+Linux fix as a Windows improvement.
+
+FACT: `doc/PACKAGING_UPGRADE_ROLLBACK.md` is new and every fact in it was
+measured here. A static-only deployment is three files. The release binary
+imports `VCRUNTIME140.dll`, which is **not** part of a clean Windows install,
+so a deployment needs the Visual C++ redistributable or that DLL staged beside
+the executable; `+crt-static` removes it and every `api-ms-win-crt-*` import
+for 208 KB (7,171,584 against 6,963,200 bytes) and still runs, but every
+benchmark on record was taken with the dynamic CRT, so switching the shipped
+build needs its own A/B. The running image **cannot be overwritten** ("Device
+or resource busy") but **can be renamed**, which is what makes the upgrade
+sequence work: rename, stage the new binary, validate the live configuration
+with it, stop, start. That whole sequence was run with two builds.
+
+FACT, and a release blocker rather than a detail: the executable carries **no
+version resource** (`icon/hamster-wheel.rc` is one `ICON` line, so
+`FileVersion` and friends are empty) and the version it does report is
+`0.3.1` on a tree containing the 0.5 through 0.8 work. A deployed artifact
+cannot be identified by looking at it, and two builds months apart report the
+same `Server:` string. Both fixes are small and independent: a `VERSIONINFO`
+block, and an owner decision on the number.
+
+FACT: with no release yet, the owner decided backward compatibility is not a
+requirement, so the compatibility section states a rule instead of a promise —
+server, control client and worker script come from one build — and backs it
+with what was measured between this tree and the oldest build that has a
+control endpoint. A newer client cannot read an older server's `status`
+(answers were unframed then); an older client times out after about 5 s on
+every command against this server **and the command still runs**, so a `stop`
+issued that way stops the server while the client reports failure. An unknown
+command is refused cleanly either way.
+
+A 250 ms grace on the answered-connection wait was tried and **withdrawn**.
+It contradicts `exchange_uses_one_deadline_including_waiting_for_peer_close`,
+which encodes a deliberate contract: one deadline for the whole exchange, and
+the peer-close wait runs to it so extra data cannot be mistaken for a close.
+The exchange deadline already bounds the hold, and the refusal path and 254
+pipe instances already protect availability, so the resource argument did not
+justify breaking a tested invariant. The commit was dropped before pushing.
+Do not reintroduce it without changing that test on purpose.
+
+Two items moved from notes into `doc/ROADMAP_0_5_TO_1_0.md`, 0.9: the Linux
+static-file path (268 us of CPU per request against 26 for `not_found`, and 2
+to 3.4 times slower than Caddy, hypothesis stated and unprofiled) and the
+non-Windows pathname-model containment, which belongs in the security review.
+
+Still open, and the honest list for 0.9: HTTP/2; an installer, signing, a
+version resource and a real version number; the soak matrix; the security
+review; reproducible benchmarks on both platforms with declared saturation
+points; and a Linux host to re-run the gates on this merged tree, which has
+never run there — including the two new signals, the reload, rotation and
+lifecycle work.
+
+## Lifecycle records and log rotation (2026-10-18, in 8d79fe0)
 
 The reload slice below was committed and pushed as `60f4822`. This is
 uncommitted work on top of it, and it finishes the 0.8 logging scope:
