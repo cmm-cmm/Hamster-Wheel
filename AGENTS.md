@@ -54,6 +54,8 @@ PHP 8.4 or newer). The FastCGI tests look for `php/8.5/php-cgi`, a symlink to th
   that launch the release binary themselves, so build release first.
 - `benchmarks/linux_http.py` is the Linux counterpart (static, `not_found`, PHP worker and FastCGI
   cells, client `oha`); `doc/LINUX_VERIFICATION.md` records how Linux was verified and what is not.
+- `benchmarks/frankenphp_linux.py --frankenphp PATH [--laravel APP]` runs the same cells against
+  FrankenPHP on the same host, interleaved; results are in `doc/FRANKENPHP_LINUX_COMPARISON.md`.
 
 Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and
 test conditions.

@@ -6,6 +6,8 @@ khi triển khai.
 - **Vòng 1** — 15/09/2026 — trang `/login`, không chạm database
 - **Vòng 2** — 16/09/2026 — năm trang có dữ liệu thật, đăng nhập bằng tài khoản `admin`
 - **Bản web:** https://claude.ai/artifact/1eYrM6TdAsnAWZ35fLXeZr
+- **So sánh trực tiếp với Hamster cùng máy (Linux, 18/10/2026):**
+  [`doc/FRANKENPHP_LINUX_COMPARISON.md`](FRANKENPHP_LINUX_COMPARISON.md)
 
 ---
 

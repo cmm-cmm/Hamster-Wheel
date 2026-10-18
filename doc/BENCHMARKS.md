@@ -2238,3 +2238,77 @@ with the other two, so read the low median as this cell's run-to-run spread on
 a shared cloud host, not as a hello-specific cost. At C1 the median exchange
 is about 0.12-0.14 ms through a persistent worker and 0.37 ms through FastCGI,
 which starts a fresh PHP request per exchange.
+
+## Hamster vs FrankenPHP — Linux, same host (2026-10-18)
+
+The first same-host comparison: both servers on one machine, the same PHP
+version, interleaved, the same request mix. The earlier FrankenPHP entry above
+combined cells from different runs and configurations and says it is not a
+valid product comparison. The full report, written in Vietnamese like its
+predecessor, is `doc/FRANKENPHP_LINUX_COMPARISON.md`.
+
+**Conditions**
+
+| | |
+|---|---|
+| Host | as in the Linux baseline above: 4 vCPU Xeon @ 2.10 GHz, Ubuntu 24.04, Linux 6.18, `oha` 1.16.0 on the same host |
+| Hamster | release at `7611f32`; PHP 8.5.11 NTS |
+| FrankenPHP | 1.13.1 (Caddy 2.11.7), built from its tag against a glibc `libphp.so` 8.5.11 ZTS with the same extensions |
+| Repeat order | H F F H H F per cell, a fresh server per run |
+| Warm-up | 1,000 requests (200 for classic) |
+| CPU and RSS | whole process tree, as `benchmarks/linux_http.py` measures them |
+| Driver | `benchmarks/frankenphp_linux.py` |
+
+The official static FrankenPHP binary, run once the same way before the glibc
+build, landed on the same side of every cell. No request failed or returned an
+unexpected status.
+
+**The four workloads**
+
+| Workload | Hamster | FrankenPHP |
+|---|---|---|
+| Persistent worker, minimal | `fixtures/php-worker/worker.php` | an equivalent worker script |
+| Classic | FastCGI to one `php-cgi` with 4 children | its in-process mode, 4 threads, on `fixtures/php-cgi/bench.php` |
+| Static file | 22-byte file | Caddy `file_server` |
+| Laravel 12 + Octane | `www/pms-scratch`, 4 workers | Octane's worker, 4 workers |
+
+Laravel ran with `APP_ENV=production`, `APP_DEBUG=false`, array session and cache, and the same
+`php.ini` with OPcache on for both.
+
+Two runs of the same cells, median RPS, Hamster / FrankenPHP:
+
+| Cell | Requests | Run 1 | Run 2 | Hamster / FrankenPHP CPU µs/req (run 1) |
+|---|---:|---|---|---|
+| Laravel `/login`, W4 C1 | 3,000 | 512 / 540 | 582 / 566 | 1,700 / 1,957 |
+| Laravel `/login`, W4 C16 | 10,000 | 2,326 / 2,169 | 2,487 / 2,255 | 1,448 / 1,697 |
+| Laravel welcome 81 KB, W4 C1 | 2,000 | 446 / 453 | 469 / 511 | 2,030 / 2,400 |
+| Laravel welcome 81 KB, W4 C16 | 5,000 | 1,645 / 1,649 | 1,691 / 1,658 | 1,898 / 2,200 |
+| worker hello, W1 C1 | 20,000 | 8,157 / 4,110 | 7,251 / 3,865 | 114 / 297 |
+| worker JSON, W1 C1 | 20,000 | 7,212 / 3,729 | 7,412 / 3,944 | 126 / 324 |
+| worker echo 12 B, W1 C1 | 20,000 | 6,300 / 3,573 | 6,117 / 3,495 | 170 / 321 |
+| worker hello, W4 C4 | 50,000 | 20,490 / 14,130 | 20,148 / 14,083 | 98 / 166 |
+| worker hello, W4 C32 | 50,000 | 32,465 / 16,904 | 30,171 / 18,733 | 72 / 142 |
+| classic hello, C1 | 5,000 | 2,287 / 3,061 | 2,278 / 3,610 | 380 / 388 |
+| classic JSON, C16 | 10,000 | 11,264 / 14,832 | 11,355 / 14,867 | 237 / 167 |
+| static 22 B, C1 | 50,000 | 3,728 / 7,622 | 3,467 / 7,249 | 250 / 154 |
+| static 22 B, C32 | 200,000 | 12,585 / 43,089 | 12,524 / 40,611 | 200 / 62 |
+
+**Laravel throughput is a tie.**
+
+- The two runs straddle parity, from 0.92x to 1.10x Hamster / FrankenPHP.
+- Per-run ranges overlap.
+- Hamster used 9-18% less CPU per request in all eight Laravel cells.
+- FrankenPHP's one process held 125-170 MiB RSS; Hamster's process tree held 239-262 MiB with four worker processes.
+
+**Elsewhere the gaps are large and repeat in both runs.**
+
+- The minimal persistent worker is 1.4-2.0x faster on Hamster.
+- At W1 C1, Hamster uses about 180 µs less CPU per request.
+- FrankenPHP is 1.3-1.6x faster in classic mode and 2.0-3.4x faster on static files.
+
+Latency percentiles, ranges, RSS and the static-binary run are in the report. Not measured:
+
+- TLS, HTTP/2 and HTTP/3, or compression;
+- a database-backed application;
+- failure, recycle or soak behaviour;
+- any host other than this one.
