@@ -12,7 +12,11 @@ use hyper::{
     header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, SERVER},
 };
 
-use crate::{config::SERVER_NAME, response_body::ResponseBody};
+use crate::{
+    access::{AccessPolicy, is_php_source},
+    config::SERVER_NAME,
+    response_body::ResponseBody,
+};
 
 const INDEX_FILE: &str = "index.html";
 
@@ -45,6 +49,7 @@ struct ResolvedFile {
 pub async fn serve(
     request: Request<Incoming>,
     document_root: Arc<PathBuf>,
+    access: &AccessPolicy,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let is_head = request.method() == Method::HEAD;
     if request.method() != Method::GET && !is_head {
@@ -55,14 +60,24 @@ pub async fn serve(
         return Ok(response);
     }
 
-    Ok(respond(is_head, &document_root, request.uri().path()).await)
+    Ok(respond(is_head, &document_root, request.uri().path(), access).await)
 }
 
 /// GET and HEAD share one resolution, so they reach the same containment
 /// decision for the same object. HEAD drops the validated handle after its
 /// metadata has produced the headers; GET streams that same handle.
-async fn respond(is_head: bool, document_root: &Path, uri_path: &str) -> Response<ResponseBody> {
+async fn respond(
+    is_head: bool,
+    document_root: &Path,
+    uri_path: &str,
+    access: &AccessPolicy,
+) -> Response<ResponseBody> {
     match resolve_file(document_root, uri_path).await {
+        Ok(file)
+            if access.denies_final_path(document_root, &file.path) || is_php_source(&file.path) =>
+        {
+            error_response(FileError::NotFound)
+        }
         Ok(file) if is_head => file_response(
             &file.path,
             ResponseBody::buffered(Bytes::new()),
@@ -234,11 +249,24 @@ async fn resolve_file(document_root: &Path, uri_path: &str) -> Result<ResolvedFi
 }
 
 pub(crate) fn normalize_path(uri_path: &str) -> Result<PathBuf, PathError> {
+    let mut normalized: PathBuf = decode_segments(uri_path)?.into_iter().collect();
+    if normalized.as_os_str().is_empty() {
+        normalized.push(INDEX_FILE);
+    }
+
+    Ok(normalized)
+}
+
+/// The decoded, validated segments of a request path, in order. Empty and
+/// `.` segments are dropped; `..`, encoded separators, NUL and (on Windows)
+/// drive or stream syntax are refused, so the segments can only name
+/// something beneath whatever root they are joined to.
+pub(crate) fn decode_segments(uri_path: &str) -> Result<Vec<String>, PathError> {
     if !uri_path.starts_with('/') {
         return Err(PathError::InvalidEncoding);
     }
 
-    let mut normalized = PathBuf::new();
+    let mut segments = Vec::new();
     for encoded_segment in uri_path.split('/') {
         if encoded_segment.is_empty() {
             continue;
@@ -260,14 +288,96 @@ pub(crate) fn normalize_path(uri_path: &str) -> Result<PathBuf, PathError> {
             return Err(PathError::Traversal);
         }
 
-        normalized.push(segment);
+        segments.push(segment);
     }
 
-    if normalized.as_os_str().is_empty() {
-        normalized.push(INDEX_FILE);
-    }
+    Ok(segments)
+}
 
-    Ok(normalized)
+/// What a relative path names beneath a document root, decided on the object
+/// actually opened, as `serve` decides it.
+pub(crate) enum Lookup {
+    /// A regular file whose final location is inside the root. `path` is that
+    /// final location, so a name the filesystem rewrote (letter case, trailing
+    /// dots or spaces on Windows) is reported as the object it really is.
+    File {
+        path: PathBuf,
+        file: std::fs::File,
+        length: u64,
+    },
+    Directory,
+    Missing,
+    /// Resolves outside the root, through a link or junction.
+    Outside,
+}
+
+/// Looks up `relative` beneath `document_root` without the directory index
+/// rule. Blocking; call it from a blocking task.
+#[cfg(windows)]
+pub(crate) fn lookup_within(document_root: &Path, relative: &Path) -> io::Result<Lookup> {
+    let candidate = document_root.join(relative);
+    let metadata = match std::fs::metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if is_missing(&error) => return Ok(Lookup::Missing),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        return Ok(Lookup::Directory);
+    }
+    let file = match std::fs::File::open(&candidate) {
+        Ok(file) => file,
+        Err(error) if is_missing(&error) => return Ok(Lookup::Missing),
+        Err(error) => return Err(error),
+    };
+    let path = final_path_of(&file)?;
+    if !path.starts_with(document_root) {
+        return Ok(Lookup::Outside);
+    }
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(Lookup::Missing);
+    }
+    Ok(Lookup::File {
+        path,
+        length: metadata.len(),
+        file,
+    })
+}
+
+/// Pathname model, as `resolve_file` on these targets; not qualified against
+/// concurrent namespace changes.
+#[cfg(not(windows))]
+pub(crate) fn lookup_within(document_root: &Path, relative: &Path) -> io::Result<Lookup> {
+    let candidate = document_root.join(relative);
+    let metadata = match std::fs::metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if is_missing(&error) => return Ok(Lookup::Missing),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        return Ok(Lookup::Directory);
+    }
+    let path = std::fs::canonicalize(&candidate)?;
+    if !path.starts_with(document_root) {
+        return Ok(Lookup::Outside);
+    }
+    let file = std::fs::File::open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(Lookup::Missing);
+    }
+    Ok(Lookup::File {
+        path,
+        length: metadata.len(),
+        file,
+    })
+}
+
+fn is_missing(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::InvalidFilename
+    ) || error.raw_os_error() == Some(123)
 }
 
 fn percent_decode(input: &str) -> Result<String, PathError> {
@@ -328,11 +438,11 @@ fn error_response(error: FileError) -> Response<ResponseBody> {
         FileError::NotFound => text_response(StatusCode::NOT_FOUND, "Not Found"),
         #[cfg(windows)]
         FileError::FinalPath(error) => {
-            eprintln!("cannot determine the final location of an opened static file: {error}");
+            errln!("cannot determine the final location of an opened static file: {error}");
             text_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         }
         FileError::Io(error) => {
-            eprintln!("failed to serve static file: {error}");
+            errln!("failed to serve static file: {error}");
             text_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         }
     }
@@ -347,6 +457,17 @@ fn map_io_error(error: io::Error) -> FileError {
 }
 
 fn text_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
+    if status.is_client_error() || status.is_server_error() {
+        let mut response = error_text_response(status, message);
+        response
+            .extensions_mut()
+            .insert(crate::access_log::ErrorReason(message));
+        return response;
+    }
+    error_text_response(status, message)
+}
+
+fn error_text_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
     let mut response = Response::new(ResponseBody::buffered(Bytes::from_static(
         message.as_bytes(),
     )));
@@ -635,7 +756,13 @@ mod windows_containment_tests {
     }
 
     async fn fetch(is_head: bool, root: &Path, uri_path: &str) -> Fetched {
-        let response = respond(is_head, root, uri_path).await;
+        let response = respond(
+            is_head,
+            root,
+            uri_path,
+            &crate::access::AccessPolicy::default(),
+        )
+        .await;
         let status = response.status();
         let content_length = response
             .headers()

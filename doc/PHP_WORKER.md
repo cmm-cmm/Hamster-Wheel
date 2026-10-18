@@ -31,6 +31,12 @@ eleven slow requests. The respawn rate stays bounded because the deadline
 itself bounds it, at `1 / (request_timeout + bootstrap)`. See
 `doc/EXECUTION_TIMEOUT_POLICY.md`.
 
+The current HTTP answer for that execution deadline is `504 PHP Worker
+Execution Timeout`, distinguishing a missing timely application response from
+a broken/invalid worker response (`502`). Neither answer authorizes replay of
+a possibly-started transaction. Changing the status does not change worker
+ownership, cancellation safety or recovery classification.
+
 Stability is time based on purpose. Treating successful request *count* as
 proof of health would tie the respawn rate to application throughput, because
 a crash loop reaches any request threshold sooner the faster the pool serves.
@@ -248,7 +254,41 @@ child that reached READY and kills/reaps failed handshakes. Explicit shutdown
 stops admission, drains accepted jobs, lets in-flight transactions finish, sends
 SHUTDOWN to healthy workers, validates SHUTDOWN_ACK, applies the two-second
 kill/reap fallback, and joins the worker and dispatcher tasks. Windows Ctrl+C
-uses the same coordinated shutdown path and has a process-level regression test.
+uses the same coordinated shutdown path and has process-level regression tests.
+
+On Windows each worker is spawned with `CREATE_NO_WINDOW`: it gets its own
+windowless console instead of sharing Hamster's. A console delivers Ctrl+C and
+Ctrl+Break to every process attached to it and `php.exe` ends on either, so
+before 2026-09-28 the key press that asked Hamster to stop also killed every
+worker directly. A request executing at that moment answered
+`502 PHP Worker Unavailable` instead of being drained, contrary to the
+shutdown contract above, and the certificate reload key (Ctrl+Break) replaced
+every worker on each reload. The older sections below record that behavior as
+it was then. Now the console event reaches Hamster only;
+`ctrl_c_drains_an_in_flight_php_request` requires the in-flight request to
+return 200 and the worker to exit 0 after SHUTDOWN_ACK, and
+`ctrl_break_reload_leaves_php_workers_serving` requires workers to survive a
+reload. `DETACHED_PROCESS` would also isolate the worker, without a
+`conhost.exe`, but leave it with no console at all: Windows then creates a new
+console, normally a visible window, for each console program the application
+starts unless that call suppresses it. It was rejected on that reasoning; it
+was not measured.
+
+The cost is one `conhost.exe` per worker, created and reaped with it. Measured
+with a release build and eight fixture workers over five alternating runs: about
+1.2 MiB private memory per worker and a READY time of 104.2 ms instead of
+86.6 ms (medians), paid at spawn and replacement only; the request path is
+unchanged. Raw figures: `benchmarks/results/worker_console_isolation_20260928.md`.
+
+Application adapters (2026-09-28): besides the Laravel Octane adapter,
+`symfony_worker.php` runs any Symfony HttpKernel application and
+`psr15_worker.php` any PSR-15 handler through an entry file. All of them share
+`adapter_support.php` (SAPI-equivalent request reconstruction, upload
+temporaries, headers Hamster owns) and `httpfoundation.php`. A response whose
+frame would exceed 8 MiB is answered `500 Response Too Large` by the adapter
+and the worker keeps serving; previously the failed write killed the worker
+and the server answered 502. What persistent workers can and cannot run, and
+the applications verified, are in `doc/PHP_APPLICATION_COMPATIBILITY.md`.
 
 ## 0.1.x Historical Architecture
 
@@ -377,7 +417,8 @@ worker mutex, sends `SHUTDOWN`, requires `SHUTDOWN_ACK`, closes stdin, and waits
 up to two seconds for process exit. Timeout or protocol failure invokes direct
 child kill and wait. On Windows, a console Ctrl+C can also terminate the child
 before Rust sends `SHUTDOWN`; an already-exited child is treated as successfully
-cleaned up. `kill_on_drop` remains a local fallback while Rust is alive; it is
+cleaned up. (Superseded on 2026-09-28: workers no longer share Hamster's
+console; see Pool Configuration.) `kill_on_drop` remains a local fallback while Rust is alive; it is
 not an abnormal-parent containment mechanism because process termination does
 not run Rust destructors.
 

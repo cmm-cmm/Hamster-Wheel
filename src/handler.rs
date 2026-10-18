@@ -10,8 +10,8 @@ use hyper::{
 #[cfg(test)]
 use crate::body_budget::BodyBudget;
 use crate::{
-    config::SERVER_NAME, php_worker::PhpWorkerPool, proxy::Upstream, response_body::ResponseBody,
-    static_files, transport::ConnectionInfo,
+    access::AccessPolicy, config::SERVER_NAME, fastcgi::FastCgiBackend, php_worker::PhpWorkerPool,
+    proxy::Upstream, response_body::ResponseBody, static_files, transport::ConnectionInfo,
 };
 
 pub(crate) type HandlerResponse = Response<ResponseBody>;
@@ -22,6 +22,7 @@ pub enum HandlerKind {
     Simple,
     PhpWorker,
     Proxy,
+    FastCgi,
     #[cfg(test)]
     TransportEcho,
     #[cfg(test)]
@@ -34,6 +35,7 @@ pub enum HandlerKind {
 pub enum Handler {
     Static {
         document_root: Arc<PathBuf>,
+        access: Arc<AccessPolicy>,
     },
     Simple {
         status: StatusCode,
@@ -44,6 +46,10 @@ pub enum Handler {
     },
     Proxy {
         upstream: Arc<Upstream>,
+    },
+    FastCgi {
+        backend: Arc<FastCgiBackend>,
+        access: Arc<AccessPolicy>,
     },
     #[cfg(test)]
     TransportEcho,
@@ -68,7 +74,17 @@ pub enum Handler {
 
 impl Handler {
     pub fn static_files(document_root: Arc<PathBuf>) -> Self {
-        Self::Static { document_root }
+        Self::static_files_with_access(document_root, Arc::new(AccessPolicy::default()))
+    }
+
+    pub(crate) fn static_files_with_access(
+        document_root: Arc<PathBuf>,
+        access: Arc<AccessPolicy>,
+    ) -> Self {
+        Self::Static {
+            document_root,
+            access,
+        }
     }
 
     pub const fn simple(status: StatusCode, body: &'static str) -> Self {
@@ -85,6 +101,21 @@ impl Handler {
 
     pub fn proxy(upstream: Arc<Upstream>) -> Self {
         Self::Proxy { upstream }
+    }
+
+    pub fn fastcgi(backend: Arc<FastCgiBackend>) -> Self {
+        Self::fastcgi_with_access(backend, Arc::new(AccessPolicy::default()))
+    }
+
+    pub(crate) fn fastcgi_with_access(
+        backend: Arc<FastCgiBackend>,
+        access: Arc<AccessPolicy>,
+    ) -> Self {
+        Self::FastCgi { backend, access }
+    }
+
+    pub(crate) const fn is_filesystem(&self) -> bool {
+        matches!(self, Self::Static { .. } | Self::FastCgi { .. })
     }
 
     #[cfg(test)]
@@ -111,6 +142,7 @@ impl Handler {
             Self::Simple { .. } => HandlerKind::Simple,
             Self::PhpWorker { .. } => HandlerKind::PhpWorker,
             Self::Proxy { .. } => HandlerKind::Proxy,
+            Self::FastCgi { .. } => HandlerKind::FastCgi,
             #[cfg(test)]
             Self::TransportEcho => HandlerKind::TransportEcho,
             #[cfg(test)]
@@ -127,15 +159,22 @@ impl Handler {
         body_read_timeout: Duration,
     ) -> Result<HandlerResponse, Infallible> {
         match self {
-            Self::Static { document_root } => {
-                static_files::serve(request, Arc::clone(document_root)).await
-            }
+            Self::Static {
+                document_root,
+                access,
+            } => static_files::serve(request, Arc::clone(document_root), access).await,
             Self::Simple { status, body } => Ok(simple_response(*status, body)),
             Self::PhpWorker { pool } => Ok(pool
                 .serve_http(request, connection, body_read_timeout)
                 .await),
             Self::Proxy { upstream } => {
                 Ok(crate::proxy::serve(upstream, request, connection).await)
+            }
+            Self::FastCgi { backend, access } => {
+                Ok(
+                    crate::fastcgi::serve(backend, access, request, connection, body_read_timeout)
+                        .await,
+                )
             }
             #[cfg(test)]
             Self::TransportEcho => Ok(transport_response(connection)),
@@ -174,6 +213,7 @@ impl Handler {
             Self::Static { .. } => simple_response(StatusCode::OK, "Static"),
             Self::PhpWorker { .. } => simple_response(StatusCode::OK, "PHP Worker"),
             Self::Proxy { .. } => simple_response(StatusCode::OK, "Proxy"),
+            Self::FastCgi { .. } => simple_response(StatusCode::OK, "FastCGI"),
             #[cfg(test)]
             Self::TransportEcho => simple_response(StatusCode::OK, "Transport Echo"),
             #[cfg(test)]
@@ -207,6 +247,16 @@ fn transport_response(connection: ConnectionInfo) -> HandlerResponse {
 pub(crate) fn simple_response(status: StatusCode, body: &'static str) -> HandlerResponse {
     let mut response = Response::new(ResponseBody::buffered(Bytes::from_static(body.as_bytes())));
     *response.status_mut() = status;
+    if status.is_client_error() || status.is_server_error() {
+        // The body text is already the precise reason this status was chosen,
+        // and every error status in the crate is built here, so carrying it on
+        // the response is what lets the access log name the cause without
+        // threading an argument through routing, static files, FastCGI, the
+        // worker pool and the proxy. Taken off again by the logger.
+        response
+            .extensions_mut()
+            .insert(crate::access_log::ErrorReason(body));
+    }
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),

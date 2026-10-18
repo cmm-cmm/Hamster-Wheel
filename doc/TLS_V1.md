@@ -326,6 +326,13 @@ scratch vendor tree lacks `predis/predis/src/Client.php` (also missing in the
 copy it came from). `cargo check --target x86_64-unknown-linux-gnu` cannot run:
 the target is not installed. Native Linux: NOT VERIFIED.
 
+Corrected on 2026-09-27. Two environment claims above were wrong. The `ctrl_c`
+failure is not ConPTY: the server inherited an "ignore Ctrl+C" attribute from
+the launching shell, the test now clears it, and it passes. The Linux target is
+installed; the cross-target check is blocked by `aws-lc-sys` needing
+`x86_64-linux-gnu-gcc`. Native Linux is still NOT VERIFIED. See
+`doc/AI_HANDOFF.md` and `doc/LOCAL_TEST_APPLICATIONS.md`.
+
 End to end with the release binary, a TLS-only config and `curl`: `localhost`
 200, `https://127.0.0.1` with no SNI 200 through an IP name on the default
 certificate, `Host: other.test` (a configured alias the certificate does not
@@ -496,7 +503,10 @@ was boxed).
   a reset that can destroy the response. A client that uses
   `Expect: 100-continue` receives it reliably. Bytes buffered before a
   response body fails mid-stream may not be flushed. Reproduced with the
-  pre-TLS build; see Verification.
+  pre-TLS build; see Verification. (Early refusals: fixed on 2026-09-28 by
+  lingering close after .NET's HttpClient lost the 413 in 10 of 10 uploads;
+  see `doc/PHP_APPLICATION_COMPATIBILITY.md`. The mid-body flush limit is
+  unchanged.)
 - **One private key per certificate entry, first key in the file.** Additional
   keys in the same PEM file are ignored.
 - **Handshake counters are not exported**; they are visible only through the
@@ -524,7 +534,9 @@ The Owner keeps the HTTP listener serving every configured host at this
 milestone. No per-host HTTPS-only policy or redirect is added. Early refusals
 continue to close the connection after the response; a client that keeps
 sending can observe a reset instead of the status. Lingering close is deferred
-until evidence from a real client warrants it.
+until evidence from a real client warrants it. (That evidence arrived on
+2026-09-28 -- .NET's HttpClient saw a reset in 10 of 10 oversized uploads --
+and lingering close was implemented in `src/lingering_close.rs`.)
 
 The final source review found two TLS startup defects: a bare leaf with
 client-auth-only EKU previously passed because EKU was checked only during

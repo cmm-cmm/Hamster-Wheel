@@ -7,18 +7,22 @@ use std::{
     task::Poll,
 };
 
-use hyper::server::conn::http1;
+use hyper::{body::Body as _, server::conn::http1};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::time::{Instant, timeout};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
 
 use crate::{
+    access_log::{AccessLog, MaybeObserved},
+    admin::{AdminState, Settings as AdminSettings},
     config::{HttpLimits, PhpPoolsError, RuntimeConfig},
+    lingering_close::{CloseSignals, LingeringClose},
+    metrics::ServerMetrics,
     router::HostRouter,
     tls::{CertificateScope, TlsListener},
     transport::{ConnectionInfo, Scheme, TransportInfo},
@@ -79,10 +83,47 @@ impl From<PhpPoolsError> for ServerError {
 }
 
 pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
+    // Reported by the control endpoint's `status`, so it is taken before any
+    // startup work rather than when the endpoint happens to be bound.
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
     #[cfg(windows)]
     if !config.php_workers().is_empty() {
         crate::windows_child_containment::establish().map_err(ServerError::ChildContainment)?;
     }
+
+    // Started before any worker or listener: a log target that cannot be
+    // written is a startup failure, not something an operator discovers under
+    // load. Absent configuration means no queue and no writer task at all.
+    let (access_log, log_writer) = match config.access_log() {
+        None => (None, None),
+        Some(settings) => {
+            let (log, writer) = crate::access_log::start(settings)?;
+            outln!(
+                "Access log writing to {} (queue {}, query {})",
+                settings.target_description(),
+                settings.queue_capacity(),
+                if settings.include_query() {
+                    "included"
+                } else {
+                    "omitted"
+                }
+            );
+            (Some(log), Some(writer))
+        }
+    };
+
+    // Counters exist only when something reads them, so a server with no
+    // administrative listener pays nothing per request.
+    let (metrics, admin_listener) = match config.admin() {
+        None => (None, None),
+        Some(settings) => {
+            let listener = crate::admin::bind(settings)
+                .await
+                .map_err(|error| admin_bind_error(settings, error))?;
+            (Some(ServerMetrics::new()), Some((settings, listener)))
+        }
+    };
 
     let workers = match config.start_workers().await {
         Ok(workers) => workers,
@@ -98,7 +139,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         }
     };
     for worker in workers {
-        println!(
+        outln!(
             "PHP worker pool {} worker {} ready after {:.3} ms",
             worker.label,
             worker.pid,
@@ -108,11 +149,22 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     for upstream in config.upstreams() {
         // The address was resolved once during configuration and is never
         // re-resolved, so it is printed where the operator will look for it.
-        println!(
+        outln!(
             "Proxy upstream {} -> http://{}",
             upstream.label(),
             upstream.address()
         );
+    }
+    for backend in config.fastcgi_backends() {
+        // Hamster does not start or supervise these endpoints; saying where
+        // it will connect is what lets an operator match them up.
+        let servers = backend
+            .servers()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        outln!("FastCGI {} -> {servers}", backend.label());
     }
     // Every listener is bound before any is served, so a failure to bind the
     // second one never leaves the first serving on its own.
@@ -129,39 +181,91 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             Err(error) => return Err(stop_workers_after(&config, error).await),
         }
     }
-    let shutdown = match shutdown_signal() {
+    let console_shutdown = match shutdown_signal() {
         Ok(shutdown) => shutdown,
         Err(error) => return Err(stop_workers_after(&config, error).await),
     };
-    let mut reload_task = if let Some(tls) = config.tls() {
+    // Finish fallible signal setup before starting administrative tasks. A
+    // later startup error must not leave a control task owning the config.
+    let reload = if let Some(tls) = config.tls() {
         match certificate_reload_signal(Arc::clone(tls)) {
-            Ok(reload) => Some(tokio::spawn(reload)),
+            Ok(reload) => Some(reload),
             Err(error) => return Err(stop_workers_after(&config, error).await),
         }
     } else {
         None
     };
+    // A control `stop` must reach the same graceful path as Ctrl+C, so the two
+    // triggers are merged into the one future `serve_listeners` already takes.
+    // The endpoint is bound before serving: a name already in use is a startup
+    // failure, not something discovered when an operator first needs it.
+    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    // Read by the control endpoint's `status` and by the administrative
+    // `/ready`. Both keep answering while connections drain, so a health poll
+    // during a stop must be able to see that the stop is deliberate.
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Annotated because the only assignment is Windows-only; without this the
+    // type could not be inferred on other targets.
+    let mut control_task: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> = None;
+    #[cfg(windows)]
+    if let Some(name) = config.control_name() {
+        match crate::control::ControlListener::bind(name) {
+            Ok(listener) => {
+                outln!("Control endpoint listening on {}", listener.path());
+                let config = Arc::clone(&config);
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                control_task = Some((
+                    shutdown_tx,
+                    tokio::spawn(listener.serve(
+                        config,
+                        started,
+                        Arc::clone(&draining),
+                        access_log.clone(),
+                        stop_tx.clone(),
+                        shutdown_rx,
+                    )),
+                ));
+            }
+            Err(error) => return Err(stop_workers_after(&config, error).await),
+        }
+    }
+    let drain_flag = Arc::clone(&draining);
+    let shutdown = async move {
+        // The sender is held here for the lifetime of the wait. Dropping it
+        // would close the channel, `recv` would return `None` at once, and a
+        // server with no control endpoint would shut down the moment it
+        // started serving.
+        let _stop_tx = stop_tx;
+        tokio::select! {
+            () = console_shutdown => {}
+            _ = stop_rx.recv() => outln!("Control endpoint requested shutdown"),
+        }
+        // Set before the graceful drain starts, so the first `status` or
+        // `/ready` that can observe a drain already reports it.
+        drain_flag.store(true, std::sync::atomic::Ordering::Release);
+    };
+    let mut reload_task = reload.map(tokio::spawn);
     // Printed once at startup, beside the other readiness lines. A refused
     // request is only explainable if the operator can see what the ceiling was
     // set to, and a configured limit is not something a running server should
     // have to be asked for.
     match config.http_limits().max_body_memory() {
-        0 => println!("Request body memory budget disabled (server.max_body_memory = 0)"),
-        limit => println!("Request body memory budget {limit} bytes"),
+        0 => outln!("Request body memory budget disabled (server.max_body_memory = 0)"),
+        limit => outln!("Request body memory budget {limit} bytes"),
     }
     for listener in &listeners {
         let address = listener.address();
         match &listener.tls {
-            None => println!("Hamster Wheel listening on http://{address}"),
+            None => outln!("Hamster Wheel listening on http://{address}"),
             Some(tls) => {
-                println!(
+                outln!(
                     "Hamster Wheel listening on https://{address} ({} certificate(s), TLS 1.2/1.3, ALPN http/1.1, handshake timeout {} s)",
                     tls.certificates().len(),
                     tls.handshake_timeout().as_secs()
                 );
                 // Report the current generation at startup and after reload.
                 for certificate in tls.certificates().iter() {
-                    println!(
+                    outln!(
                         "TLS certificate {} for {}: valid until {} ({} days)",
                         certificate.field,
                         certificate.names,
@@ -169,7 +273,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
                         certificate.days_left
                     );
                     if let Some(note) = certificate.note {
-                        println!("TLS certificate {}: note: {note}", certificate.field);
+                        outln!("TLS certificate {}: note: {note}", certificate.field);
                     }
                 }
             }
@@ -177,10 +281,71 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     }
 
     let router = config.router_arc();
-    let serve_result = serve_listeners(listeners, router, config.http_limits(), shutdown).await;
+    // Started after the application listeners are bound and reported, and
+    // stopped after they drain: a load balancer must be able to read `/ready`
+    // for the whole of a graceful stop.
+    let (admin_shutdown, admin_task) = match admin_listener {
+        None => (None, None),
+        Some((settings, listener)) => {
+            outln!(
+                "Admin listener on http://{} serving /health, /ready and /metrics",
+                settings.listen()
+            );
+            if settings.is_public() {
+                errln!(
+                    "Admin listener {} is not a loopback address: health, readiness and metrics are reachable from the network, with no TLS and no authentication",
+                    settings.listen()
+                );
+            }
+            let state = Arc::new(AdminState {
+                config: Arc::clone(&config),
+                started: admin_started(),
+                draining: Arc::clone(&draining),
+                access_log: access_log.clone(),
+                metrics: metrics
+                    .clone()
+                    .expect("counters exist with an admin listener"),
+            });
+            let (stop_tx, stop_rx) = watch::channel(false);
+            (
+                Some(stop_tx),
+                Some(tokio::spawn(crate::admin::serve(listener, state, stop_rx))),
+            )
+        }
+    };
+
+    let serve_result = serve_listeners(
+        listeners,
+        router,
+        config.http_limits(),
+        access_log.clone(),
+        metrics.clone(),
+        shutdown,
+    )
+    .await;
+    if let Some(stop_tx) = admin_shutdown {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(task) = admin_task {
+        let _ = task.await;
+    }
     if let Some(task) = reload_task.take() {
         task.abort();
         let _ = task.await;
+    }
+    // Accepting another control request after the listeners have stopped would
+    // answer for a server that is already going away.
+    if let Some((shutdown_tx, task)) = control_task.take() {
+        let _ = shutdown_tx.send(());
+        let _ = task.await;
+    }
+    // Every connection task has ended, so no further record can be produced.
+    // Dropping the last sink closes the queue, which is what ends the writer;
+    // waiting for it is what keeps the last requests served out of a lost
+    // tail.
+    drop(access_log);
+    if let Some(writer) = log_writer {
+        writer.finish().await;
     }
     // Every downstream connection, and therefore every active proxy exchange,
     // has ended. Close what remains idle instead of leaving it to process exit.
@@ -189,7 +354,10 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     }
     let shutdown_result = config.shutdown_workers().await;
     match (serve_result, shutdown_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => {
+            outln!("Hamster Wheel stopped");
+            Ok(())
+        }
         (Err(error), Ok(())) => Err(ServerError::Io(error)),
         (Ok(()), Err(error)) => Err(ServerError::Worker(error)),
         (Err(source), Err(cleanup)) => Err(ServerError::IoWithWorkerCleanup { source, cleanup }),
@@ -233,6 +401,49 @@ impl Listener {
     }
 }
 
+/// Keeps the active-connection gauge honest however a task ends.
+struct ConnectionGuard(Arc<ServerMetrics>);
+
+impl ConnectionGuard {
+    fn new(metrics: Arc<ServerMetrics>) -> Self {
+        metrics.connection_opened();
+        Self(metrics)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
+fn admin_started() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+fn admin_bind_error(settings: AdminSettings, error: io::Error) -> ServerError {
+    ServerError::Io(io::Error::new(
+        error.kind(),
+        format!(
+            "cannot bind the admin listener {}: {error}",
+            settings.listen()
+        ),
+    ))
+}
+
+/// What every connection served by one accept loop shares.
+///
+/// These three are cloned per connection and never change for its lifetime.
+/// Carrying them as one value keeps the serving functions' signatures about
+/// the connection rather than about the server's wiring.
+#[derive(Clone)]
+struct ServeContext {
+    router: Arc<HostRouter>,
+    http_limits: HttpLimits,
+    access_log: Option<Arc<AccessLog>>,
+    metrics: Option<Arc<ServerMetrics>>,
+}
+
 /// Serves one cleartext listener. Kept as the entry point every existing
 /// integration test and probe uses.
 pub async fn serve_with_router<F>(
@@ -248,6 +459,8 @@ where
         vec![Listener::cleartext(listener)],
         router,
         http_limits,
+        None,
+        None,
         shutdown,
     )
     .await
@@ -263,6 +476,8 @@ pub async fn serve_listeners<F>(
     listeners: Vec<Listener>,
     router: Arc<HostRouter>,
     http_limits: HttpLimits,
+    access_log: Option<Arc<AccessLog>>,
+    metrics: Option<Arc<ServerMetrics>>,
     shutdown: F,
 ) -> io::Result<()>
 where
@@ -270,6 +485,12 @@ where
 {
     tokio::pin!(shutdown);
 
+    let context = ServeContext {
+        router,
+        http_limits,
+        access_log,
+        metrics,
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut next_listener = 0;
@@ -282,31 +503,23 @@ where
                 let local_addr = match stream.local_addr() {
                     Ok(local_addr) => local_addr,
                     Err(error) => {
-                        eprintln!("failed to identify accepted connection: {error}");
+                        errln!("failed to identify accepted connection: {error}");
                         continue;
                     }
                 };
                 let transport = TransportInfo::new(peer_addr, local_addr);
                 let tls = listeners[index].tls.clone();
                 let shutdown_rx = shutdown_rx.clone();
-                let router = Arc::clone(&router);
+                let context = context.clone();
 
                 connections.spawn(async move {
-                    serve_connection(
-                        stream,
-                        transport,
-                        tls,
-                        accepted_at,
-                        router,
-                        http_limits,
-                        shutdown_rx,
-                    )
-                    .await;
+                    serve_connection(stream, transport, tls, accepted_at, context, shutdown_rx)
+                        .await;
                 });
             }
             join_result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = join_result {
-                    eprintln!("connection task failed: {error}");
+                    errln!("connection task failed: {error}");
                 }
             }
             () = &mut shutdown => break,
@@ -318,11 +531,11 @@ where
 
     while let Some(join_result) = connections.join_next().await {
         if let Err(error) = join_result {
-            eprintln!("connection task failed during shutdown: {error}");
+            errln!("connection task failed during shutdown: {error}");
         }
     }
 
-    println!("Hamster Wheel stopped");
+    outln!("HTTP listeners drained");
     Ok(())
 }
 
@@ -351,18 +564,27 @@ async fn serve_connection(
     transport: TransportInfo,
     tls: Option<Arc<TlsListener>>,
     accepted_at: Instant,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    context: ServeContext,
     shutdown: watch::Receiver<bool>,
 ) {
+    let http_limits = context.http_limits;
+    // Counted here rather than in the accept loop so the gauge follows the
+    // task that actually holds the connection, including a TLS handshake that
+    // never becomes a request.
+    let _connection = context.metrics.clone().map(ConnectionGuard::new);
     // The write deadline wraps the socket, beneath TLS. It must observe bytes
     // the kernel accepted, not plaintext rustls buffered: above TLS it would
     // count buffering as progress, and a flush or close_notify stalled on a
     // peer that stopped reading would never time out.
-    let stream = WriteProgressTimeout::new(stream, http_limits.write_progress_timeout());
+    //
+    // Lingering close sits beneath both: it acts only when the connection is
+    // shut down with request bytes still unread (`src/lingering_close.rs`).
+    let lingering = LingeringClose::new(stream, http_limits.body_read_timeout());
+    let close_signals = lingering.signals();
+    let stream = WriteProgressTimeout::new(lingering, http_limits.write_progress_timeout());
     let Some(tls) = tls else {
         let connection = ConnectionInfo::new(transport, Scheme::Http);
-        serve_http(stream, connection, None, router, http_limits, shutdown).await;
+        serve_http(stream, connection, None, context, close_signals, shutdown).await;
         return;
     };
     // Boxed so that a cleartext connection's task is not sized for the TLS
@@ -373,20 +595,21 @@ async fn serve_connection(
         transport,
         tls,
         accepted_at,
-        router,
-        http_limits,
+        context,
+        close_signals,
         shutdown,
     ))
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_tls(
-    stream: WriteProgressTimeout<TcpStream>,
+    stream: WriteProgressTimeout<LingeringClose<TcpStream>>,
     transport: TransportInfo,
     tls: Arc<TlsListener>,
     accepted_at: Instant,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    context: ServeContext,
+    close_signals: Arc<CloseSignals>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // Total, from accept: no HTTP deadline applies before HTTP exists, and a
@@ -403,8 +626,8 @@ async fn serve_tls(
             stream,
             connection,
             Some(scope),
-            router,
-            http_limits,
+            context,
+            close_signals,
             shutdown,
         )
         .await;
@@ -419,27 +642,55 @@ async fn serve_http<I>(
     io: I,
     connection_info: ConnectionInfo,
     scope: Option<Arc<CertificateScope>>,
-    router: Arc<HostRouter>,
-    http_limits: HttpLimits,
+    context: ServeContext,
+    close_signals: Arc<CloseSignals>,
     mut shutdown: watch::Receiver<bool>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let ServeContext {
+        router,
+        http_limits,
+        access_log,
+        metrics,
+    } = context;
     let transport = connection_info.transport();
-    let service = hyper::service::service_fn(move |request| {
-        let router = Arc::clone(&router);
-        let scope = scope.clone();
-        async move {
-            router
-                .serve(
-                    request,
-                    connection_info,
-                    http_limits.body_read_timeout(),
-                    scope.as_deref(),
-                )
-                .await
-        }
-    });
+    let request_signals = Arc::clone(&close_signals);
+    let service =
+        hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+            // Whether this request may leave body bytes unread when the
+            // connection closes; see `LingeringClose`.
+            request_signals.request_declared_body(!request.body().is_end_stream());
+            let router = Arc::clone(&router);
+            let scope = scope.clone();
+            // Taken before the handler runs so the record measures the whole
+            // request, and so a handler cannot change what was asked for.
+            let started = std::time::Instant::now();
+            let start = access_log
+                .as_ref()
+                .map(|log| log.begin(&request, connection_info));
+            let access_log = access_log.clone();
+            let metrics = metrics.clone();
+            async move {
+                let served: Result<_, std::convert::Infallible> = router
+                    .serve(
+                        request,
+                        connection_info,
+                        http_limits.body_read_timeout(),
+                        scope.as_deref(),
+                    )
+                    .await;
+                served.map(|response| {
+                    MaybeObserved::wrap(
+                        started,
+                        access_log.as_ref(),
+                        start,
+                        metrics.as_ref(),
+                        response,
+                    )
+                })
+            }
+        });
     let mut builder = http1::Builder::new();
     builder
         .timer(TokioTimer::new())
@@ -451,7 +702,7 @@ async fn serve_http<I>(
     tokio::select! {
         result = &mut connection => {
             if let Err(error) = result && should_report_connection_error(&error) {
-                eprintln!(
+                errln!(
                     "failed to serve connection from {} to {}: {error}",
                     transport.peer_addr(),
                     transport.local_addr()
@@ -462,6 +713,7 @@ async fn serve_http<I>(
         // serving, for example while its TLS handshake was completing.
         stopped = async { shutdown.wait_for(|stop| *stop).await.is_ok() } => {
             if stopped {
+                close_signals.server_stopping();
                 connection.as_mut().graceful_shutdown();
                 // Graceful shutdown stops accepting another request but a peer
                 // that no longer reads a streaming response can otherwise hold
@@ -479,7 +731,7 @@ async fn serve_http<I>(
                 .await
                     && should_report_connection_error(&error)
                 {
-                    eprintln!(
+                    errln!(
                         "failed to gracefully close connection from {} to {}: {error}",
                         transport.peer_addr(),
                         transport.local_addr()
@@ -490,7 +742,7 @@ async fn serve_http<I>(
     }
 }
 
-fn should_report_connection_error(error: &hyper::Error) -> bool {
+pub(crate) fn should_report_connection_error(error: &hyper::Error) -> bool {
     // These are controlled by the remote peer and are expected admission
     // outcomes. Synchronously logging every one would turn malformed traffic
     // into a stderr backpressure path.
@@ -570,12 +822,12 @@ fn certificate_reload_signal(tls: Arc<TlsListener>) -> io::Result<impl Future<Ou
 async fn report_certificate_reload(tls: &TlsListener) {
     match tls.reload_certificates().await {
         Ok(reports) => {
-            println!(
+            outln!(
                 "TLS certificate reload succeeded ({} certificate(s))",
                 reports.len()
             );
             for certificate in reports.iter() {
-                println!(
+                outln!(
                     "TLS certificate {} for {}: valid until {} ({} days)",
                     certificate.field,
                     certificate.names,
@@ -583,12 +835,12 @@ async fn report_certificate_reload(tls: &TlsListener) {
                     certificate.days_left
                 );
                 if let Some(note) = certificate.note {
-                    println!("TLS certificate {}: note: {note}", certificate.field);
+                    outln!("TLS certificate {}: note: {note}", certificate.field);
                 }
             }
         }
         Err(error) => {
-            eprintln!("TLS certificate reload failed; previous set remains active: {error}")
+            errln!("TLS certificate reload failed; previous set remains active: {error}")
         }
     }
 }
@@ -705,10 +957,9 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn php_containment_failure_precedes_worker_spawn_and_listener_bind() {
-        let reserved =
-            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve test address");
-        let address = reserved.local_addr().expect("reserved address");
-        drop(reserved);
+        // Outside the dynamic range, so no concurrently running test can be
+        // given this port and make the final probe connect.
+        let address = crate::test_ports::unused_outside_dynamic_range();
         let executable = std::env::current_exe().expect("test executable path");
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
         let source = format!(
@@ -750,9 +1001,7 @@ mod tests {
         let leaf = pki.leaf("localhost", &["localhost"]);
         let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy");
         let taken = occupied.local_addr().expect("occupied address");
-        let free = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve");
-        let cleartext = free.local_addr().expect("free address");
-        drop(free);
+        let cleartext = crate::test_ports::unused_outside_dynamic_range();
         let literal = |path: &Path| format!("'{}'", path.display());
         let source = format!(
             "[server]\nlisten = \"{cleartext}\"\n\n[server.tls]\nlisten = \"{taken}\"\n\n[[server.tls.certificates]]\ncert = {}\nkey = {}\nnames = [\"localhost\"]\n\n[[hosts]]\nname = \"localhost\"\nlocations = [{{ path = \"/\", handler = \"not_found\" }}]\n",
@@ -1610,6 +1859,172 @@ mod tests {
             budget.peak(),
             budget.limit()
         );
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    /// A client that sends its whole body before reading, as .NET's HttpClient
+    /// does, must receive the early refusal rather than a reset. Without
+    /// lingering close the server closed with the body unread and Windows
+    /// answered the next segment with a reset: .NET saw "connection reset" in
+    /// 10 of 10 two-megabyte uploads and never read the response.
+    #[tokio::test]
+    async fn an_early_refusal_reaches_a_client_that_sends_its_whole_body_first() {
+        // Larger than the 16 MiB discard bound an earlier version had, which
+        // turned every bigger refused upload back into a reset.
+        const BODY: usize = 20 * 1_024 * 1_024;
+        let budget = BodyBudget::new(64 * 1_024);
+        let limits = HttpLimits::for_test(
+            16,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) =
+            start_budget_server(limits, Arc::clone(&budget), None).await;
+
+        // Even attempts send everything at once. Odd ones send the head and a
+        // little body, pause while the server refuses and closes, then send
+        // the rest, as a client writing in bursts does. At that close nothing
+        // is waiting on the socket, so only the request's declared body says
+        // the client is still sending.
+        for attempt in 0..6 {
+            let mut client = connect(listen_addr).await;
+            let head =
+                format!("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {BODY}\r\n\r\n");
+            let mut request = head.into_bytes();
+            request.extend(std::iter::repeat_n(b'x', BODY));
+            let pause_after = if attempt % 2 == 1 {
+                1_024
+            } else {
+                request.len()
+            };
+            let send = async {
+                client.write_all(&request[..pause_after]).await?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                client.write_all(&request[pause_after..]).await
+            };
+            tokio::time::timeout(Duration::from_secs(10), send)
+                .await
+                .expect("the server keeps reading until the body is sent")
+                .unwrap_or_else(|error| panic!("attempt {attempt}: sending the body: {error}"));
+            let mut answer = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut answer))
+                .await
+                .expect("the refusal is followed by a close")
+                .unwrap_or_else(|error| panic!("attempt {attempt}: reading the refusal: {error}"));
+            // Declared over the handler's body limit: refused as the PHP
+            // handler refuses a body over the protocol limit, before reading.
+            assert!(
+                answer.starts_with(b"HTTP/1.1 413 "),
+                "attempt {attempt}: {:?}",
+                String::from_utf8_lossy(&answer[..answer.len().min(120)])
+            );
+        }
+        assert_eq!(budget.reserved(), 0);
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    /// Lingering is decided per connection. A closing connection whose last
+    /// request had no body, and nothing waiting, is closed at once: a client
+    /// that stays silent after the FIN cannot hold its connection slot for the
+    /// linger timeout.
+    #[tokio::test]
+    async fn a_closing_connection_without_a_body_does_not_linger() {
+        let budget = BodyBudget::new(64 * 1_024);
+        let limits = HttpLimits::for_test(
+            1,
+            Duration::from_millis(300),
+            Duration::from_secs(10),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) =
+            start_budget_server(limits, Arc::clone(&budget), None).await;
+
+        // One request without a body that asks to close, then silence: the
+        // client reads to the server's FIN but never closes its own side.
+        let mut idle = connect(listen_addr).await;
+        idle.write_all(
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .expect("write request");
+        let started = std::time::Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), idle.read_to_end(&mut rest))
+            .await
+            .expect("the idle connection is closed")
+            .expect("read to the close");
+        // `max_connections` is 1: the slot must be free again at once, well
+        // inside even the one-second linger idle bound.
+        let mut next = connect(listen_addr).await;
+        next.write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write request");
+        let _ = read_response_body(&mut next).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the slot was held for {:?}",
+            started.elapsed()
+        );
+        drop(idle);
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+
+    /// A client refused early whose body then stops arriving is lingered on
+    /// only for the idle bound. The total bound is `body_read_timeout` (ten
+    /// seconds here), so it is the idle bound that frees the slot.
+    #[tokio::test]
+    async fn a_stalled_upload_frees_its_slot_after_the_linger_idle_bound() {
+        let budget = BodyBudget::new(64 * 1_024);
+        let limits = HttpLimits::for_test(
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            8 * 1_024,
+        );
+        let (listen_addr, shutdown_tx, server) =
+            start_budget_server(limits, Arc::clone(&budget), None).await;
+
+        // Declared over the handler's limit, so refused at once; one body byte
+        // arrives and then nothing, with the connection left open.
+        let mut stalled = connect(listen_addr).await;
+        stalled
+            .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4194304\r\n\r\nx")
+            .await
+            .expect("write a partial body");
+        let started = std::time::Instant::now();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), stalled.read_to_end(&mut answer))
+            .await
+            .expect("the stalled upload is refused and closed")
+            .expect("read the refusal");
+        assert!(
+            answer.starts_with(b"HTTP/1.1 413 "),
+            "{:?}",
+            String::from_utf8_lossy(&answer)
+        );
+
+        // `max_connections` is 1 and the stalled client never closes.
+        let mut next = connect(listen_addr).await;
+        next.write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write request");
+        let _ = tokio::time::timeout(Duration::from_secs(4), read_response_body(&mut next))
+            .await
+            .expect("the slot is released");
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(2_500),
+            "the slot was held for {waited:?}; the idle bound is {:?}",
+            crate::lingering_close::LINGER_IDLE
+        );
+        drop(stalled);
 
         shutdown_tx.send(()).expect("signal shutdown");
         server.await.expect("join server").expect("server result");

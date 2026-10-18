@@ -11,11 +11,19 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::access::AccessPolicy;
 use crate::body_budget::BodyBudget;
+use crate::fastcgi::{
+    DEFAULT_CONNECT_TIMEOUT as FASTCGI_DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_INDEX as FASTCGI_DEFAULT_INDEX,
+    DEFAULT_RESPONSE_TIMEOUT as FASTCGI_DEFAULT_RESPONSE_TIMEOUT, FastCgiBackend, FastCgiConfig,
+    MAX_CONCURRENCY as FASTCGI_MAX_CONCURRENCY, MAX_SERVERS as FASTCGI_MAX_SERVERS,
+};
 use crate::php_worker::{
-    DEFAULT_REQUEST_TIMEOUT, MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY, MAX_REQUEST_TIMEOUT,
-    MAX_WORKERS, MIN_REQUEST_TIMEOUT, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool,
-    PhpWorkerPoolConfig, WorkerStart,
+    DEFAULT_REQUEST_TIMEOUT, DEFAULT_STARTUP_TIMEOUT, MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY,
+    MAX_REQUEST_TIMEOUT, MAX_STARTUP_TIMEOUT, MAX_WORKERS, MIN_REQUEST_TIMEOUT,
+    MIN_STARTUP_TIMEOUT, PhpWorkerConfig, PhpWorkerError, PhpWorkerPool, PhpWorkerPoolConfig,
+    WorkerStart,
 };
 use crate::proxy::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_IDLE, DEFAULT_PROGRESS_TIMEOUT,
@@ -86,6 +94,83 @@ struct RawServer {
     max_body_memory: u64,
     #[serde(default = "default_http1_max_buffer_size")]
     http1_max_buffer_size: usize,
+    control: Option<RawControl>,
+    access_log: Option<RawAccessLog>,
+    admin: Option<RawAdmin>,
+}
+
+/// The administrative listener. Absent means health, readiness and metrics are
+/// not served at all, which is the default.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAdmin {
+    listen: String,
+}
+
+/// Per-request logging. Absent means no queue, no writer and no per-request
+/// work: a server that was not asked to log does not pay for logging.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAccessLog {
+    /// Log file, resolved beside this configuration file. Absent means stdout.
+    path: Option<String>,
+    /// Query strings are omitted by default because they carry credentials in
+    /// real deployments. See `src/access_log.rs` for what is replaced.
+    #[serde(default)]
+    include_query: bool,
+    #[serde(default = "default_access_log_queue_capacity")]
+    queue_capacity: usize,
+}
+
+const fn default_access_log_queue_capacity() -> usize {
+    crate::access_log::DEFAULT_QUEUE_CAPACITY
+}
+
+/// The local control endpoint. Absent means no endpoint exists at all.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControl {
+    name: String,
+}
+
+/// Just enough of a configuration file to find the control endpoint.
+///
+/// A control client must not compile the configuration: loading certificates,
+/// canonicalizing roots and building pools can fail for reasons that have
+/// nothing to do with the request, and a certificate that no longer loads is
+/// exactly when `reload-certificates` is needed. Unknown fields are ignored
+/// here on purpose, so a file the running server accepted stays readable.
+#[derive(Debug, Deserialize)]
+struct ControlProbe {
+    server: ControlProbeServer,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlProbeServer {
+    control: Option<RawControl>,
+}
+
+/// Reads the configured control endpoint name without compiling anything else.
+pub fn control_endpoint(selection: &ConfigSelection) -> Result<Option<String>, ConfigError> {
+    let ConfigSelection::File(path) = selection else {
+        // The built-in configuration has no control endpoint to name.
+        return Ok(None);
+    };
+    let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        context: format!("cannot read config file {}", path.display()),
+        source,
+    })?;
+    let probe: ControlProbe = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        source_name: path.display().to_string(),
+        source,
+    })?;
+    match probe.server.control {
+        None => Ok(None),
+        Some(control) => {
+            crate::control::validate_name(&control.name).map_err(ConfigError::Validation)?;
+            Ok(Some(control.name))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +221,10 @@ struct RawHost {
     name: String,
     #[serde(default)]
     aliases: Vec<String>,
+    #[serde(default)]
+    deny_paths: Vec<String>,
+    #[serde(default)]
+    deny_names: Vec<String>,
     locations: Vec<RawLocation>,
 }
 
@@ -147,6 +236,17 @@ struct RawLocation {
     root: Option<PathBuf>,
     php: Option<RawPhpWorker>,
     proxy: Option<RawProxy>,
+    fastcgi: Option<RawFastCgi>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFastCgi {
+    servers: Vec<String>,
+    concurrency: Option<usize>,
+    index: Option<String>,
+    connect_timeout: Option<u64>,
+    response_timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +270,7 @@ struct RawPhpWorker {
     workers: usize,
     queue_capacity: Option<usize>,
     request_timeout: Option<u64>,
+    startup_timeout: Option<u64>,
     max_requests: Option<u64>,
     max_worker_age: Option<u64>,
     /// Extra environment for the worker process. The server never interprets
@@ -187,9 +288,13 @@ pub struct RuntimeConfig {
     listen: Option<SocketAddr>,
     tls: Option<Arc<TlsListener>>,
     http_limits: HttpLimits,
+    control: Option<String>,
+    access_log: Option<crate::access_log::Settings>,
+    admin: Option<crate::admin::Settings>,
     router: Arc<HostRouter>,
     php_pools: Vec<Arc<PhpWorkerPool>>,
     upstreams: Vec<Arc<Upstream>>,
+    fastcgi_backends: Vec<Arc<FastCgiBackend>>,
 }
 
 #[derive(Debug)]
@@ -357,6 +462,21 @@ impl RuntimeConfig {
         self.listen
     }
 
+    /// The configured control endpoint name, when an operator asked for one.
+    pub fn control_name(&self) -> Option<&str> {
+        self.control.as_deref()
+    }
+
+    /// The compiled per-request log settings, when logging was configured.
+    pub fn access_log(&self) -> Option<&crate::access_log::Settings> {
+        self.access_log.as_ref()
+    }
+
+    /// The administrative listener's settings, when one was configured.
+    pub fn admin(&self) -> Option<crate::admin::Settings> {
+        self.admin
+    }
+
     /// The HTTPS listener, with its certificates already loaded and checked.
     pub fn tls(&self) -> Option<&Arc<TlsListener>> {
         self.tls.as_ref()
@@ -435,6 +555,11 @@ impl RuntimeConfig {
         &self.upstreams
     }
 
+    /// Every FastCGI location's backend, in configuration order.
+    pub fn fastcgi_backends(&self) -> &[Arc<FastCgiBackend>] {
+        &self.fastcgi_backends
+    }
+
     pub fn php_workers(&self) -> &[Arc<PhpWorkerPool>] {
         &self.php_pools
     }
@@ -498,18 +623,72 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    match parse_invocation(arguments)? {
+        Invocation::Serve(selection) => Ok(selection),
+        Invocation::Control { .. } => Err(ConfigError::Arguments(
+            "--control is not a server invocation".to_owned(),
+        )),
+        Invocation::Validate(_) => Err(ConfigError::Arguments(
+            "--validate is not a server invocation".to_owned(),
+        )),
+    }
+}
+
+/// What the process was asked to be: the server, or a client of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    Serve(ConfigSelection),
+    /// Compile the configuration, report what it would serve, and start
+    /// nothing. See `src/validate.rs`.
+    Validate(ConfigSelection),
+    /// Send one command to the control endpoint the configuration names.
+    Control {
+        selection: ConfigSelection,
+        command: crate::control::Command,
+    },
+}
+
+const USAGE: &str = "usage: hamster-wheel [--config PATH] [--control COMMAND | --validate]";
+
+pub fn parse_invocation<I, S>(arguments: I) -> Result<Invocation, ConfigError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
     let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
-    match arguments.as_slice() {
-        [] => Ok(ConfigSelection::BuiltIn),
-        [flag, path] if flag == "--config" && !path.is_empty() => {
-            Ok(ConfigSelection::File(PathBuf::from(path)))
+    // The control endpoint's name lives in the configuration, so a client
+    // invocation reads the same file the server was started with.
+    let (selection, rest) = match arguments.as_slice() {
+        [flag, path, rest @ ..] if flag == "--config" && !path.is_empty() => {
+            (ConfigSelection::File(PathBuf::from(path)), rest)
         }
-        [flag] if flag == "--config" => Err(ConfigError::Arguments(
-            "--config requires a file path".to_owned(),
+        [flag] if flag == "--config" => {
+            return Err(ConfigError::Arguments(
+                "--config requires a file path".to_owned(),
+            ));
+        }
+        rest => (ConfigSelection::BuiltIn, rest),
+    };
+    match rest {
+        [] => Ok(Invocation::Serve(selection)),
+        [flag, command] if flag == "--control" => {
+            match crate::control::Command::parse(&command.to_string_lossy()) {
+                Some(command) => Ok(Invocation::Control { selection, command }),
+                None => Err(ConfigError::Arguments(format!(
+                    "--control accepts {}",
+                    crate::control::Command::ALL
+                        .iter()
+                        .map(|command| command.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))),
+            }
+        }
+        [flag] if flag == "--control" => Err(ConfigError::Arguments(
+            "--control requires a command".to_owned(),
         )),
-        _ => Err(ConfigError::Arguments(
-            "usage: hamster-wheel [--config PATH]".to_owned(),
-        )),
+        [flag] if flag == "--validate" => Ok(Invocation::Validate(selection)),
+        _ => Err(ConfigError::Arguments(USAGE.to_owned())),
     }
 }
 
@@ -558,6 +737,9 @@ fn load_builtin() -> Result<RuntimeConfig, ConfigError> {
 fn builtin_raw_config() -> RawConfig {
     RawConfig {
         server: RawServer {
+            control: None,
+            access_log: None,
+            admin: None,
             listen: Some(DEFAULT_LISTEN.to_owned()),
             tls: None,
             max_connections: default_max_connections(),
@@ -570,6 +752,8 @@ fn builtin_raw_config() -> RawConfig {
         hosts: vec![RawHost {
             name: "localhost".to_owned(),
             aliases: vec!["127.0.0.1".to_owned()],
+            deny_paths: Vec::new(),
+            deny_names: Vec::new(),
             locations: vec![
                 RawLocation {
                     path: "/api".to_owned(),
@@ -577,6 +761,7 @@ fn builtin_raw_config() -> RawConfig {
                     root: None,
                     php: None,
                     proxy: None,
+                    fastcgi: None,
                 },
                 RawLocation {
                     path: "/".to_owned(),
@@ -584,6 +769,7 @@ fn builtin_raw_config() -> RawConfig {
                     root: Some(PathBuf::from(DEFAULT_DOCUMENT_ROOT)),
                     php: None,
                     proxy: None,
+                    fastcgi: None,
                 },
             ],
         }],
@@ -618,12 +804,16 @@ pub(crate) struct ValidatedConfig {
     listen: Option<SocketAddr>,
     tls: Option<TlsSource>,
     http_limits: HttpLimits,
+    control: Option<String>,
+    access_log: Option<crate::access_log::Settings>,
+    admin: Option<crate::admin::Settings>,
     hosts: Vec<ValidatedHost>,
 }
 
 struct ValidatedHost {
     name: String,
     aliases: Vec<String>,
+    access: Arc<AccessPolicy>,
     locations: Vec<ValidatedLocation>,
 }
 
@@ -643,6 +833,7 @@ enum ValidatedHandler {
         workers: usize,
         queue_capacity: usize,
         request_timeout: Duration,
+        startup_timeout: Duration,
         max_requests: Option<u64>,
         max_worker_age: Option<Duration>,
         env: BTreeMap<String, String>,
@@ -657,6 +848,14 @@ enum ValidatedHandler {
         idle_timeout: Duration,
         max_idle: usize,
         preserve_host: bool,
+    },
+    FastCgi {
+        resolved_root: PathBuf,
+        servers: Vec<SocketAddr>,
+        concurrency: usize,
+        index: String,
+        connect_timeout: Duration,
+        response_timeout: Duration,
     },
 }
 
@@ -739,6 +938,27 @@ pub(crate) fn validate_raw(
         max_body_memory: raw.server.max_body_memory as usize,
         http1_max_buffer_size: raw.server.http1_max_buffer_size,
     };
+    let control = match raw.server.control {
+        None => None,
+        Some(control) => {
+            if !cfg!(windows) {
+                return Err(ConfigError::Validation(
+                    "server.control is a Windows named pipe and is not available on this platform"
+                        .to_owned(),
+                ));
+            }
+            crate::control::validate_name(&control.name).map_err(ConfigError::Validation)?;
+            Some(control.name)
+        }
+    };
+    let access_log = match raw.server.access_log {
+        None => None,
+        Some(settings) => Some(validate_access_log(settings, base_directory)?),
+    };
+    let admin = match raw.server.admin {
+        None => None,
+        Some(settings) => Some(validate_admin(settings, listen, tls.as_ref())?),
+    };
     if raw.hosts.is_empty() {
         return Err(ConfigError::Validation(
             "hosts must contain at least one virtual host".to_owned(),
@@ -748,6 +968,11 @@ pub(crate) fn validate_raw(
     let mut names = HashMap::<String, HostnameRole>::new();
     let mut hosts = Vec::with_capacity(raw.hosts.len());
     for (host_index, host) in raw.hosts.into_iter().enumerate() {
+        let access = Arc::new(
+            AccessPolicy::compile(host.deny_paths, host.deny_names).map_err(|error| {
+                ConfigError::Validation(format!("hosts[{host_index}] ({:?}): {error}", host.name))
+            })?,
+        );
         validate_hostname_field(&host.name, &format!("hosts[{host_index}].name"))?;
         register_hostname(
             &mut names,
@@ -792,6 +1017,12 @@ pub(crate) fn validate_raw(
                 return Err(ConfigError::Validation(format!(
                     "{context}.path {:?} duplicates normalized location {path:?}",
                     location.path
+                )));
+            }
+            if location.fastcgi.is_some() && location.handler != "fastcgi" {
+                return Err(ConfigError::Validation(format!(
+                    "{context}.fastcgi is not valid for handler {:?}",
+                    location.handler
                 )));
             }
             let handler = match location.handler.as_str() {
@@ -894,6 +1125,20 @@ pub(crate) fn validate_raw(
                             configured
                         }
                     };
+                    let startup_timeout = match php.startup_timeout {
+                        None => DEFAULT_STARTUP_TIMEOUT,
+                        Some(seconds) => {
+                            let configured = Duration::from_secs(seconds);
+                            if !(MIN_STARTUP_TIMEOUT..=MAX_STARTUP_TIMEOUT).contains(&configured) {
+                                return Err(ConfigError::Validation(format!(
+                                    "{context}.php.startup_timeout must be between {} and {} seconds",
+                                    MIN_STARTUP_TIMEOUT.as_secs(),
+                                    MAX_STARTUP_TIMEOUT.as_secs()
+                                )));
+                            }
+                            configured
+                        }
+                    };
                     if php.max_requests == Some(0) {
                         return Err(ConfigError::Validation(format!(
                             "{context}.php.max_requests must be at least 1 when configured"
@@ -929,6 +1174,7 @@ pub(crate) fn validate_raw(
                         workers: php.workers,
                         queue_capacity,
                         request_timeout,
+                        startup_timeout,
                         max_requests: php.max_requests,
                         max_worker_age: php.max_worker_age.map(Duration::from_secs),
                         env: php.env,
@@ -952,9 +1198,42 @@ pub(crate) fn validate_raw(
                     })?;
                     validate_proxy(proxy, &context)?
                 }
+                "fastcgi" => {
+                    if location.php.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.php is not valid for handler \"fastcgi\""
+                        )));
+                    }
+                    if location.proxy.is_some() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.proxy is not valid for handler \"fastcgi\""
+                        )));
+                    }
+                    let root = location.root.ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "{context}.root is required for handler \"fastcgi\""
+                        ))
+                    })?;
+                    if root.as_os_str().is_empty() {
+                        return Err(ConfigError::Validation(format!(
+                            "{context}.root must not be empty"
+                        )));
+                    }
+                    let resolved_root = if root.is_absolute() {
+                        root
+                    } else {
+                        base_directory.join(root)
+                    };
+                    let fastcgi = location.fastcgi.ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "{context}.fastcgi is required for handler \"fastcgi\""
+                        ))
+                    })?;
+                    validate_fastcgi(fastcgi, resolved_root, &context)?
+                }
                 handler => {
                     return Err(ConfigError::Validation(format!(
-                        "{context}.handler {handler:?} is unknown; expected \"static\", \"not_found\", \"php_worker\", or \"proxy\""
+                        "{context}.handler {handler:?} is unknown; expected \"static\", \"not_found\", \"php_worker\", \"proxy\", or \"fastcgi\""
                     )));
                 }
             };
@@ -964,6 +1243,7 @@ pub(crate) fn validate_raw(
         hosts.push(ValidatedHost {
             name: host.name,
             aliases: host.aliases,
+            access,
             locations,
         });
     }
@@ -971,7 +1251,91 @@ pub(crate) fn validate_raw(
         listen,
         tls,
         http_limits,
+        control,
+        access_log,
+        admin,
         hosts,
+    })
+}
+
+/// Validates a `fastcgi` location without touching the filesystem or the
+/// network: the root is canonicalized and the servers are used only at
+/// compilation and request time.
+fn validate_fastcgi(
+    fastcgi: RawFastCgi,
+    resolved_root: PathBuf,
+    context: &str,
+) -> Result<ValidatedHandler, ConfigError> {
+    if fastcgi.servers.is_empty() || fastcgi.servers.len() > FASTCGI_MAX_SERVERS {
+        return Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.servers must list between 1 and {FASTCGI_MAX_SERVERS} addresses"
+        )));
+    }
+    let mut servers = Vec::with_capacity(fastcgi.servers.len());
+    for (index, server) in fastcgi.servers.iter().enumerate() {
+        let field = format!("{context}.fastcgi.servers[{index}]");
+        let address = server.parse::<SocketAddr>().map_err(|error| {
+            ConfigError::Validation(format!(
+                "{field} {server:?} is not a numeric IP socket address: {error}"
+            ))
+        })?;
+        if address.port() == 0 {
+            return Err(ConfigError::Validation(format!(
+                "{field} {server:?} must name a port"
+            )));
+        }
+        if servers.contains(&address) {
+            return Err(ConfigError::Validation(format!(
+                "{field} {server:?} is listed twice"
+            )));
+        }
+        servers.push(address);
+    }
+    let concurrency = fastcgi.concurrency.unwrap_or(1);
+    if !(1..=FASTCGI_MAX_CONCURRENCY).contains(&concurrency) {
+        return Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.concurrency must be between 1 and {FASTCGI_MAX_CONCURRENCY}"
+        )));
+    }
+    let index = fastcgi
+        .index
+        .unwrap_or_else(|| FASTCGI_DEFAULT_INDEX.to_owned());
+    let plain_segments = !index.is_empty()
+        && !index.starts_with('/')
+        && index.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && !segment.contains(['\\', ':', '\0'])
+        });
+    let script = index.len() > 4 && index[index.len() - 4..].eq_ignore_ascii_case(".php");
+    if !plain_segments || !script {
+        return Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.index {index:?} must be a relative path to a .php script inside the root"
+        )));
+    }
+    let seconds = |value: Option<u64>, default: Duration, name: &str| match value {
+        None => Ok(default),
+        Some(value @ 1..=3600) => Ok(Duration::from_secs(value)),
+        Some(_) => Err(ConfigError::Validation(format!(
+            "{context}.fastcgi.{name} must be between 1 and 3600 seconds"
+        ))),
+    };
+    Ok(ValidatedHandler::FastCgi {
+        resolved_root,
+        servers,
+        concurrency,
+        index,
+        connect_timeout: seconds(
+            fastcgi.connect_timeout,
+            FASTCGI_DEFAULT_CONNECT_TIMEOUT,
+            "connect_timeout",
+        )?,
+        response_timeout: seconds(
+            fastcgi.response_timeout,
+            FASTCGI_DEFAULT_RESPONSE_TIMEOUT,
+            "response_timeout",
+        )?,
     })
 }
 
@@ -1216,6 +1580,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
     let mut virtual_hosts = Vec::new();
     let mut php_pools = Vec::new();
     let mut upstreams = Vec::new();
+    let mut fastcgi_backends = Vec::new();
     // One budget for the whole process. Every PHP pool shares it, because the
     // resource it protects is this process's memory, not a pool's queue.
     let body_budget = BodyBudget::new(validated.http_limits.max_body_memory());
@@ -1224,28 +1589,44 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         for (location_index, location) in host.locations.into_iter().enumerate() {
             let handler = match location.handler {
                 ValidatedHandler::Static { resolved_root } => {
-                    let canonical_root = fs::canonicalize(&resolved_root).map_err(|error| {
-                        ConfigError::Compile(format!(
-                            "hosts[{host_index}] ({:?}).locations[{location_index}].root {} cannot be canonicalized: {error}",
-                            host.name,
-                            resolved_root.display()
-                        ))
-                    })?;
-                    let metadata = fs::metadata(&canonical_root).map_err(|error| {
-                        ConfigError::Compile(format!(
-                            "hosts[{host_index}] ({:?}).locations[{location_index}].root {} cannot be inspected: {error}",
-                            host.name,
-                            canonical_root.display()
-                        ))
-                    })?;
-                    if !metadata.is_dir() {
-                        return Err(ConfigError::Compile(format!(
-                            "hosts[{host_index}] ({:?}).locations[{location_index}].root {} is not a directory",
-                            host.name,
-                            canonical_root.display()
-                        )));
-                    }
-                    Handler::static_files(Arc::new(canonical_root))
+                    let canonical_root = canonical_directory(
+                        &resolved_root,
+                        &format!(
+                            "hosts[{host_index}] ({:?}).locations[{location_index}].root",
+                            host.name
+                        ),
+                    )?;
+                    Handler::static_files_with_access(
+                        Arc::new(canonical_root),
+                        Arc::clone(&host.access),
+                    )
+                }
+                ValidatedHandler::FastCgi {
+                    resolved_root,
+                    servers,
+                    concurrency,
+                    index,
+                    connect_timeout,
+                    response_timeout,
+                } => {
+                    let document_root = canonical_directory(
+                        &resolved_root,
+                        &format!(
+                            "hosts[{host_index}] ({:?}).locations[{location_index}].root",
+                            host.name
+                        ),
+                    )?;
+                    let backend = FastCgiBackend::new(FastCgiConfig {
+                        label: Arc::from(format!("{}{}", host.name, location.path).as_str()),
+                        document_root,
+                        index,
+                        servers,
+                        concurrency,
+                        connect_timeout,
+                        response_timeout,
+                    });
+                    fastcgi_backends.push(Arc::clone(&backend));
+                    Handler::fastcgi_with_access(backend, Arc::clone(&host.access))
                 }
                 ValidatedHandler::NotFound => Handler::not_found(),
                 ValidatedHandler::PhpWorker {
@@ -1254,6 +1635,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                     workers,
                     queue_capacity,
                     request_timeout,
+                    startup_timeout,
                     max_requests,
                     max_worker_age,
                     env,
@@ -1287,6 +1669,7 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
                         workers,
                         queue_capacity,
                         request_timeout,
+                        startup_timeout,
                         max_requests,
                         max_worker_age,
                         body_budget: Arc::clone(&body_budget),
@@ -1337,8 +1720,12 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
             .map(|(path, handler)| (path.as_str(), handler.clone()))
             .collect();
         let location_router = Arc::new(
-            LocationRouter::new(location_refs, Handler::not_found())
-                .map_err(|error| compile_router_error(&host.name, "locations", error))?,
+            LocationRouter::with_access(
+                location_refs,
+                Handler::not_found(),
+                Arc::clone(&host.access),
+            )
+            .map_err(|error| compile_router_error(&host.name, "locations", error))?,
         );
         for hostname in
             std::iter::once(host.name.as_str()).chain(host.aliases.iter().map(String::as_str))
@@ -1355,10 +1742,107 @@ pub(crate) fn compile_validated(validated: ValidatedConfig) -> Result<RuntimeCon
         listen: validated.listen,
         tls,
         http_limits: validated.http_limits,
+        control: validated.control,
+        access_log: validated.access_log,
+        admin: validated.admin,
         router: Arc::new(router),
         php_pools,
         upstreams,
+        fastcgi_backends,
     })
+}
+
+/// Validates `[server.admin]`.
+///
+/// The address is bound in `server::run`, before workers start, so a clash
+/// with another process fails startup. What is checked here is a clash an
+/// operator can only have meant as a mistake: naming the address an
+/// application listener already uses, which would make the administrative
+/// surface and the application fight for the same socket.
+fn validate_admin(
+    raw: RawAdmin,
+    listen: Option<SocketAddr>,
+    tls: Option<&TlsSource>,
+) -> Result<crate::admin::Settings, ConfigError> {
+    let address: SocketAddr = raw.listen.parse().map_err(|_| {
+        ConfigError::Validation(format!(
+            "server.admin.listen must be host:port, got {}",
+            raw.listen
+        ))
+    })?;
+    // Port 0 asks the operating system for a free port, so two port-0
+    // addresses are not the same socket and must not be read as a clash.
+    let clashes = address.port() != 0
+        && (Some(address) == listen || tls.map(|tls| tls.listen) == Some(address));
+    if clashes {
+        return Err(ConfigError::Validation(format!(
+            "server.admin.listen {address} is already an application listener"
+        )));
+    }
+    Ok(crate::admin::Settings::new(address))
+}
+
+/// Validates `[server.access_log]` without creating or opening anything.
+///
+/// The file is opened once at startup by `server::run`, which fails closed on
+/// a path that cannot be written. Validation here is about values a
+/// configuration can get wrong: an unusable queue depth, or a path that names
+/// a directory that is already there.
+fn validate_access_log(
+    raw: RawAccessLog,
+    base_directory: &Path,
+) -> Result<crate::access_log::Settings, ConfigError> {
+    use crate::access_log::{MAX_QUEUE_CAPACITY, MIN_QUEUE_CAPACITY};
+    if !(MIN_QUEUE_CAPACITY..=MAX_QUEUE_CAPACITY).contains(&raw.queue_capacity) {
+        return Err(ConfigError::Validation(format!(
+            "server.access_log.queue_capacity must be between {MIN_QUEUE_CAPACITY} and {MAX_QUEUE_CAPACITY}"
+        )));
+    }
+    let path = match raw.path {
+        None => None,
+        Some(path) if path.trim().is_empty() => {
+            return Err(ConfigError::Validation(
+                "server.access_log.path must not be empty; omit it to log to stdout".to_owned(),
+            ));
+        }
+        Some(path) => {
+            let resolved = resolve_path(base_directory, PathBuf::from(path));
+            if resolved.is_dir() {
+                return Err(ConfigError::Validation(format!(
+                    "server.access_log.path {} is a directory",
+                    resolved.display()
+                )));
+            }
+            Some(resolved)
+        }
+    };
+    Ok(crate::access_log::Settings::new(
+        path,
+        raw.include_query,
+        raw.queue_capacity,
+    ))
+}
+
+fn canonical_directory(path: &Path, field: &str) -> Result<PathBuf, ConfigError> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        ConfigError::Compile(format!(
+            "{field} {} cannot be canonicalized: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        ConfigError::Compile(format!(
+            "{field} {} cannot be inspected: {error}",
+            canonical.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(ConfigError::Compile(format!(
+            "{field} {} is not a directory",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 fn canonical_file(path: &Path, field: &str) -> Result<PathBuf, ConfigError> {
@@ -1427,6 +1911,147 @@ mod tests {
         );
         assert!(parse_arguments(["--config"]).is_err());
         assert!(parse_arguments(["unknown"]).is_err());
+        // A control invocation is not a server invocation.
+        assert!(parse_arguments(["--config", "custom.toml", "--control", "stop"]).is_err());
+    }
+
+    #[test]
+    fn parses_control_invocations_beside_the_server_one() {
+        assert_eq!(
+            parse_invocation(["--config", "custom.toml", "--control", "stop"]).unwrap(),
+            Invocation::Control {
+                selection: ConfigSelection::File(PathBuf::from("custom.toml")),
+                command: crate::control::Command::Stop,
+            }
+        );
+        for command in crate::control::Command::ALL {
+            assert_eq!(
+                parse_invocation(["--control", command.name()]).unwrap(),
+                Invocation::Control {
+                    selection: ConfigSelection::BuiltIn,
+                    command,
+                }
+            );
+        }
+        assert_eq!(
+            parse_invocation(Vec::<OsString>::new()).unwrap(),
+            Invocation::Serve(ConfigSelection::BuiltIn)
+        );
+        assert!(parse_invocation(["--control"]).is_err());
+        assert!(parse_invocation(["--control", "restart"]).is_err());
+        assert!(parse_invocation(["--control", "stop", "extra"]).is_err());
+    }
+
+    #[test]
+    fn parses_validate_invocations_and_keeps_them_out_of_serving() {
+        assert_eq!(
+            parse_invocation(["--config", "custom.toml", "--validate"]).unwrap(),
+            Invocation::Validate(ConfigSelection::File(PathBuf::from("custom.toml")))
+        );
+        assert_eq!(
+            parse_invocation(["--validate"]).unwrap(),
+            Invocation::Validate(ConfigSelection::BuiltIn)
+        );
+        // Validation is not a server invocation, and not a control one.
+        assert!(parse_arguments(["--config", "custom.toml", "--validate"]).is_err());
+        assert!(parse_invocation(["--validate", "extra"]).is_err());
+        assert!(parse_invocation(["--validate", "--control", "stop"]).is_err());
+    }
+
+    #[test]
+    fn reads_the_control_endpoint_without_compiling_the_configuration() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "hamster-control-endpoint-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let temporary = Scratch(directory);
+        let path = temporary.0.join("hamster.toml");
+        // A certificate path that cannot load: the client must still be able to
+        // ask the running server to reload, which is the whole point.
+        fs::write(
+            &path,
+            "[server]
+listen = \"127.0.0.1:0\"
+
+[server.control]
+name = \"edge\"
+
+             [[server.tls.certificates]]
+cert = \"missing.pem\"
+key = \"missing.key\"
+             names = [\"localhost\"]
+
+[[hosts]]
+name = \"localhost\"
+locations = []
+",
+        )
+        .unwrap();
+        let selection = ConfigSelection::File(path);
+        assert!(load(selection.clone()).is_err());
+        assert_eq!(
+            control_endpoint(&selection).unwrap(),
+            Some("edge".to_owned())
+        );
+        assert_eq!(control_endpoint(&ConfigSelection::BuiltIn).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_an_unusable_control_endpoint_name() {
+        let base = "[server]
+listen = \"127.0.0.1:8080\"
+
+[[hosts]]
+name = \"localhost\"
+                    locations = [{ path = \"/\", handler = \"not_found\" }]
+
+[server.control]
+";
+        for name in ["", "a b", "pipe/name", "x!"] {
+            let source = format!(
+                "{base}name = \"{name}\"
+"
+            );
+            assert!(
+                matches!(
+                    compile_str(&source, Path::new(".")),
+                    Err(ConfigError::Validation(_))
+                ),
+                "{name}"
+            );
+        }
+        // An unknown key under [server.control] is a configuration error.
+        assert!(matches!(
+            compile_str(
+                &format!(
+                    "{base}name = \"edge\"
+path = \"ignored\"
+"
+                ),
+                Path::new(".")
+            ),
+            Err(ConfigError::Parse { .. })
+        ));
+        let runtime = compile_str(
+            &format!(
+                "{base}name = \"edge\"
+"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(runtime.control_name(), Some("edge"));
     }
 
     #[test]
@@ -1462,6 +2087,160 @@ mod tests {
         assert!(matches!(
             compile_str(&port, Path::new(".")),
             Err(ConfigError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn compiles_an_admin_listener_and_rejects_one_that_takes_an_application_address() {
+        let hosts = "
+
+[[hosts]]
+name = \"localhost\"
+locations = [{ path = \"/\", handler = \"not_found\" }]
+";
+
+        let without = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:8080\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(without.admin().is_none(), "admin is off unless configured");
+
+        let configured = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.admin]
+listen = \"127.0.0.1:9090\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(
+            configured.admin().map(|admin| admin.listen()),
+            Some("127.0.0.1:9090".parse().unwrap())
+        );
+
+        // The same socket as the application listener is a mistake, not a
+        // configuration: it would make the two fight for one address.
+        assert!(matches!(
+            compile_str(
+                &format!(
+                    "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.admin]
+listen = \"127.0.0.1:8080\"{hosts}"
+                ),
+                Path::new(".")
+            ),
+            Err(ConfigError::Validation(_))
+        ));
+        // But port 0 asks for a free port, so two of them are two sockets.
+        let both_ephemeral = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:0\"
+
+[server.admin]
+listen = \"127.0.0.1:0\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(both_ephemeral.admin().is_some());
+
+        assert!(matches!(
+            compile_str(
+                &format!(
+                    "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.admin]
+listen = \"not-an-address\"{hosts}"
+                ),
+                Path::new(".")
+            ),
+            Err(ConfigError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn compiles_an_access_log_and_rejects_values_that_cannot_work() {
+        let base = "[server]
+listen = \"127.0.0.1:8080\"
+
+[server.access_log]
+";
+        let hosts = "
+
+[[hosts]]
+name = \"localhost\"
+locations = [{ path = \"/\", handler = \"not_found\" }]
+";
+
+        // Absent section: no settings at all, so no queue and no writer.
+        let without = compile_str(
+            &format!(
+                "[server]
+listen = \"127.0.0.1:8080\"{hosts}"
+            ),
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(without.access_log().is_none());
+
+        // Present with no path: stdout, query omitted, default queue.
+        let stdout = compile_str(&format!("{base}{hosts}"), Path::new(".")).unwrap();
+        let settings = stdout.access_log().expect("the section was present");
+        assert!(settings.path().is_none());
+        assert!(!settings.include_query());
+        assert_eq!(
+            settings.queue_capacity(),
+            crate::access_log::DEFAULT_QUEUE_CAPACITY
+        );
+        assert_eq!(settings.target_description(), "stdout");
+
+        // A relative path resolves beside the configuration file.
+        let relative = compile_str(
+            &format!("{base}path = \"logs/access.jsonl\"{hosts}"),
+            Path::new("D:/deployment"),
+        )
+        .unwrap();
+        assert_eq!(
+            relative.access_log().unwrap().path(),
+            Some(
+                Path::new("D:/deployment")
+                    .join("logs/access.jsonl")
+                    .as_path()
+            )
+        );
+
+        for rejected in [
+            "queue_capacity = 0",
+            "queue_capacity = 8",
+            "queue_capacity = 65537",
+            "path = \"\"",
+            // A directory is never a log file, and the error belongs in
+            // validation rather than in the first write.
+            "path = \".\"",
+        ] {
+            assert!(
+                matches!(
+                    compile_str(&format!("{base}{rejected}{hosts}"), Path::new(".")),
+                    Err(ConfigError::Validation(_))
+                ),
+                "{rejected} was accepted"
+            );
+        }
+        // An unknown key in the section is still a configuration error.
+        assert!(matches!(
+            compile_str(&format!("{base}rotate = true{hosts}"), Path::new(".")),
+            Err(ConfigError::Parse { .. })
         ));
     }
 

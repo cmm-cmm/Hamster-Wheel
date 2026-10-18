@@ -7,13 +7,16 @@ description = "HTTP server with static files, routing, configuration, and persis
 [features]
 profiling = []
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [dependencies]
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws_lc_rs", "tls12"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 

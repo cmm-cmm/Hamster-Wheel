@@ -109,11 +109,14 @@ FACT (measured, G1): the worst case this repository can construct — four
 workers, a one-second timeout, every request timing out, driven concurrently
 for 30.5 s — produced 95 timeouts, about three lines per second.
 
-## HTTP status: 502, decided
+## HTTP status: 504 in the current Windows corrective pass
 
-The response is `502` with the body `PHP Worker Execution Timeout`. The body is
-what distinguishes the condition, the same pattern the body budget uses for its
-`503`.
+The original policy emitted `502` with the body `PHP Worker Execution Timeout`
+for the reasons recorded below. The later owner instruction asks for a
+cause-based gateway status: a worker that has not replied by its execution
+deadline now emits `504` with the same body. Invalid protocol/process/I/O
+responses remain `502`. The request still is never replayed, its worker is
+killed/reaped, and replacement still bypasses infrastructure backoff.
 
 `504 Gateway Timeout` is arguably the more literal status — RFC 9110 defines it
 as a gateway not receiving a timely response from an upstream. It was
@@ -124,9 +127,10 @@ and proxies apply idempotent-retry heuristics more readily to it than to `502`.
 Hamster refuses to replay a possibly-started request internally, so it must not
 emit an HTTP-level signal that encourages a peer to replay it externally.
 
-This is a deliberate choice against the more descriptive status, not an
-oversight, and it is not revisited without a reason that addresses the replay
-risk.
+That was a deliberate historical choice, not an oversight. The current
+contract uses [RFC 9110's timeout meaning](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.5)
+to identify the cause. A 504 does not assert that an operation is safe to
+retry: clients must apply their own method/application idempotency policy.
 
 ## Configuration
 

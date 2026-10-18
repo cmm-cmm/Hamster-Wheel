@@ -27,61 +27,11 @@ use Illuminate\Support\Once;
 use Laravel\Octane\ApplicationFactory;
 use Laravel\Octane\RequestContext;
 use Laravel\Octane\Worker;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
-use Symfony\Component\HttpFoundation\StreamedResponse;
-
-const HAMSTER_FORBIDDEN_RESPONSE_HEADERS = [
-    'connection' => true,
-    'content-length' => true,
-    'keep-alive' => true,
-    'proxy-authenticate' => true,
-    'proxy-authorization' => true,
-    'server' => true,
-    'te' => true,
-    'trailer' => true,
-    'transfer-encoding' => true,
-    'upgrade' => true,
-];
 
 function hamster_fail(string $message): never
 {
     fwrite(STDERR, "laravel worker: {$message}\n");
     exit(2);
-}
-
-/** @return list<array{0:string,1:string}> */
-function hamster_response_headers($response): array
-{
-    $headers = [];
-    foreach ($response->headers->allPreserveCase() as $name => $values) {
-        if (isset(HAMSTER_FORBIDDEN_RESPONSE_HEADERS[strtolower($name)])) {
-            continue;
-        }
-        foreach ($values as $value) {
-            $headers[] = [$name, (string) $value];
-        }
-    }
-
-    return $headers;
-}
-
-function hamster_response_body($response): string
-{
-    if (! $response instanceof StreamedResponse && ! $response instanceof BinaryFileResponse) {
-        return (string) $response->getContent();
-    }
-
-    $level = ob_get_level();
-    ob_start();
-    try {
-        $response->sendContent();
-
-        return (string) ob_get_contents();
-    } finally {
-        while (ob_get_level() > $level) {
-            ob_end_clean();
-        }
-    }
 }
 
 function hamster_worker_response(int $id, int $status, string $body): string
@@ -92,26 +42,6 @@ function hamster_worker_response(int $id, int $status, string $body): string
         'headers' => [['Content-Type', 'text/plain; charset=UTF-8']],
         'body' => $body,
     ]);
-}
-
-/** Run code behind an output guard and return bytes it attempted to print. */
-function hamster_guard_output(callable $operation): string
-{
-    $level = ob_get_level();
-    ob_start();
-    try {
-        $operation();
-    } finally {
-        $chunks = [];
-        while (ob_get_level() > $level) {
-            $chunk = ob_get_clean();
-            if (is_string($chunk) && $chunk !== '') {
-                $chunks[] = $chunk;
-            }
-        }
-    }
-
-    return implode('', array_reverse($chunks));
 }
 
 $appPath = getenv('HAMSTER_LARAVEL_PATH');

@@ -5,7 +5,11 @@ param(
     [int]$WarmupRequests = 1000,
     [string]$RequestPath = '/',
     [int]$ExpectedStatus = 200,
-    [string]$Executable = '.\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe'
+    [string]$Executable = '.\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe',
+    # Omitted means the built-in configuration, which every earlier run
+    # used. Pass one to measure a configured feature against the same
+    # workload.
+    [string]$ConfigPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,8 +106,18 @@ $executable = (Resolve-Path -LiteralPath $Executable).Path
 $logicalProcessors = [Environment]::ProcessorCount
 $results = @()
 
+$serverArguments = @()
+if ($ConfigPath -ne '') {
+    $serverArguments = @('--config', (Resolve-Path -LiteralPath $ConfigPath).Path)
+}
+
 for ($run = 1; $run -le $Runs; $run++) {
-    $serverProcess = Start-Process -FilePath $executable -PassThru -WindowStyle Hidden
+    $serverProcess = if ($serverArguments.Count -gt 0) {
+        Start-Process -FilePath $executable -ArgumentList $serverArguments -PassThru -WindowStyle Hidden
+    }
+    else {
+        Start-Process -FilePath $executable -PassThru -WindowStyle Hidden
+    }
     try {
         $ready = $false
         for ($attempt = 0; $attempt -lt 100; $attempt++) {

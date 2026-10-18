@@ -12,8 +12,17 @@ Replace every PEM certificate and key at the paths already configured in
 **Ctrl+Break** in the server's attached console; **Ctrl+C** still shuts down.
 On Linux, send **SIGHUP** to the server process; **SIGINT** still shuts down.
 The trigger is explicit, so writing several files does not publish a partial
-set. There is no polling and no change to the TOML schema. Windows operation
-without an attached console has no reload trigger yet.
+set. There is no polling. On Windows without a console, configure
+`[server.control]` and use `hamster-wheel.exe --config <file> --control
+reload-certificates`; see `WINDOWS_OPERATIONS.md` for pipe permissions and
+`ERR reload_failed` rollback evidence. Native Linux remains NOT VERIFIED.
+
+A console delivers Ctrl+Break to every process attached to it. PHP workers are
+spawned with their own windowless console (`CREATE_NO_WINDOW`), so the event
+reaches Hamster only: workers and the requests they are executing continue
+across a reload. Until 2026-09-28 workers shared Hamster's console and ended on
+the same key press, so every reload on a server with PHP pools answered its
+in-flight PHP requests with 502 and replaced every worker.
 
 The server logs either `TLS certificate reload succeeded` followed by each
 certificate's names and new expiry, or `TLS certificate reload failed; previous
@@ -29,7 +38,10 @@ key, checks key matching, configured SAN coverage, dates, leaf EKU, bundled
 issuer CA status and chain linkage with the same loader used at startup, then
 builds a complete rustls `ServerConfig`, SNI resolver, Host authority scopes and
 expiry reports. If any step fails, the candidate is dropped and the current
-set is unchanged. Reload requests are serialized by an async mutex.
+set is unchanged. Reload requests are serialized by an async mutex whose
+owned guard travels with the blocking job. Cancelling the caller cannot
+release serialization while queued/running certificate work remains; on
+success the guard is retained through adoption to prevent out-of-order swaps.
 
 The serving set is one `Arc<CertificateSet>` behind a short `RwLock`. The lock
 is held only to clone or swap this pointer; no file I/O, parsing or handshake
@@ -39,7 +51,11 @@ the ClientHello and holds it through scope selection. The acceptor's resolver
 and the scope lookup therefore belong to the same generation. Existing TLS
 connections keep their stream and authority scope; new handshakes after a
 successful swap take the new set. Shutdown cancels the signal task; a blocked
-file load cannot publish after its caller is cancelled.
+file load cannot publish after its caller is cancelled. Cancellation does not
+cancel native file I/O or queued `spawn_blocking` work; at most one compilation
+per listener remains outstanding, and later reloads wait instead of enqueueing
+more. Keep certificate files on reliable local storage; stalled native I/O
+and runtime termination are not claimed to have a hard real-time bound.
 
 Each new rustls `ServerConfig` starts with a fresh in-memory session cache;
 resumption from the previous generation is not retained. The listener
@@ -89,6 +105,21 @@ The first test attempt failed because its helper used
 helper itself exited on the event. Installing an explicit handler fixed the
 test harness. No production reload defect was found. Linux SIGHUP has not
 been exercised in an end-to-end process test.
+
+Two later process regressions (2026-09-28) found two defects outside the reload
+logic itself, both now fixed:
+
+- `ctrl_break_reloads_after_stdout_is_closed` closes the server's stdout and
+  sends Ctrl+Break twice. Before the fix, the first reload's success line
+  panicked the reload task (`failed printing to stdout: The pipe is being
+  closed`); with that task gone nothing handled the second Ctrl+Break, and
+  Windows ended the process with `STATUS_CONTROL_C_EXIT` (0xC000013A).
+  Operational output now drops a line it cannot write (`src/output.rs`).
+- `ctrl_break_reload_leaves_php_workers_serving` in `tests/php_worker.rs`
+  reloads a server with a two-worker PHP pool while a request is executing.
+  Before the fix that request returned `502 PHP Worker Unavailable` because the
+  console event ended `php.exe`; now it returns 200, both workers keep their
+  process, and on the following Ctrl+C each exits 0 through SHUTDOWN.
 
 Windows gates on the final implementation: `cargo fmt --all -- --check`,
 `cargo test` (144 library passed, 9 ignored; 30 configuration, 7 routing and 5

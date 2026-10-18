@@ -1,0 +1,17 @@
+# Baseline arm for the access-log A/B: identical to the built-in development
+# configuration, with no [server.access_log] section.
+[server]
+listen = "127.0.0.1:8080"
+
+[[hosts]]
+name = "localhost"
+aliases = ["127.0.0.1"]
+
+[[hosts.locations]]
+path = "/api"
+handler = "not_found"
+
+[[hosts.locations]]
+path = "/"
+handler = "static"
+root = "../public"

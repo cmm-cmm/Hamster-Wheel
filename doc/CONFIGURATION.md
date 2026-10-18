@@ -1,5 +1,8 @@
 # Runtime Configuration
 
+For startup, backend ownership, readiness and signal procedures on Windows,
+see `doc/WINDOWS_OPERATIONS.md`.
+
 ## Design Goals
 
 Milestone 0.0.4 parses, validates, and compiles configuration once before the
@@ -23,6 +26,9 @@ http1_max_buffer_size = 65536
 [[hosts]]
 name = "localhost"
 aliases = ["127.0.0.1"]
+# Optional host-wide, component-aware denials applied before routing.
+deny_paths = ["/data", "/conf", "/inc", "/bin", "/vendor"]
+deny_names = ["composer.json", "composer.lock"]
 
 [[hosts.locations]]
 path = "/api"
@@ -49,6 +55,8 @@ workers = 4
 queue_capacity = 32
 # Ceiling on one application transaction, in seconds. Defaults to 5.
 request_timeout = 30
+# Budget for each generation to reach READY, in seconds (1-300). Defaults to 5.
+startup_timeout = 30
 # Optional lifecycle policies; omitted means OFF.
 max_requests = 10000
 max_worker_age = 3600
@@ -93,6 +101,48 @@ because it buffers no request body. `idle_timeout` defaults below the 5-second
 keep-alive timeout common to several upstream servers so Hamster normally
 retires an idle connection first; it is a policy default, not a measured
 optimum. See `doc/REVERSE_PROXY_V1.md` for the full semantics.
+
+A FastCGI location runs the PHP scripts under `root` through FastCGI endpoints
+the operator starts, for example `php-cgi.exe -b 127.0.0.1:9001` with
+`PHP_FCGI_MAX_REQUESTS=0`. Hamster never starts or restarts them. `root` and
+`servers` are required; the other fields show their defaults:
+
+```toml
+[[hosts.locations]]
+path = "/"
+handler = "fastcgi"
+root = "sites/wiki"
+
+[hosts.locations.fastcgi]
+servers = ["127.0.0.1:9001", "127.0.0.1:9002"]  # 1-64, numeric IP:port, no duplicates
+concurrency = 1               # 1-256 exchanges per server at once
+index = "index.php"           # relative .php path: front controller and directory index
+connect_timeout = 5           # seconds, 1-3600: waiting for a slot, then the connect
+response_timeout = 60         # seconds, 1-3600: backend inactivity
+```
+
+`php-cgi` on Windows serves one connection at a time, so each process is one
+`servers` entry with `concurrency = 1`. Hostnames are refused rather than
+resolved. On Windows, that single-exchange configuration uses a bounded
+blocking-pool TCP connect when `connect_timeout <= 5`; longer timeouts and
+multiplexing endpoints use async connect. Each request still opens a fresh
+connection. A canceled HTTP waiter cannot send a FastCGI request from a
+detached connect task. If that task has not started, its exchange slot is
+released immediately; if it has started, the slot is held until connect
+returns. Queued blocking connect work is capped per location, with async
+connect fallback when the cap is occupied. The whole
+root is otherwise served, and `.htaccess` is not read.
+Declare private directories with host-wide `deny_paths`, and sensitive file
+basenames with `deny_names`; both return 404 before any location handler sees
+the request. Paths match whole components, ignoring ASCII case, so `/data`
+blocks `/DATA/file` and `/%64ata/file` but not `/database`. Names match at any
+depth. Rules must use plain ASCII path components, without percent escapes,
+`..`, trailing dots or spaces. File handlers also deny dotfile components
+except root `/.well-known`, and never serve PHP source extensions as bytes.
+The final opened file location is checked again, so a junction alias inside
+the same root does not bypass a rule. These defaults do not identify every
+application-specific private directory: configure those explicitly. See
+`doc/FASTCGI_V1.md` for examples and the remaining script-path handoff limit.
 
 An optional HTTPS listener terminates TLS in front of the same hosts. Only
 `listen` and at least one certificate are required; the example shows the
@@ -147,9 +197,107 @@ the leaf to the last one in the file are `Compile` errors naming the field and
 path. Key contents never appear in a diagnostic. A file holding only a leaf
 whose issuer is not included starts with a printed note, because only clients
 know which issuers they trust; startup also prints each certificate's expiry
-date, since certificates are not reloaded. TLS 1.2 and 1.3 use rustls's defaults with the
-aws-lc-rs provider, and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md`
-for the full semantics.
+date. Configured certificate/key files can later be reloaded transactionally
+with Ctrl+Break in an attached Windows console, or with the control endpoint
+below on a server that has none; listeners, names and other configuration do
+not reload. TLS 1.2 and 1.3 use rustls's defaults with the aws-lc-rs provider,
+and ALPN advertises only `http/1.1`. See `doc/TLS_V1.md` and
+`doc/TLS_CERTIFICATE_RELOAD.md` for the full semantics.
+
+An optional local control endpoint gives a server with no console the graceful
+stop and the certificate reload that Ctrl+C and Ctrl+Break provide in one:
+
+```toml
+[server.control]
+name = "edge"                 # ASCII letters, digits, '-', '_', '.'; 1-64 long
+```
+
+`name` is the only key, and the endpoint exists only when it is present. It is
+a Windows named pipe at `\\.\pipe\hamster-wheel-control-<name>`, so the key is
+rejected while compiling a configuration on any other platform. A name already
+in use is a startup failure rather than a shared endpoint. The pipe's DACL is
+set at creation and protected: LocalSystem and the pipe's object-owner SID
+have full access and nobody else has any; verify the actual Service token's
+default owner rather than assuming it equals its user SID. Remote
+clients are rejected. Anyone who can open it can stop the server.
+
+There is no concurrency key: the endpoint handles four exchanges at once, and a
+connection beyond that is answered `ERR busy` within eight bounded refusal
+slots, which the client retries inside its own five-second budget. Beyond
+those slots it closes without a guaranteed frame; that is a client error,
+not success. One five-second exchange deadline covers all phases. The
+listener owns and joins its exchanges on shutdown. Sustained overload can
+still prevent an operator command: this is bounded admission, not a fairness
+or reserved-operator-slot guarantee.
+
+The same binary is the client, and needs the same configuration file because
+that file names the endpoint:
+`hamster-wheel --config hamster.toml --control status|ping|stop|reload-certificates`.
+The client reads only `[server.control]` and compiles nothing else, so a
+certificate that no longer loads does not stop `reload-certificates` from
+reaching the running server. The server's answer is printed verbatim and the
+exit code is 0 for `OK`, 1 for `ERR`. See `doc/WINDOWS_OPERATIONS.md` for the
+operator runbook.
+
+An optional per-request log records what the server served. It is off unless
+the section is present, and its absence means no queue, no writer task and no
+per-request work:
+
+```toml
+[server.access_log]
+path = "logs/access.jsonl"   # omit for stdout; relative resolves beside this file
+include_query = false        # default; credential-shaped values are replaced
+queue_capacity = 1024        # 16-65536
+```
+
+Records are JSON Lines, one object per request. The file is opened at startup,
+before pools start and before listeners bind, so a path that cannot be written
+is a startup failure; a path naming an existing directory, an empty path and a
+queue outside the range are configuration errors. Hamster appends and never
+rotates: stream rotation belongs to the Service wrapper or to an out-of-process
+tool.
+
+No headers other than the validated authority are logged, and no bodies. A
+query string is omitted unless `include_query = true`, in which case the values
+of credential-shaped keys are replaced with `REDACTED`. The queue is bounded
+and never waited on: when it is full the record is dropped, counted, reported
+in the log as a `log_dropped` record and shown by the control endpoint's
+`status` as `access_log=<target> queued= written= dropped= failed=`. See
+`doc/ACCESS_LOG_0_8.md` for the record fields and the complete behaviour.
+
+A configuration file can be checked without running it:
+
+```powershell
+hamster-wheel.exe --config D:\site\hamster.toml --validate
+```
+
+This compiles the file exactly as a server start would — resolving roots,
+loading certificates, validating pool, proxy and FastCGI settings — then prints
+the resources it would serve as `key=value` lines and exits 0. Any error is
+reported on stderr with exit 1. It starts nothing: no listener is bound, no PHP
+worker is spawned, no log file is created, so it is safe to run on the machine
+that is currently serving. The last line names what it did **not** check:
+`not_checked=listener_bind,log_write,worker_startup,backend_reachability`.
+
+An optional administrative listener serves health, readiness and metrics. It
+is off unless the section is present, and it is a separate socket that never
+receives the application router, so it cannot occupy an application route:
+
+```toml
+[server.admin]
+listen = "127.0.0.1:9090"
+```
+
+`listen` is the only key. It is bound before pools start, so an address already
+in use is a startup failure; naming an address an application listener already
+uses is a configuration error. The listener serves exactly `GET`/`HEAD` on
+`/health`, `/ready` and `/metrics`, answers 405 for other methods and 404 for
+other paths, and has no TLS and no authentication: keep it on loopback and let
+the network decide who reaches it. Binding it to a non-loopback address logs a
+warning naming what became reachable. `/ready` answers 503 while the server
+drains and while a PHP pool has no live worker; `/health` answers 200 whenever
+the process can answer at all. See `doc/OBSERVABILITY_0_8.md` for the metric
+list and the readiness rules.
 
 On Windows, the presence of any `php_worker` location also requires process
 containment to be established before worker startup. Hamster creates and fully
@@ -185,6 +333,20 @@ returns HTTP 408 and closes the incomplete HTTP/1 exchange; it does not cancel a
 PHP request because PHP has not received one. The existing 1 MiB PHP body limit
 remains independent of this timer.
 
+`body_read_timeout` also bounds lingering close. When Hamster answers a request
+before reading its body (a declared body over the PHP limit is `413`, over the
+body budget `503`), it sends the response and FIN and then keeps reading and
+discarding what the client still sends, so the client, which may send its whole
+body before reading, receives the status instead of a TCP reset. That discard
+stops when the client closes, when nothing arrives for one second, when
+`body_read_timeout` has passed, or immediately once server shutdown has begun;
+a refused body is never read longer than an accepted one would be, and there is
+no byte bound. Measured with .NET `HttpClient` against a 1 MiB PHP limit:
+refused uploads of 2-100 MiB and a 4 MiB upload sent at 640 KiB/s all received
+`413`; a client pausing longer than one second between writes is still reset.
+The connection keeps its `max_connections` slot while lingering. See
+`src/lingering_close.rs`.
+
 `write_progress_timeout` is the maximum number of seconds an HTTP response
 socket write may remain backpressured without writing at least one byte. It
 defaults to 30 and must be 1-3600. The timer is lazy: it starts only when the
@@ -204,11 +366,11 @@ application's own observed request latency plus headroom: measure the routes
 this location actually serves, take a high percentile rather than an average,
 and leave room for a cold cache and a slow dependency. A value below the
 application's real p99 converts ordinary slow requests into killed workers and
-`502`s.
+`504`s.
 
 Exceeding it is not an ordinary request failure. Protocol v1 has no cancel
 frame, so the only way to reclaim a worker that is still mid-transaction is to
-kill it; the request is answered `502` with the body
+kill it; the request is answered `504` with the body
 `PHP Worker Execution Timeout`, the child is killed and reaped, and a
 replacement is started immediately. The request is never dispatched again,
 because a deadline that expires says nothing about how far PHP already got.
@@ -225,14 +387,30 @@ deadline also covers Hamster's own protocol I/O: the worst legal payload, a
 1 MiB body echoed back, round-trips in 18.1 ms, so one second still leaves the
 application over 98% of the smallest allowed deadline.
 
+`startup_timeout` is the budget, in seconds, for one worker generation to
+reach READY: process start, the application's bootstrap and the READY frame.
+It applies to the initial workers, whose failure fails server startup, and to
+every replacement and recycle, whose failure counts against the slot's
+backoff. It is configured per `php_worker` location, defaults to 5 (the value
+that was fixed before it became configurable) and must be between 1 and 300.
+Raise it for an application whose first start is slow. Measured on the Windows
+development machine: reading 10,072 PHP files took 100.7 s the first time and
+0.47 s the second (on-access scanning was enabled), so a cold first start is
+dominated by opening files the machine has not opened recently; a Laravel
+stand-in went from 0.25 s warm to 3.4-3.8 s cold, and Symfony Demo in its
+debug environment needed 9.9-11.7 s. A larger value also lets a replacement
+that hangs in bootstrap keep its slot out of service for that long before the
+failure is counted.
+
 An execution timeout is deliberately *not* charged to the slot's
 infrastructure failure history, so repeated slow requests cannot walk a slot
 into the replacement backoff ladder or its cooldown band. Crashes, I/O faults
 and protocol faults still are. Both counts are visible in the pool snapshot,
 and each timeout writes one line to standard error naming the condition. The
-status is deliberately `502` rather than `504`: the request is already started
-and may already have had side effects, and `504` more readily invites the
-external retry that Hamster itself refuses to perform. See
+status is `504` because the upstream application did not respond before the
+deadline; `502` remains for a broken/invalid worker response. This status
+does not authorize a retry: the request may already have had side effects,
+and Hamster never replays it. See
 `doc/EXECUTION_TIMEOUT_POLICY.md` for the measured failure this separation
 fixes.
 
@@ -433,7 +611,10 @@ invalid or duplicate normalized location paths; unknown handlers; missing or
 unexpected handler fields; invalid pool bounds; static roots that cannot be
 canonicalized or are not directories; PHP executable/script paths that are
 missing or not files; and proxy upstreams that are not `http://host[:port]`,
-cannot be resolved, or carry out-of-range timeouts or `max_idle`. Errors identify the field plus the host/location index or
+cannot be resolved, or carry out-of-range timeouts or `max_idle`; and FastCGI
+locations without a root or `servers`, with nonnumeric, duplicate or port-0
+servers, out-of-range `concurrency` or timeouts, or an `index` that is not a
+relative `.php` path inside the root. Errors identify the field plus the host/location index or
 name where applicable. No dangerous input is silently repaired, and PHP is not
 searched from `PATH`.
 

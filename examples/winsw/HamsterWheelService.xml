@@ -1,0 +1,32 @@
+<!-- Example only: use a dedicated, Owner-authorized elevated Service rehearsal. -->
+<service>
+  <id>HamsterWheel</id>
+  <name>Hamster Wheel</name>
+  <description>Hamster Wheel web/application server</description>
+  <startmode>Manual</startmode>
+  <serviceaccount>
+    <domain>NT AUTHORITY</domain>
+    <user>LocalService</user>
+  </serviceaccount>
+  <!-- Pinned WinSW 2.11.0 NET461 integration. Build the companion DLL with
+       Build-LifecycleExtension.ps1 and retain the unchanged WinSW.NET461.exe
+       reference copy beside this renamed wrapper. Missing/incompatible shim
+       fails startup; never replace this with elevated SCM rights. -->
+  <extensions>
+    <extension id="hamster-lifecycle" enabled="true" className="Hamster.WinSW.LifecycleExtension, HamsterLifecycleExtension" />
+  </extensions>
+  <executable>%BASE%\hamster-wheel.exe</executable>
+  <startarguments>--config "%BASE%\hamster.toml"</startarguments>
+  <!-- WinSW 2.11 ignores stoptimeout in its custom-stop branch. The helper
+       verifies its wrapper-owned main process and enforces the grace budget.
+       The lifecycle extension also supports an independently graceful exit 0
+       under LocalService. SCM/WinSW stopwait remains the normal stop command. -->
+  <stopexecutable>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</stopexecutable>
+  <stoparguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%BASE%\Stop-Hamster.ps1" -Executable "%BASE%\hamster-wheel.exe" -Config "%BASE%\hamster.toml" -OwnerExecutable "%BASE%\HamsterWheelService.exe" -GraceSeconds 120 -EvidencePath "%BASE%\logs\last-stop.log"</stoparguments>
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+  <onfailure action="restart" delay="10 sec" />
+</service>

@@ -96,11 +96,8 @@ final class HamsterOctaneClient implements Client, StoppableClient
             throw new RuntimeException('Octane attempted to produce more than one response');
         }
         $this->cleanupCompleted = false;
-        $this->pendingFrame = hamster_encode_response([
-            'id' => $id,
-            'status' => $status,
-            'headers' => $headers,
-            'body' => $body,
-        ]);
+        // A response the protocol cannot carry becomes a 500 here rather than
+        // a failed write later, which would kill this healthy generation.
+        $this->pendingFrame = hamster_response_frame($id, $status, $headers, $body, 'laravel worker');
     }
 }

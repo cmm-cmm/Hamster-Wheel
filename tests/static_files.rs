@@ -6,7 +6,7 @@ use std::{
 };
 
 use hamster_wheel::{
-    config::{HttpLimits, SERVER_NAME},
+    config::{self, HttpLimits, SERVER_NAME},
     router::HostRouter,
     server,
 };
@@ -49,6 +49,18 @@ struct TestServer {
 
 impl TestServer {
     async fn start(document_root: PathBuf) -> Self {
+        let document_root = Arc::new(
+            tokio::fs::canonicalize(document_root)
+                .await
+                .expect("test document root should canonicalize"),
+        );
+        let router = Arc::new(
+            HostRouter::default_static(document_root).expect("test static router should compile"),
+        );
+        Self::start_router(router).await
+    }
+
+    async fn start_router(router: Arc<HostRouter>) -> Self {
         let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .expect("test listener should bind");
@@ -57,15 +69,6 @@ impl TestServer {
             .expect("listener should have an address");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let document_root = Arc::new(
-                tokio::fs::canonicalize(document_root)
-                    .await
-                    .expect("test document root should canonicalize"),
-            );
-            let router = Arc::new(
-                HostRouter::default_static(document_root)
-                    .expect("test static router should compile"),
-            );
             server::serve_with_router(listener, router, HttpLimits::default(), async {
                 let _ = shutdown_rx.await;
             })
@@ -106,6 +109,96 @@ impl TestServer {
             .expect("response should be read");
         response
     }
+}
+
+#[tokio::test]
+async fn filesystem_handlers_do_not_serve_php_source_or_dotfiles() {
+    let root = TestRoot::new();
+    std::fs::write(root.path.join("index.html"), "public").unwrap();
+    std::fs::write(root.path.join("config.php"), "<?php secret();").unwrap();
+    std::fs::write(root.path.join("code.phtml"), "<?php secret();").unwrap();
+    std::fs::write(root.path.join(".env"), "PRIVATE_PASSWORD").unwrap();
+    std::fs::create_dir(root.path.join(".well-known")).unwrap();
+    std::fs::write(root.path.join(".well-known/check.txt"), "public-check").unwrap();
+    let server = TestServer::start(root.path.clone()).await;
+    for path in ["/config.php", "/code.phtml", "/.env", "/%2eenv"] {
+        for method in ["GET", "HEAD"] {
+            let response = server
+                .request(&format!(
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                ))
+                .await;
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+                "{method} {path}: {response}"
+            );
+            assert!(!response.contains("secret"));
+            assert!(!response.contains("PRIVATE_PASSWORD"));
+        }
+    }
+    let public = server
+        .request(
+            "GET /.well-known/check.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    assert!(public.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(public.ends_with("public-check"));
+    server.stop().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn host_denials_cover_uri_aliases_and_final_file_location() {
+    let root = TestRoot::new();
+    std::fs::create_dir(root.path.join("data")).unwrap();
+    std::fs::create_dir(root.path.join("public")).unwrap();
+    std::fs::write(root.path.join("data/secret.txt"), "PRIVATE_DATA").unwrap();
+    std::fs::write(root.path.join("public/composer.json"), "PRIVATE_CONFIG").unwrap();
+    std::fs::write(root.path.join("public/ok.txt"), "public").unwrap();
+    let alias = root.path.join("public").join("alias");
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/D", "/C", "mklink", "/J"])
+        .arg(&alias)
+        .arg(root.path.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let source = format!(
+        "[server]\nlisten = '127.0.0.1:0'\n[[hosts]]\nname = 'localhost'\ndeny_paths = ['/data']\ndeny_names = ['composer.json']\n[[hosts.locations]]\npath = '/public'\nhandler = 'static'\nroot = '{}'\n[[hosts.locations]]\npath = '/'\nhandler = 'fastcgi'\nroot = '{}'\n[hosts.locations.fastcgi]\nservers = ['127.0.0.1:39001']\n",
+        root.path.display(),
+        root.path.display()
+    );
+    let runtime = config::compile_str(&source, &root.path).unwrap();
+    let server = TestServer::start_router(runtime.router_arc()).await;
+    for path in [
+        "/data/secret.txt",
+        "/DATA/secret.txt",
+        "/%64ata/secret.txt",
+        "/public/alias/secret.txt",
+        "/public/composer.json",
+    ] {
+        let response = server
+            .request(&format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{path}: {response}"
+        );
+        assert!(!response.contains("PRIVATE_"));
+    }
+    let public = server
+        .request("GET /public/ok.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await;
+    assert!(public.starts_with("HTTP/1.1 200 OK\r\n"));
+    server.stop().await;
+    std::fs::remove_dir(&alias).unwrap();
 }
 
 #[tokio::test]

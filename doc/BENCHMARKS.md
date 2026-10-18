@@ -1862,3 +1862,290 @@ every round, inside the noise). It did find about 4 KiB more per idle
 cleartext connection while the TLS branch was inline in the connection task;
 boxing that branch restored 25.3 KiB before versus 25.5 KiB after. The release
 binary grew from 2,945,024 to 5,318,656 bytes.
+
+## FastCGI operator-managed endpoints — Windows corrective pass (2026-10-01)
+
+MSVC release build, Windows NT 10.0.26200.0, Core i5-1235U (12 logical
+processors), loopback HTTP/1.1 with reused client connections. The
+`benchmarks/fastcgi_windows.ps1` driver started a fresh Hamster and two fresh
+operator-managed PHP 8.5.10 `php-cgi.exe -b` endpoints per run. Each endpoint
+allowed one exchange; the fixture returned a validated 14-byte Hello or
+28-byte JSON response from `fixtures/php-cgi/bench.php`. Each cell used 200
+warm-up requests and three measured runs of at least six seconds. Errors were
+counted, not omitted. CPU is process CPU time per successful HTTP response;
+RAM is combined working set at the end of a run, not peak/private bytes.
+
+| Workload / HTTP concurrency | RPS min / median / max | P50 / P95 / P99 ms (median run statistics) | Hamster / total PHP CPU µs per request | Hamster / total PHP RAM MiB | Errors |
+|---|---:|---:|---:|---:|---:|
+| Hello C1 | 172 / 186 / 187 | 2.9 / 24.0 / 27.7 | 1991 / 819 | 6.6 / 38.3 | 0 |
+| Hello C4 | 520 / 580 / 623 | 4.8 / 24.6 / 30.1 | 2540 / 953 | 7.3 / 38.3 | 0 |
+| Hello C16 | 572 / 580 / 1115 | 23.3 / 55.6 / 66.8 | 2425 / 1037 | 8.4 / 38.3 | 0 |
+| Hello C32 | 498 / 708 / 1054 | 42.1 / 86.3 / 113.2 | 2596 / 809 | 9.8 / 38.3 | 0 |
+| JSON C1 | 185 / 189 / 197 | 2.8 / 23.4 / 28.1 | 2062 / 714 | 6.6 / 38.3 | 0 |
+| JSON C4 | 576 / 595 / 857 | 4.7 / 23.5 / 29.9 | 2504 / 1077 | 7.3 / 38.3 | 0 |
+| JSON C16 | 605 / 997 / 1192 | 11.6 / 43.3 / 62.2 | 1766 / 676 | 9.0 / 38.3 | 0 |
+| JSON C32 | 600 / 719 / 734 | 40.9 / 92.3 / 115.5 | 2501 / 981 | 9.2 / 38.3 | 0 |
+
+A separate same-driver C16 run with **one** endpoint gave Hello
+356 / 369 / 372 RPS and JSON 184 / 269 / 336 RPS (min/median/max); no errors.
+Two endpoints improved capacity for this workload, but high run-to-run spread
+at C16-C32 prevents a precise scaling claim. The driver does not isolate the
+cost of a fresh backend TCP connection from PHP execution, Windows scheduling
+and slot queueing. No connection-reuse optimization is justified by these
+numbers alone. These small fixture responses are not an application benchmark
+and are not comparable to historical persistent-worker measurements.
+
+### Follow-up load and saturation check (2026-10-04)
+
+Same release driver, machine, PHP fixture, loopback HTTP keep-alive and
+operator-started `php-cgi.exe` as above; new binary includes the Unicode path
+fix. Three fresh Hamster/PHP processes per cell, 100 warm-up requests, at
+least eight measured seconds per run, `concurrency = 1` per endpoint,
+`connect_timeout = 2 s`, `response_timeout = 10 s`. The one- and two-endpoint
+groups ran sequentially, not interleaved; shared-host drift limits direct
+scaling claims. Every measured response was validated and all cells had zero
+errors. RAM is end-of-run working set, not a peak.
+
+| Endpoints / workload / HTTP concurrency | RPS min / median / max | Median P50 / P95 / P99 ms | Median Hamster / PHP CPU µs per response | Median Hamster / PHP RAM MiB |
+|---|---:|---:|---:|---:|
+| 2 / Hello / C16 | 381 / 541 / 911 | 30.9 / 61.1 / 74.7 | 1597 / 643 | 9.4 / 38.3 |
+| 2 / JSON / C16 | 321 / 365 / 400 | 44.0 / 74.6 / 88.2 | 2176 / 802 | 9.2 / 38.3 |
+| 2 / Hello / C32 | 379 / 394 / 941 | 82.4 / 122.0 / 135.1 | 2192 / 765 | 10.0 / 38.4 |
+| 2 / JSON / C32 | 764 / 871 / 962 | 32.7 / 70.3 / 87.2 | 1996 / 656 | 9.9 / 38.4 |
+| 1 / Hello / C16 | 298 / 304 / 349 | 48.9 / 94.1 / 117.6 | 1849 / 642 | 7.9 / 19.4 |
+| 1 / JSON / C16 | 357 / 395 / 520 | 30.6 / 92.0 / 109.6 | 1427 / 494 | 7.9 / 19.4 |
+| 1 / Hello / C32 | 126 / 143 / 146 | 232.7 / 345.3 / 378.1 | 1431 / 620 | 8.9 / 19.4 |
+| 1 / JSON / C32 | 141 / 142 / 169 | 226.6 / 303.1 / 325.6 | 1363 / 511 | 9.0 / 19.4 |
+
+The C32 one-endpoint throughput collapse and latency rise are a measured
+overload warning even though its 2 s slot timeout did not expire. The
+two-endpoint cells also vary widely (for example Hello C16 381–911 RPS), so
+these runs cannot isolate TCP connect cost, establish a reliable scaling
+factor, or justify connection reuse. The fixture is intentionally tiny; an
+operator should size endpoint count and timeouts against the real application.
+
+### Windows FastCGI connect-path investigation (2026-10-04)
+
+A profiling-only release probe (`profile_fastcgi_slot_connect_and_backend_head`
+in `tests/php_cgi.rs`) used real operator-started PHP 8.5 `php-cgi.exe`,
+HTTP keep-alive, and three fresh runs per cell. It timed slot admission,
+backend TCP connect, FastCGI preamble write, and the wait from preamble to
+CGI response head. The last stage includes endpoint scheduling and PHP, not
+just script execution. At W1/C32 with the original Tokio async connect,
+median HTTP latency was 220–385 ms, median slot wait 213–371 ms, connect
+mean 5–11 ms with p95 around 16–21 ms, and backend-head mean below 1 ms.
+Thus slot queueing dominated latency, while slow connect attempts limited
+the rate at which the single slot could turn over.
+
+A direct FastCGI client against the same `php-cgi` process had connect mean
+about 0.45–1.23 ms. Ending the direct exchange at `FCGI_END_REQUEST` rather
+than waiting for TCP EOF was slightly faster, disproving the proposed
+early-slot-release explanation. Interleaved direct/Hamster/direct windows
+reproduced a higher async-connect tail inside the Hamster path. The exact
+Windows scheduler/IOCP cause is **not established**.
+
+An interleaved profiling-only A/B swapped only the connect primitive while
+keeping fresh TCP connections, the same endpoint and the same protocol.
+Windows `std::net::TcpStream::connect_timeout` on Tokio's blocking pool beat
+Tokio async connect in all 12 high-load paired rounds (three runs each of
+W1/W2 at C16/C32), with zero errors. Example ranges: W1/C32 async 95–157
+RPS versus blocking 1,926–1,983 RPS; W2/C32 async 290–593 versus blocking
+1,311–3,199. Blocking-connect mean was typically 0.24–0.64 ms. These are
+in-process profiling measurements, **not** production throughput figures.
+
+The default-feature MSVC release binary was then measured by the existing
+independent .NET driver, with three fresh Hamster/PHP processes per cell,
+8 seconds measured, 100 warm-up requests, `connect_timeout = 2`, and no
+profiling feature. All responses were validated; every cell had zero errors.
+The table reports min/median/max RPS and median-run latency/CPU/RAM; RAM is
+working set at run end. The one- and two-endpoint groups ran sequentially,
+so host drift limits exact before/after and scaling percentages.
+
+| Endpoints / workload / HTTP concurrency | RPS min / median / max | P50 / P95 / P99 ms | Hamster / PHP CPU µs per response | Hamster / PHP RAM MiB |
+|---|---:|---:|---:|---:|
+| 1 / Hello / C16 | 1,084 / 1,144 / 1,702 | 13.6 / 17.8 / 19.4 | 1,081 / 365 | 7.8 / 19.4 |
+| 1 / Hello / C32 | 969 / 1,405 / 1,496 | 23.2 / 32.3 / 40.6 | 866 / 301 | 9.2 / 19.4 |
+| 2 / Hello / C16 | 1,315 / 1,396 / 2,426 | 11.3 / 13.7 / 15.0 | 1,655 / 500 | 9.0 / 38.4 |
+| 2 / Hello / C32 | 1,167 / 1,678 / 1,820 | 14.5 / 30.1 / 34.5 | 1,299 / 406 | 10.2 / 38.4 |
+| 1 / JSON / C32 | 794 / 837 / 916 | 37.4 / 48.6 / 51.3 | 1,522 / 510 | 8.5 / 19.4 |
+| 2 / JSON / C32 | 747 / 1,216 / 1,221 | 26.0 / 30.1 / 31.6 | 2,000 / 620 | 9.7 / 38.4 |
+
+The previous table remains historical data, not rewritten. Its same-driver
+W1/C32 Hello median was 143 RPS, but the runs were not interleaved; the
+paired profiling A/B supports the improvement direction, not an exact
+production regression/improvement percentage. Neither connection reuse nor
+PHP endpoint lifecycle changed. Application workloads may have a different
+dominant cost, and no native Linux result is implied.
+
+### Windows FastCGI blocking-pool saturation follow-up (2026-10-04)
+
+A deterministic unit probe restricted Tokio to one blocking thread and held
+that thread while a FastCGI connect waited behind it. Before the correction,
+the HTTP waiter expired at 114 ms but its exchange slot was still held at
+368 ms. `JoinHandle::abort()` alone did not reclaim the queued closure's
+captured claim. A per-connect handoff now reclaims a claim that the closure
+has not taken; a separate semaphore caps queued/running blocking closures
+to the location's endpoint-slot count, and excess attempts use async connect.
+After correction, the 100 ms deadline returned at 109 ms and the slot was
+reclaimed at 109 ms, before the blocker was released. Explicit cancellation
+reclaimed a queued claim in 23–102 µs across two controlled runs. A closure
+that already took the claim still retained the slot until it exited. With the
+blocking-connect cap occupied,
+the async fallback completed a local TCP connect in 1.5 ms without waiting
+for the blocker. These are test timings, not network throughput measurements.
+
+With a backend that accepted a complete request but stayed silent, shutdown
+waited for the 400 ms response deadline, answered 504, released the slot and
+finished in 412 ms; the request was not replayed. This is an application
+response-stall case, not a TCP SYN-blackhole test. No firewall or unrelated
+network configuration was changed.
+
+The existing default-feature .NET release driver then ran Hello at C32,
+three fresh processes per cell, 8 seconds measured, 100 warm-up requests,
+`connect_timeout = 2`, PHP 8.5 NTS and zero errors:
+
+| Endpoints | RPS min / median / max | Median P50 / P95 / P99 ms | Median Hamster / PHP CPU µs/response | Hamster / PHP RAM MiB |
+|---|---:|---:|---:|---:|
+| 1 | 587 / 643 / 880 | 53.9 / 69.5 / 76.6 | 1,938 / 633 | 8.7 / 19.4 |
+| 2 | 240 / 910 / 1,210 | 34.2 / 51.9 / 64.6 | 2,418 / 875 | 9.8 / 38.3 |
+
+These non-interleaved runs were substantially slower and more variable than
+the preceding table, especially W2 run 3. They do **not** isolate the handoff
+cost or establish a production regression. A profiling-only interleaved
+async-vs-current-blocking A/B on the same PHP endpoints then favored current
+blocking in 11 of 12 W1/W2 C16/C32 paired 3-second windows, all with zero
+errors. At W1/C32, async was 235–373 RPS versus blocking 558–618; at
+W2/C32, async was 545–754 versus blocking 1,357–1,698. The one contrary
+pair was W1/C16 (async 440, blocking 425). Blocking connect p95 was around
+1–1.3 ms across these windows; async frequently showed a 10–19 ms p95 tail.
+This supports retaining the Windows blocking path while leaving the cause of
+cross-run host variance unresolved. No exact before/after percentage is
+claimed, and the in-process A/B is not the independent production driver.
+
+## Structured access log A/B — order-balanced paired run (2026-10-12)
+
+First measurement of `[server.access_log]` (`doc/ACCESS_LOG_0_8.md`). The two
+arms differ only by the presence of that one section and are checked in as
+`benchmarks/access_log_off.toml` and `benchmarks/access_log_on.toml`; the
+logging arm appends JSON Lines to a file on the same disk.
+`benchmarks/static_http.ps1` gained `-ConfigPath`, whose default keeps the
+built-in configuration every earlier run used.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+# five pairs, one run each, arms alternating; pairs 1-3 ran off first,
+# pairs 4-5 ran on first
+./benchmarks/static_http.ps1 -ConfigPath ./benchmarks/access_log_<arm>.toml `
+  -Runs 1 -Requests 100000 -Concurrency 32 -WarmupRequests 1000
+```
+
+**Conditions, which bound what this run can claim.** Intel i5-1235U (2P+8E,
+12 threads, 1.3 GHz base), Windows 11 Home 10.0.26300, measured during an
+active desktop session: `LoadPercentage` was 81% before the run, with Chrome,
+this agent session, `audiodg` and `RazerAppEngine` all consuming CPU. Absolute
+throughput is therefore 3.0-4.0k RPS where the 0.5 admission runs on this
+machine recorded 6.9-7.3k at the same concurrency. **These absolute numbers
+must not be compared with any earlier entry**; only the paired arms are
+comparable with each other.
+
+| Pair | Order | off RPS | on RPS | on vs off |
+|---|---|---:|---:|---:|
+| 1 | off, on | 3,029 | 3,156 | +4.2% |
+| 2 | off, on | 3,467 | 3,773 | +8.8% |
+| 3 | off, on | 3,598 | 3,717 | +3.3% |
+| 4 | on, off | 3,894 | 3,606 | -7.4% |
+| 5 | on, off | 3,989 | 3,817 | -4.3% |
+
+The three forward pairs all made the logging arm look **faster**, which cannot
+be true of a change that only adds work. The ten runs in execution order were
+3,029 / 3,156 / 3,467 / 3,773 / 3,598 / 3,717 / 3,606 / 3,894 / 3,817 / 3,989:
+a monotonic warm-up drift that favours whichever arm ran second. Reversing the
+order reversed the sign, which is what identifies the bias rather than
+explaining it away.
+
+Order-balanced over the five pairs:
+
+| Measure | Balanced delta (on vs off) | Ordering bias |
+|---|---:|---:|
+| RPS | **-0.21%** | +/-5.6% |
+| CPU per request | **+19.8 us (+2.0%)** on 1,001 us baseline | same drift |
+| Working set | **+0.3-0.4 MiB** (10.6-10.9 vs 10.2-10.5) | drift-free |
+
+**Conclusion.** This run rejects a material static-path regression from access
+logging: the balanced RPS difference is within a fifth of a percent while the
+ordering bias alone is +/-5.6%. It cannot resolve a small cost, and the CPU
+figure (+2% per request) is the same order as the noise, so it is a direction,
+not a measurement. The working-set increase is the queue and the writer
+buffer and is the one consistent signal. A clean machine and the historical
+500,000-request parameters are needed before any cost claim is made; until
+then the honest statement is "no large regression found, small cost not
+excluded".
+
+**Completeness, which is not a timing claim.** The three logging runs wrote
+303,000 records for 3 x (100,000 measured + 1,000 warm-up) requests, zero
+`log_dropped` records, every record `"status":200`. The default 1,024-deep
+queue lost nothing at this rate through the real release binary.
+
+## Observability counters A/B — inconclusive, with the reason (2026-10-12)
+
+Second measurement attempt of a 0.8 slice, this time the per-request counters
+behind `[server.admin]` (`doc/OBSERVABILITY_0_8.md`). Arms differ only by that
+one section and are checked in as `benchmarks/admin_off.toml` and
+`benchmarks/admin_on.toml`; nothing scraped the administrative listener during
+the runs, so the only difference on the request path is five relaxed atomics
+per request and two per connection.
+
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+# five pairs, one run each; pairs 1-3 ran off first, pairs 4-5 ran on first
+./benchmarks/static_http.ps1 -ConfigPath ./benchmarks/admin_<arm>.toml `
+  -Runs 1 -Requests 100000 -Concurrency 32 -WarmupRequests 1000
+```
+
+Conditions: Intel i5-1235U (2 performance cores + 8 efficient cores, 12
+threads, 1.3 GHz base), Windows 11 Home 10.0.26300. Unlike the access-log run
+earlier the same day, the machine was quiet: `LoadPercentage` was **4%** before
+the first run.
+
+| Pair | Order | off RPS | on RPS | on vs off | off CPU us/req | on CPU us/req |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | off, on | 5,203 | 3,768 | -27.6% | 672.7 | 1,000.2 |
+| 2 | off, on | 3,821 | 4,028 | +5.4% | 968.3 | 925.5 |
+| 3 | off, on | 3,916 | 4,637 | +18.4% | 908.6 | 787.5 |
+| 4 | on, off | 6,062 | 5,337 | -12.0% | 598.9 | 653.9 |
+| 5 | on, off | 5,445 | 5,478 | +0.6% | 630.8 | 661.3 |
+
+Order-balanced: RPS **-3.5%** with an ordering bias of **+2.2%**, CPU
+**+48.6 us/request**. Working set was 10.3-11.0 MiB with the counters off and
+10.4-10.7 MiB with them on: no difference.
+
+**This run does not resolve the cost, and the per-pair spread says why**: the
+same comparison produced -27.6% and +18.4% on a quiet machine. The cause is
+visible in the driver's own numbers rather than left as "variance". Across all
+ten runs the **server process** used 3.44-3.77 effective cores — a 10% spread —
+while throughput ranged 3,768-6,062 RPS, a 61% spread. The server was
+CPU-saturated in every run and received nearly the same CPU time; what differed
+was how much work that CPU delivered. On this processor that is the expected
+signature of thread placement across performance and efficient cores, which the
+scheduler chooses afresh for every process start, and the driver starts a fresh
+server per run.
+
+It also means `CPU_US_PER_REQUEST` here is a function of that placement, not of
+per-request work: it moves inversely with throughput at nearly constant core
+usage. The +48.6 us balanced CPU delta is therefore **not** attributable to the
+counters, and cannot be: five relaxed atomic increments are tens of nanoseconds,
+about four orders of magnitude below 48 us. For scale, 1% of this baseline is
+roughly 7 us per request, so the change being measured is some three orders of
+magnitude below what this driver can see on this machine.
+
+**Conclusion.** No large regression: nothing in ten runs suggests a cost
+anywhere near the measurement's own spread, and memory is unchanged. No cost
+figure is claimed, and the analytical expectation (tens of nanoseconds per
+request) is stated as analysis, not as a measurement.
+
+**What a valid measurement needs here**, recorded so the next attempt does not
+repeat this one: pin the server process to the performance cores, or measure on
+a machine with homogeneous cores; use the in-memory `/api` route to remove
+filesystem variance as the 0.5 admission comparison did; and use the historical
+500,000-request parameters. The driver does not set affinity today.
+
