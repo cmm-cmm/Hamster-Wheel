@@ -114,6 +114,10 @@ struct RawAdmin {
 struct RawAccessLog {
     /// Log file, resolved beside this configuration file. Absent means stdout.
     path: Option<String>,
+    /// Size at which the file is rotated. Absent or 0 means never.
+    rotate_bytes: Option<u64>,
+    /// Archives kept beside the active file.
+    keep: Option<usize>,
     /// Query strings are omitted by default because they carry credentials in
     /// real deployments. See `src/access_log.rs` for what is replaced.
     #[serde(default)]
@@ -2084,10 +2088,12 @@ fn fingerprint_tls(source: &TlsSource) -> String {
 
 fn fingerprint_access_log(settings: &crate::access_log::Settings) -> String {
     format!(
-        "{:?}|{}|{}",
+        "{:?}|{}|{}|{:?}|{}",
         settings.path(),
         settings.include_query(),
-        settings.queue_capacity()
+        settings.queue_capacity(),
+        settings.rotate_bytes(),
+        settings.keep()
     )
 }
 
@@ -2137,6 +2143,40 @@ fn validate_access_log(
             "server.access_log.queue_capacity must be between {MIN_QUEUE_CAPACITY} and {MAX_QUEUE_CAPACITY}"
         )));
     }
+    let rotate_bytes = match raw.rotate_bytes {
+        None | Some(0) => None,
+        Some(bytes) if bytes < crate::access_log::MIN_ROTATE_BYTES => {
+            return Err(ConfigError::Validation(format!(
+                "server.access_log.rotate_bytes must be 0 or at least {}",
+                crate::access_log::MIN_ROTATE_BYTES
+            )));
+        }
+        Some(bytes) => Some(bytes),
+    };
+    let keep = match raw.keep {
+        None => crate::access_log::DEFAULT_KEEP,
+        Some(keep) if keep > crate::access_log::MAX_KEEP => {
+            return Err(ConfigError::Validation(format!(
+                "server.access_log.keep must be at most {}",
+                crate::access_log::MAX_KEEP
+            )));
+        }
+        Some(keep) => keep,
+    };
+    if rotate_bytes.is_none() && raw.keep.is_some() {
+        // Keeping archives of a file that never rotates is a configuration an
+        // operator cannot have meant, and silently ignoring the key would
+        // leave them believing in rotation they do not have.
+        return Err(ConfigError::Validation(
+            "server.access_log.keep needs server.access_log.rotate_bytes".to_owned(),
+        ));
+    }
+    if rotate_bytes.is_some() && raw.path.is_none() {
+        return Err(ConfigError::Validation(
+            "server.access_log.rotate_bytes needs server.access_log.path; stdout is rotated by whoever owns it"
+                .to_owned(),
+        ));
+    }
     let path = match raw.path {
         None => None,
         Some(path) if path.trim().is_empty() => {
@@ -2159,6 +2199,8 @@ fn validate_access_log(
         path,
         raw.include_query,
         raw.queue_capacity,
+        rotate_bytes,
+        keep,
     ))
 }
 
@@ -2787,6 +2829,51 @@ listen = \"127.0.0.1:8080\"{hosts}"
             compile_str(&format!("{base}rotate = true{hosts}"), Path::new(".")),
             Err(ConfigError::Parse { .. })
         ));
+
+        // Rotation: on with a size, off without one, and every combination
+        // that cannot mean what it says is refused rather than ignored.
+        let rotating = compile_str(
+            &format!("{base}path = \"logs/access.jsonl\"\nrotate_bytes = 1048576\nkeep = 7{hosts}"),
+            Path::new("."),
+        )
+        .unwrap();
+        let settings = rotating.access_log().unwrap();
+        assert_eq!(settings.rotate_bytes(), Some(1_048_576));
+        assert_eq!(settings.keep(), 7);
+        assert_eq!(settings.rotation_description(), "1048576 bytes, 7 kept");
+
+        let plain = compile_str(
+            &format!("{base}path = \"logs/access.jsonl\"{hosts}"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(plain.access_log().unwrap().rotate_bytes(), None);
+        assert_eq!(plain.access_log().unwrap().rotation_description(), "off");
+
+        for rejected in [
+            // Below the floor, where one batch would rotate repeatedly.
+            "path = \"a.jsonl\"\nrotate_bytes = 1024",
+            "path = \"a.jsonl\"\nrotate_bytes = 4096\nkeep = 65",
+            // Archives of a file that never rotates.
+            "path = \"a.jsonl\"\nkeep = 2",
+            // Rotation of stdout, which belongs to whoever owns it.
+            "rotate_bytes = 8192",
+        ] {
+            assert!(
+                matches!(
+                    compile_str(&format!("{base}{rejected}{hosts}"), Path::new(".")),
+                    Err(ConfigError::Validation(_))
+                ),
+                "{rejected} was accepted"
+            );
+        }
+        // Zero is how rotation is turned off explicitly.
+        let explicit_off = compile_str(
+            &format!("{base}path = \"logs/access.jsonl\"\nrotate_bytes = 0{hosts}"),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(explicit_off.access_log().unwrap().rotate_bytes(), None);
     }
 
     #[test]

@@ -1300,6 +1300,119 @@ fn request_in_flight(address: SocketAddr, target: &str) -> thread::JoinHandle<St
 }
 
 #[test]
+#[ignore = "starts a detached server and reads the lifecycle records it wrote"]
+fn the_log_records_what_the_server_did_as_well_as_what_it_served() {
+    let scratch = Scratch::new("lifecycle");
+    let name = control_name("lifecycle");
+    let address = reserve_address();
+    fs::create_dir_all(scratch.file("public")).unwrap();
+    fs::write(scratch.file("public/index.html"), "ok").unwrap();
+    fs::create_dir_all(scratch.file("other")).unwrap();
+    fs::write(scratch.file("other/index.html"), "ok").unwrap();
+    let config = scratch.file("server.toml");
+    let source = |root: &str| {
+        format!(
+            "[server]\nlisten = \"{address}\"\n\n[server.control]\nname = \"{name}\"\n\n\
+             [server.access_log]\npath = \"access.jsonl\"\n\n\
+             [[hosts]]\nname = \"localhost\"\naliases = [\"127.0.0.1\"]\n\n\
+             [[hosts.locations]]\npath = \"/\"\nhandler = \"static\"\nroot = \"{root}\"\n"
+        )
+    };
+    fs::write(&config, source("public")).unwrap();
+    let log = scratch.file("server.stdout");
+    let mut server = spawn_detached(&config, &log, &scratch.file("server.stderr"));
+    wait_until("the listener", || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("listening on")
+    });
+    let records = scratch.file("access.jsonl");
+
+    // Startup is in the log before any request is served.
+    wait_until("the startup records", || {
+        fs::read_to_string(&records)
+            .unwrap_or_default()
+            .contains("\"event\":\"listener_bound\"")
+    });
+    let written = fs::read_to_string(&records).unwrap();
+    assert!(
+        written.contains(&format!("\"event\":\"started\",\"pid\":{}", server.id())),
+        "{written}"
+    );
+    assert!(
+        written.contains("\"generation\":1"),
+        "the startup record names the generation: {written}"
+    );
+    assert!(
+        written.contains(&format!("\"address\":\"{address}\"")),
+        "{written}"
+    );
+
+    // A served request and a published reload are both in the same file, in
+    // the order they happened.
+    let served = http_get(address, "/index.html");
+    assert!(served.ends_with("ok"), "{served}");
+    fs::write(&config, source("other")).unwrap();
+    let (ok, reloaded) = control(&config, "reload");
+    assert!(ok, "{reloaded}");
+    fs::write(
+        &config,
+        format!("[server]\nlisten = \"nonsense\"\n\n[server.control]\nname = \"{name}\"\n"),
+    )
+    .unwrap();
+    let (refused, _) = control(&config, "reload");
+    assert!(!refused, "an invalid configuration was published");
+
+    fs::write(&config, source("other")).unwrap();
+    let (ok, stopped) = control(&config, "stop");
+    assert!(ok, "{stopped}");
+    assert!(wait_for_exit(server.id(), Duration::from_secs(10)));
+    assert_eq!(server.exited(), Some(0));
+
+    // The whole story, in one file, in order.
+    let written = fs::read_to_string(&records).unwrap();
+    let events: Vec<&str> = written
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"lifecycle\""))
+        .map(|line| {
+            let marker = "\"event\":\"";
+            let start = line.find(marker).unwrap() + marker.len();
+            let rest = &line[start..];
+            &rest[..rest.find('"').unwrap()]
+        })
+        .collect();
+    for expected in [
+        "started",
+        "listener_bound",
+        "reload_published",
+        "reload_refused",
+        "draining",
+        "listeners_drained",
+        "stopped",
+    ] {
+        assert!(
+            events.contains(&expected),
+            "{expected} missing from {events:?}"
+        );
+    }
+    assert!(
+        events.iter().position(|event| *event == "started")
+            < events.iter().position(|event| *event == "stopped"),
+        "{events:?}"
+    );
+    // The access record for the served request is in the same file.
+    assert!(
+        written.contains("\"kind\":\"access\""),
+        "the requests and the lifecycle share one log: {written}"
+    );
+    // A stop through the endpoint says where the drain came from, and the
+    // graceful stop says so.
+    assert!(written.contains("\"trigger\":\"control\""), "{written}");
+    assert!(written.contains("\"graceful\":true"), "{written}");
+    eprintln!("control evidence: lifecycle events {events:?}");
+}
+
+#[test]
 #[ignore = "starts a detached server and reloads its configuration"]
 fn reload_publishes_a_new_generation_and_refuses_what_needs_a_restart() {
     let scratch = Scratch::new("reload");

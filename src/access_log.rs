@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -91,6 +91,129 @@ const REDACTED_QUERY_KEYS: &[&str] = &[
 /// What replaces a redacted query value.
 const REDACTED: &str = "REDACTED";
 
+/// The lifecycle events this server reports.
+///
+/// A fixed list rather than free strings at each call site: an event name is
+/// something an operator greps for and a dashboard groups by, so a typo must
+/// not be able to invent a new one.
+pub mod event {
+    pub const STARTED: &str = "started";
+    pub const LISTENER_BOUND: &str = "listener_bound";
+    pub const WORKER_READY: &str = "worker_ready";
+    pub const RELOAD_PUBLISHED: &str = "reload_published";
+    pub const RELOAD_REFUSED: &str = "reload_refused";
+    pub const CERTIFICATES_RELOADED: &str = "certificates_reloaded";
+    pub const CERTIFICATE_RELOAD_REFUSED: &str = "certificate_reload_refused";
+    pub const DRAINING: &str = "draining";
+    pub const LISTENERS_DRAINED: &str = "listeners_drained";
+    pub const STOPPED: &str = "stopped";
+}
+
+/// One value in a lifecycle record.
+///
+/// Typed at the call site so the writer can render each kind correctly and
+/// escape text in the one place escaping is tested.
+#[derive(Debug)]
+pub enum Detail {
+    Text(Box<str>),
+    Number(u64),
+    Signed(i64),
+    Seconds(f64),
+    Flag(bool),
+}
+
+impl From<&str> for Detail {
+    fn from(value: &str) -> Self {
+        Self::Text(Box::from(value))
+    }
+}
+
+impl From<String> for Detail {
+    fn from(value: String) -> Self {
+        Self::Text(value.into_boxed_str())
+    }
+}
+
+impl From<u64> for Detail {
+    fn from(value: u64) -> Self {
+        Self::Number(value)
+    }
+}
+
+impl From<u32> for Detail {
+    fn from(value: u32) -> Self {
+        Self::Number(u64::from(value))
+    }
+}
+
+impl From<usize> for Detail {
+    fn from(value: usize) -> Self {
+        Self::Number(value as u64)
+    }
+}
+
+impl From<i64> for Detail {
+    fn from(value: i64) -> Self {
+        Self::Signed(value)
+    }
+}
+
+impl From<f64> for Detail {
+    fn from(value: f64) -> Self {
+        Self::Seconds(value)
+    }
+}
+
+impl From<bool> for Detail {
+    fn from(value: bool) -> Self {
+        Self::Flag(value)
+    }
+}
+
+/// The sink lifecycle records go to, once a server has started one.
+///
+/// A process has one log, and lifecycle events happen in places that have no
+/// reason to be handed a sink: a pool supervisor, a signal handler, the
+/// shutdown path. This is set once before any of them runs and only read
+/// afterwards, so it is a relaxed load rather than a lock, and it is
+/// deliberately **not** how the request path reaches the log: that keeps its
+/// own `Arc`, so no global is read per request.
+///
+/// It holds a `Weak` on purpose. An owning handle here would keep the queue
+/// open after the server dropped its own sink at shutdown, so the writer
+/// would wait for a sender that nothing was going to close and the process
+/// would never exit. The sink's lifetime stays exactly where it was: with
+/// `server::run`.
+static LIFECYCLE: std::sync::OnceLock<Weak<AccessLog>> = std::sync::OnceLock::new();
+
+/// Makes lifecycle records go to this sink. Later calls are ignored.
+pub fn install_lifecycle(sink: &Arc<AccessLog>) {
+    let _ = LIFECYCLE.set(Arc::downgrade(sink));
+}
+
+/// Submits one lifecycle record, or does nothing when no log is configured.
+pub fn lifecycle_record(event: &'static str, fields: Vec<(&'static str, Detail)>) {
+    if let Some(sink) = LIFECYCLE.get().and_then(Weak::upgrade) {
+        sink.submit(Record::Lifecycle {
+            at_ms: unix_millis(),
+            event,
+            fields,
+        });
+    }
+}
+
+/// Smallest rotation size accepted.
+///
+/// Below this a single batch could rotate several times, which would turn the
+/// log into a stream of nearly empty archives.
+pub const MIN_ROTATE_BYTES: u64 = 4 * 1_024;
+
+/// Most archives kept beside the active file.
+pub const MAX_KEEP: usize = 64;
+
+/// Archives kept when rotation is on and the operator did not choose.
+pub const DEFAULT_KEEP: usize = 4;
+
 /// The compiled `[server.access_log]` section.
 ///
 /// Absent from the configuration means no queue, no writer task and no
@@ -100,15 +223,37 @@ pub struct Settings {
     path: Option<PathBuf>,
     include_query: bool,
     queue_capacity: usize,
+    /// Size at which the active file is rotated, when rotation is on.
+    rotate_bytes: Option<u64>,
+    /// Archives kept beside the active file.
+    keep: usize,
 }
 
 impl Settings {
-    pub(crate) fn new(path: Option<PathBuf>, include_query: bool, queue_capacity: usize) -> Self {
+    pub(crate) fn new(
+        path: Option<PathBuf>,
+        include_query: bool,
+        queue_capacity: usize,
+        rotate_bytes: Option<u64>,
+        keep: usize,
+    ) -> Self {
         Self {
             path,
             include_query,
             queue_capacity,
+            rotate_bytes,
+            keep,
         }
+    }
+
+    /// The size at which the active file is rotated, if it is.
+    pub fn rotate_bytes(&self) -> Option<u64> {
+        self.rotate_bytes
+    }
+
+    /// How many archives are kept beside the active file.
+    pub fn keep(&self) -> usize {
+        self.keep
     }
 
     /// The log file, or `None` when records go to stdout.
@@ -129,6 +274,14 @@ impl Settings {
         match &self.path {
             None => "stdout".to_owned(),
             Some(path) => path.display().to_string(),
+        }
+    }
+
+    /// How rotation is reported at startup and by the control endpoint.
+    pub fn rotation_description(&self) -> String {
+        match self.rotate_bytes {
+            None => "off".to_owned(),
+            Some(bytes) => format!("{bytes} bytes, {} kept", self.keep),
         }
     }
 }
@@ -172,13 +325,11 @@ impl LogWriter {
 pub fn start(settings: &Settings) -> io::Result<(Arc<AccessLog>, LogWriter)> {
     let sink = match settings.path() {
         None => Sink::Stdout(tokio::io::stdout()),
-        Some(path) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
-            Sink::File(tokio::fs::File::from_std(file))
-        }
+        Some(path) => Sink::File(FileSink::open(
+            path.to_path_buf(),
+            settings.rotate_bytes(),
+            settings.keep(),
+        )?),
     };
     let (sender, receiver) = mpsc::channel(settings.queue_capacity());
     let counters = Arc::new(Counters::default());
@@ -276,7 +427,16 @@ pub(crate) struct RequestStart {
 /// One finished request, or one note from the log about itself.
 enum Record {
     Access(Box<AccessRecord>),
-    Dropped { at_ms: u64, count: u64 },
+    /// Something the server did, rather than something a client asked for.
+    Lifecycle {
+        at_ms: u64,
+        event: &'static str,
+        fields: Vec<(&'static str, Detail)>,
+    },
+    Dropped {
+        at_ms: u64,
+        count: u64,
+    },
 }
 
 struct AccessRecord {
@@ -292,6 +452,38 @@ struct AccessRecord {
 impl Record {
     fn write_json(&self, out: &mut String) {
         match self {
+            Self::Lifecycle {
+                at_ms,
+                event,
+                fields,
+            } => {
+                let _ = write!(out, r#"{{"kind":"lifecycle","ts_ms":{at_ms},"event":""#);
+                escape_json(event, out);
+                out.push('"');
+                for (key, value) in fields {
+                    let _ = write!(out, r#","{key}":"#);
+                    match value {
+                        Detail::Text(text) => {
+                            out.push('"');
+                            escape_json(text, out);
+                            out.push('"');
+                        }
+                        Detail::Number(number) => {
+                            let _ = write!(out, "{number}");
+                        }
+                        Detail::Signed(number) => {
+                            let _ = write!(out, "{number}");
+                        }
+                        Detail::Seconds(seconds) => {
+                            let _ = write!(out, "{seconds:.3}");
+                        }
+                        Detail::Flag(flag) => {
+                            let _ = write!(out, "{flag}");
+                        }
+                    }
+                }
+                out.push('}');
+            }
             Self::Dropped { at_ms, count } => {
                 let _ = write!(
                     out,
@@ -550,7 +742,171 @@ impl Drop for ObservedBody {
 
 enum Sink {
     Stdout(Stdout),
-    File(tokio::fs::File),
+    File(FileSink),
+}
+
+/// The active log file, its path and how large it is.
+///
+/// Rotation is the writer task's work: it is the only thing that holds this
+/// handle, so closing, renaming and reopening cannot race with a record being
+/// written, and nothing on the request path waits for any of it.
+struct FileSink {
+    file: tokio::fs::File,
+    path: PathBuf,
+    written: u64,
+    rotate_bytes: Option<u64>,
+    keep: usize,
+    /// A rotation that failed is reported once; records keep going to the file
+    /// that is already open, because a log that stops writing is worse than a
+    /// log that grew past its bound.
+    reported_failure: bool,
+}
+
+impl FileSink {
+    fn open(path: PathBuf, rotate_bytes: Option<u64>, keep: usize) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        // Appending to an existing file counts what is already there, so a
+        // restart cannot grow the file past its bound.
+        let written = file.metadata().map(|data| data.len()).unwrap_or(0);
+        Ok(Self {
+            file: tokio::fs::File::from_std(file),
+            path,
+            written,
+            rotate_bytes,
+            keep,
+            reported_failure: false,
+        })
+    }
+
+    /// Bytes that still fit under the bound, or `None` when there is none.
+    fn room(&self) -> Option<u64> {
+        self.rotate_bytes
+            .map(|limit| limit.saturating_sub(self.written))
+    }
+
+    /// Rotates, reporting a failure once and carrying on.
+    ///
+    /// A log that stops writing because a rename failed is worse than a log
+    /// that grew past its bound, so a failed rotation keeps the open file.
+    async fn rotate_or_report(&mut self) {
+        match self.rotate().await {
+            Ok(()) => self.reported_failure = false,
+            Err(error) => {
+                if !self.reported_failure {
+                    errln!(
+                        "access log rotation failed, still writing to {}: {error}",
+                        self.path.display()
+                    );
+                    self.reported_failure = true;
+                }
+                // Treat the bound as satisfied for now; the next batch tries
+                // again rather than rotating on every record.
+                self.written = 0;
+            }
+        }
+    }
+
+    async fn rotate(&mut self) -> io::Result<()> {
+        // The handle must be closed before the rename on Windows, so the
+        // active file is flushed and replaced in one step the writer owns.
+        self.file.flush().await?;
+        let path = self.path.clone();
+        let keep = self.keep;
+        tokio::task::spawn_blocking(move || shift_archives(&path, keep))
+            .await
+            .map_err(io::Error::other)??;
+        let reopened = FileSink::open(self.path.clone(), self.rotate_bytes, self.keep)?;
+        self.file = reopened.file;
+        self.written = reopened.written;
+        Ok(())
+    }
+
+    /// Writes whole records, rotating at the bound rather than past it.
+    ///
+    /// `records` is newline-terminated JSON Lines. The split is always at a
+    /// record boundary: a record is never divided across two files, and a
+    /// single record larger than the bound goes through whole into an empty
+    /// file rather than being dropped.
+    async fn write(&mut self, records: &[u8]) -> io::Result<()> {
+        let mut rest = records;
+        while !rest.is_empty() {
+            let take = match self.room() {
+                None => rest.len(),
+                Some(room) => whole_records_within(rest, room),
+            };
+            if take == 0 {
+                if self.written == 0 {
+                    // One record is larger than the whole bound.
+                    let whole = first_record(rest);
+                    self.append(&rest[..whole]).await?;
+                    rest = &rest[whole..];
+                    continue;
+                }
+                self.rotate_or_report().await;
+                continue;
+            }
+            self.append(&rest[..take]).await?;
+            rest = &rest[take..];
+        }
+        Ok(())
+    }
+
+    async fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes).await?;
+        self.file.flush().await?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+/// The length of the longest prefix of `records` that is whole records and
+/// fits in `room`.
+fn whole_records_within(records: &[u8], room: u64) -> usize {
+    let room = usize::try_from(room)
+        .unwrap_or(usize::MAX)
+        .min(records.len());
+    match records[..room].iter().rposition(|byte| *byte == b'\n') {
+        Some(index) => index + 1,
+        None => 0,
+    }
+}
+
+/// The length of the first record, including its newline.
+fn first_record(records: &[u8]) -> usize {
+    records
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(records.len(), |index| index + 1)
+}
+
+/// Moves `path` to `path.1`, shifting existing archives up and dropping the
+/// oldest beyond `keep`.
+///
+/// With `keep` of zero the active file is simply removed, which is what an
+/// operator asking for no archives means.
+fn shift_archives(path: &Path, keep: usize) -> io::Result<()> {
+    let archive = |index: usize| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".{index}"));
+        PathBuf::from(name)
+    };
+    if keep == 0 {
+        return std::fs::remove_file(path);
+    }
+    let oldest = archive(keep);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+    for index in (1..keep).rev() {
+        let from = archive(index);
+        if from.exists() {
+            std::fs::rename(&from, archive(index + 1))?;
+        }
+    }
+    std::fs::rename(path, archive(1))
 }
 
 impl Sink {
@@ -560,10 +916,7 @@ impl Sink {
                 stdout.write_all(bytes).await?;
                 stdout.flush().await
             }
-            Self::File(file) => {
-                file.write_all(bytes).await?;
-                file.flush().await
-            }
+            Self::File(file) => file.write(bytes).await,
         }
     }
 }
@@ -725,7 +1078,7 @@ mod tests {
     }
 
     fn settings(include_query: bool) -> Settings {
-        Settings::new(None, include_query, MIN_QUEUE_CAPACITY)
+        Settings::new(None, include_query, MIN_QUEUE_CAPACITY, None, DEFAULT_KEEP)
     }
 
     fn record_of(start: RequestStart, status: u16, bytes: u64, complete: bool) -> Record {
@@ -855,6 +1208,99 @@ mod tests {
         assert_eq!(log.dropped(), 3);
         assert_eq!(log.queued(), 2);
         assert_eq!(log.written(), 0);
+    }
+
+    #[test]
+    fn a_lifecycle_record_is_one_line_with_its_typed_fields() {
+        let mut line = String::new();
+        Record::Lifecycle {
+            at_ms: 1_700_000_000_000,
+            event: event::WORKER_READY,
+            fields: vec![
+                ("pool", "localhost/php".into()),
+                ("pid", 4_321_u32.into()),
+                ("startup_ms", 149.9742_f64.into()),
+                ("graceful", true.into()),
+                ("delta", (-3_i64).into()),
+            ],
+        }
+        .write_json(&mut line);
+        assert_eq!(
+            line,
+            r#"{"kind":"lifecycle","ts_ms":1700000000000,"event":"worker_ready","pool":"localhost/php","pid":4321,"startup_ms":149.974,"graceful":true,"delta":-3}"#
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_value_cannot_forge_a_record() {
+        // Reasons come from error text, which can contain anything a path or
+        // an operating system put in it.
+        let mut line = String::new();
+        Record::Lifecycle {
+            at_ms: 1,
+            event: event::RELOAD_REFUSED,
+            fields: vec![("reason", "broke\\n{\"kind\":\"lifecycle\"}".into())],
+        }
+        .write_json(&mut line);
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.ends_with(r#"}"#), "{line}");
+        assert_eq!(line.matches(r#""kind""#).count(), 1, "{line}");
+    }
+
+    #[test]
+    fn rotation_takes_whole_records_up_to_the_bound() {
+        let records = b"aaaa\nbbbb\ncccc\n";
+        // Room for two whole records takes exactly two.
+        assert_eq!(whole_records_within(records, 10), 10);
+        assert_eq!(whole_records_within(records, 12), 10);
+        assert_eq!(whole_records_within(records, 15), 15);
+        // Room for part of a record takes none of it, so the caller rotates.
+        assert_eq!(whole_records_within(records, 4), 0);
+        assert_eq!(whole_records_within(records, 0), 0);
+        // And a record larger than the bound is still measured whole.
+        assert_eq!(first_record(records), 5);
+        assert_eq!(first_record(b"no newline"), 10);
+    }
+
+    #[test]
+    fn archives_shift_up_and_the_oldest_is_dropped() {
+        let directory = std::env::temp_dir().join(format!(
+            "hamster-rotate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("access.jsonl");
+        let archive = |index: usize| directory.join(format!("access.jsonl.{index}"));
+
+        std::fs::write(&path, "first").unwrap();
+        shift_archives(&path, 2).unwrap();
+        assert!(!path.exists(), "the active file was rotated away");
+        assert_eq!(std::fs::read_to_string(archive(1)).unwrap(), "first");
+
+        std::fs::write(&path, "second").unwrap();
+        shift_archives(&path, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(archive(1)).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(archive(2)).unwrap(), "first");
+
+        // The third rotation drops the oldest rather than keeping three.
+        std::fs::write(&path, "third").unwrap();
+        shift_archives(&path, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(archive(1)).unwrap(), "third");
+        assert_eq!(std::fs::read_to_string(archive(2)).unwrap(), "second");
+        assert!(
+            !archive(3).exists(),
+            "more archives were kept than asked for"
+        );
+
+        // Keeping none means the active file is simply removed.
+        std::fs::write(&path, "fourth").unwrap();
+        shift_archives(&path, 0).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

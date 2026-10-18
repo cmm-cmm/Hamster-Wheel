@@ -209,14 +209,27 @@ When a per-request log is configured, `status` also reports it:
 access_log=D:\site\logs\access.jsonl queued=0 written=5312 dropped=0 failed=0
 ```
 
+The same file also holds `lifecycle` records — `started`, `listener_bound`,
+`worker_ready`, `reload_published`, `reload_refused`, `certificates_reloaded`,
+`certificate_reload_refused`, `draining`, `listeners_drained`, `stopped` —
+beside the `access` records, in the order they happened. That is the file to
+read after an incident: it says what the server did as well as what it served,
+with the generation each request was served under.
+
+Hamster can rotate it, with `rotate_bytes` and `keep` in
+`[server.access_log]`. The bound is exact at record granularity and the
+rotation is done by the log's own writer task, so nothing on the request path
+waits for it; `status` reports `rotation=`. Without `rotate_bytes` Hamster only
+appends, and rotation belongs to the Service wrapper or an out-of-process
+tool — in which case do not rename the active file under a running server,
+because records keep going to the old handle.
+
 `dropped` is the only honest answer to "is this log complete?": the queue is
 bounded and is never waited on, so a log target slower than the traffic costs
 records rather than request latency. A non-zero `dropped` means the log has
 gaps, which are also written into the log as `log_dropped` records; a non-zero
-`failed` means the target refused writes. Hamster appends and never rotates
-this file: give it to the wrapper's rotation or to an out-of-process tool, and
-remember that renaming or deleting it under a running server sends records to
-the old handle until restart. `doc/ACCESS_LOG_0_8.md` has the record format and
+`failed` means the target refused writes. Without `rotate_bytes` Hamster only appends to this file; with it, Hamster
+rotates it and keeps `keep` archives. `doc/ACCESS_LOG_0_8.md` has the record format and
 what is deliberately never logged.
 
 Read health from `php_pool=<label> target= live= ready= pids=` by comparing

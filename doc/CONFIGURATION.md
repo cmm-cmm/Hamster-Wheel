@@ -248,9 +248,14 @@ per-request work:
 path = "logs/access.jsonl"   # omit for stdout; relative resolves beside this file
 include_query = false        # default; credential-shaped values are replaced
 queue_capacity = 1024        # 16-65536
+rotate_bytes = 10485760      # 0 or absent: never rotate; at least 4096; needs path
+keep = 4                     # archives kept, 0-64; needs rotate_bytes
 ```
 
-Records are JSON Lines, one object per request. The file is opened at startup,
+Records are JSON Lines: one object per request, plus `lifecycle` records for
+what the server itself did (startup, listeners, workers, reloads, drain, stop).
+With `rotate_bytes` the log's own writer rotates the file at that size and
+keeps `keep` archives beside it, splitting only at a record boundary. The file is opened at startup,
 before pools start and before listeners bind, so a path that cannot be written
 is a startup failure; a path naming an existing directory, an empty path and a
 queue outside the range are configuration errors. Hamster appends and never

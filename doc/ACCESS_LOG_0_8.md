@@ -1,4 +1,4 @@
-# Structured Access and Error Log (0.8 slice)
+# Structured Access, Error and Lifecycle Log (0.8 slice)
 
 Status: implemented in the working tree, default off, gated on Windows
 `x86_64-pc-windows-msvc`. The release A/B benchmark required by `AGENTS.md`
@@ -35,7 +35,17 @@ path that cannot be written is a startup failure rather than a surprise under
 load. An unknown key in the section is a configuration error, as everywhere
 else.
 
-## Record format
+## Record kinds
+
+One file holds the whole story of a process, in the order it happened:
+
+| `kind` | What it is |
+|---|---|
+| `access` | One finished request |
+| `lifecycle` | Something the server did, rather than something a client asked for |
+| `log_dropped` | The log's own note that the queue was full |
+
+## Access records
 
 JSON Lines: one object per line, `kind` naming the record type. The format is
 written by hand rather than through a serializer, because a log line is the
@@ -81,6 +91,85 @@ FastCGI, the worker pool or the proxy. It appears for any status at or above
 built outside those constructors still records `server error` rather than an
 empty cause.
 
+## Lifecycle records
+
+```json
+{"kind":"lifecycle","ts_ms":1760000000050,"event":"worker_ready","pool":"localhost/php","pid":4321,"startup_ms":149.974}
+```
+
+The event names are a fixed list in `src/access_log.rs`, not free strings at
+each call site: an event name is something an operator greps for and a
+dashboard groups by, so a typo must not be able to invent a new one.
+
+| `event` | Fields | When |
+|---|---|---|
+| `started` | `pid`, `generation`, `version` | The log is open, before any pool starts |
+| `listener_bound` | `scheme`, `address` | Each listener, as it is reported |
+| `worker_ready` | `pool`, `pid`, `startup_ms` | Each initial PHP worker reaching READY |
+| `reload_published` | `generation`, `previous_generation` | A configuration reload took effect |
+| `reload_refused` | `reason`, `active_generation` | A reload was refused; nothing changed |
+| `certificates_reloaded` | `certificates` | A transactional certificate reload succeeded |
+| `certificate_reload_refused` | `reason` | It was refused; the previous set still serves |
+| `draining` | `trigger` (`console` or `control`) | A graceful stop began |
+| `listeners_drained` | — | Every connection has ended |
+| `stopped` | `graceful` | The process is about to exit cleanly |
+
+Each one is written beside the human line it accompanies, so the console and
+the log cannot disagree, and neither blocks: a lifecycle record goes to the
+same bounded queue as an access record, and is dropped and counted the same
+way if that queue is full.
+
+Values are typed at the call site — text, integer, float, boolean — so the
+writer renders each kind correctly and escapes text in the one place escaping
+is tested. A reason built from an error string cannot forge a record.
+
+The sink is reached through a process-wide `Weak` handle, installed once
+before any pool starts. Lifecycle events happen in places that have no reason
+to be handed a sink — a pool supervisor, a signal handler, the shutdown path —
+and the handle is `Weak` so it cannot keep the queue open after the server
+drops its own sink at shutdown. The request path does **not** use it: it keeps
+its own `Arc`, so nothing global is read per request.
+
+## Rotation
+
+```toml
+[server.access_log]
+path = "logs/access.jsonl"
+rotate_bytes = 10485760   # 0 or absent: never rotate
+keep = 4                  # archives beside the active file, 0-64
+```
+
+Rotation is the writer task's work, so nothing on the request path waits for
+it. At the bound the active file is closed, `access.jsonl.1` becomes `.2` and
+so on, the archive beyond `keep` is deleted, `access.jsonl` becomes `.1`, and
+a fresh file is opened. `keep = 0` means the active file is simply removed at
+the bound, which is what asking for no archives means.
+
+The bound is exact at record granularity: a batch is split at a record
+boundary, so a record is never divided across two files, and the active file
+does not pass `rotate_bytes`. A single record larger than the whole bound goes
+through whole into an empty file rather than being dropped. Appending to an
+existing file counts what is already there, so a restart cannot grow a file
+past its bound.
+
+A rotation that fails — an archive held open by something else, for instance —
+is reported once on stderr and the server keeps writing to the file that is
+already open. A log that stops writing because a rename failed would be worse
+than one that grew past its bound.
+
+`rotate_bytes` has a floor of 4 KiB, because below that a single batch could
+rotate repeatedly and leave a stream of nearly empty archives. It requires
+`path`: stdout is rotated by whoever owns it. `keep` without `rotate_bytes` is
+a configuration error rather than a silently ignored key, because an operator
+who wrote it believes they have rotation.
+
+Rotation and retention are reported at startup and by `--control status`:
+
+```text
+Access log writing to D:\site\logs\access.jsonl (queue 1024, query omitted, rotation 10485760 bytes, 4 kept)
+access_log=D:\site\logs\access.jsonl rotation=10485760 bytes, 4 kept queued=0 written=5312 dropped=0 failed=0
+```
+
 ## What is never logged
 
 No request or response headers other than the validated authority. No cookies,
@@ -118,7 +207,7 @@ traffic:
 and in the control endpoint:
 
 ```text
-access_log=D:\site\logs\access.jsonl queued=0 written=5312 dropped=124 failed=0
+access_log=D:\site\logs\access.jsonl rotation=off queued=0 written=5312 dropped=124 failed=0
 ```
 
 `failed` counts records the target refused; the first such failure is also
@@ -217,9 +306,12 @@ that rate through the real release binary.
 
 - One format (JSON Lines) and one record type for requests. No combined/NCSA
   format, no field selection.
-- No lifecycle or error records of their own yet: lifecycle output still goes
-  to stdout/stderr as operational lines. The `error` field is a request-scoped
-  label, not a separate error stream.
+- Lifecycle records cover the events listed above. Errors that are neither a
+  request outcome nor one of those events — a malformed connection, a worker
+  stderr line — are still only operational output on stderr.
+- Rotation is size-based only: no age-based rotation, no compression, and no
+  reopen-on-signal for an external rotator. Renaming the active file under a
+  running server sends records to the old handle until the next rotation.
 - The `id` field is per process; it restarts at 1 on restart. The
   `generation` field names the configuration that served the request, and also
   restarts at 1.

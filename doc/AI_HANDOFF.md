@@ -1,6 +1,93 @@
 # AI Handoff
 
-## Current: transactional configuration reload (2026-10-18)
+## Current: lifecycle records and log rotation (2026-10-18)
+
+The reload slice below was committed and pushed as `60f4822`. This is
+uncommitted work on top of it, and it finishes the 0.8 logging scope:
+`doc/ACCESS_LOG_0_8.md` now covers all three record kinds and rotation.
+
+FACT: the log holds `lifecycle` records beside `access` ones, in one file, in
+the order things happened. Ten events, as a fixed list in `src/access_log.rs`
+rather than free strings at the call sites: `started`, `listener_bound`,
+`worker_ready`, `reload_published`, `reload_refused`,
+`certificates_reloaded`, `certificate_reload_refused`, `draining` (with
+`trigger` = console or control), `listeners_drained`, `stopped`. Each is
+written beside the human `outln!`/`errln!` line it accompanies, so the console
+and the log cannot disagree, and each goes to the same bounded queue as an
+access record, so neither blocks and both are dropped and counted the same
+way. Values are typed at the call site, so the writer escapes text in the one
+place escaping is tested; a reason built from an error string cannot forge a
+record.
+
+FACT: the sink is reached from those places through a process-wide **`Weak`**
+handle installed once before any pool starts. It is `Weak` because of a
+defect this slice produced and the new test caught: with an owning `Arc` in
+the `OnceLock`, the queue never closed when the server dropped its own sink at
+shutdown, so `writer.finish()` waited for a sender nothing would close and the
+process **never exited**. The detached-server test failed on
+`wait_for_exit`; the handle is now a view and the sink's lifetime stays with
+`server::run`. The request path still keeps its own `Arc`, so nothing global
+is read per request.
+
+FACT: the same test exposed an ordering bug. The log was flushed before the
+final `stopped` record was produced, so the last thing the server did could
+never reach the file. The flush now happens at the very end of `run`, after
+the outcome has been reported.
+
+FACT: rotation is in the writer task, so nothing on the request path waits for
+it. `[server.access_log]` gained `rotate_bytes` (0 or absent = never; floor
+4 KiB; requires `path`, because stdout belongs to whoever owns it) and `keep`
+(0-64, default 4, and an error without `rotate_bytes` rather than a silently
+ignored key). The bound is **exact at record granularity**: a batch is split
+at a record boundary, so a record is never divided across two files and the
+active file does not pass `rotate_bytes`; a single record larger than the
+whole bound goes through whole into an empty file rather than being dropped.
+Appending to an existing file counts what is already there. A rotation that
+fails is reported once and the server keeps writing to the open file, because
+a log that stops writing is worse than one that grew past its bound.
+Rotation is reported at startup and in `--control status` as `rotation=`.
+
+FACT: an integration test drove 120 sequential requests against a 4 KiB bound
+with `keep = 2`, then read the retained window oldest archive first. The point
+is not how many records survive — three files of 4 KiB cannot hold 120, and
+discarding the oldest archive is what was asked for — but that the ids form
+**one contiguous run ending at the last request**, which is what proves
+nothing was lost or written twice across a rotation. An earlier version of
+that test asserted a retention level instead and failed for the wrong reason;
+do not reintroduce it.
+
+FACT (`tests/windows_control.rs`, ignored, detached server): one file contains
+`started` with the real pid and `generation=1`, `listener_bound` with the
+address, an `access` record for a served request, `reload_published`,
+`reload_refused`, `draining` with `trigger=control`, `listeners_drained` and
+`stopped` with `graceful=true`, in that order. A release probe with a 4 KiB
+bound produced `access.jsonl` at 1,959 bytes beside two archives of 3,952,
+152 records written and none dropped.
+
+Gates at this working tree: `cargo fmt --all -- --check`; strict MSVC Clippy
+`--all-targets --all-features -D warnings`; the default suite 301 tests (296
+at `60f4822`, plus 4 record and rotation unit tests and 1 integration test);
+ignored `windows_control` 16/16, `windows_headless` 2/2,
+`windows_containment` 4/4, `tls_reload_process` 3/3, `validate_cli` 1/1; the
+non-Windows cfg-flip compile check; MSVC release build; `cargo bench --no-run
+--features profiling` linking all 11 benches.
+
+No benchmark: a lifecycle record is produced a handful of times per process
+life, and rotation happens in the writer task. The per-request path is
+unchanged by this slice, so the measurement owed is still the one recorded in
+`doc/BENCHMARKS.md` for the access log itself.
+
+Remaining in 0.8: nothing, on the reading of the scope in
+`doc/ROADMAP_0_5_TO_1_0.md` — transactional reload, generation identity,
+structured access/error/lifecycle logs, metrics, health and readiness, and the
+validate/serve/status/reload/stop CLI all exist. What 0.8 asks for and this
+project cannot do here remains Linux systemd operation, and the Windows
+Service qualification is scoped as recorded in
+`doc/WINDOWS_SERVICE_LIFECYCLE_GAPS.md`. 0.9 is untouched: no HTTP/2, no
+packaging or upgrade/rollback documentation, no soak matrix, no security
+review, and no reproducible Windows **and** Linux release benchmarks.
+
+## Transactional configuration reload (2026-10-18, in 60f4822)
 
 The slices below were committed and pushed as `e91fd65` (access log, health,
 readiness, metrics) and `abeffa5` (`--validate`). This is uncommitted work on

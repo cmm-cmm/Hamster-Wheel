@@ -355,6 +355,84 @@ async fn a_response_the_client_abandoned_is_recorded_as_incomplete() {
 }
 
 #[tokio::test]
+async fn rotation_keeps_every_record_and_only_the_archives_asked_for() {
+    let scratch = Scratch::new("rotate");
+    fs::write(scratch.file("public/index.html"), "ok").unwrap();
+    // Small enough that ordinary traffic rotates several times.
+    let served = serve(
+        &scratch,
+        "path = \"access.jsonl\"\nrotate_bytes = 4096\nkeep = 2",
+        STATIC_LOCATION,
+    )
+    .await;
+
+    // Sequentially, so the writer sees small batches: this is the steady-state
+    // shape, and it is where the bound has to hold.
+    const REQUESTS: usize = 120;
+    for _ in 0..REQUESTS {
+        let answer = request(served.address, &get("/index.html")).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+    }
+    assert_eq!(served.log.dropped(), 0);
+    assert_eq!(served.log.failed(), 0);
+
+    let active = served.log_path.clone();
+    let records = served.finish().await;
+
+    // The active file stays under the bound it was given.
+    let size = fs::metadata(&active).unwrap().len();
+    assert!(size <= 4096, "the active file is {size} bytes");
+
+    // Exactly the archives asked for, and no more.
+    let first = PathBuf::from(format!("{}.1", active.display()));
+    let second = PathBuf::from(format!("{}.2", active.display()));
+    let third = PathBuf::from(format!("{}.3", active.display()));
+    assert!(first.exists(), "no archive was created");
+    assert!(second.exists(), "the second archive is missing");
+    assert!(!third.exists(), "more archives were kept than asked for");
+    for archive in [&first, &second] {
+        let size = fs::metadata(archive).unwrap().len();
+        assert!(size <= 4096, "{} is {size} bytes", archive.display());
+    }
+
+    // Rotation retains a window, not everything: three files of 4 KiB cannot
+    // hold 120 records, and discarding the oldest archive is what the
+    // configuration asked for. What must hold is that nothing was lost or
+    // duplicated *inside* that window, so the ids are read oldest file first
+    // and must be one contiguous run ending at the last request.
+    let mut ids = Vec::new();
+    for archive in [&second, &first] {
+        let text = fs::read_to_string(archive).unwrap();
+        assert!(
+            text.ends_with("\n"),
+            "{} ends mid-record",
+            archive.display()
+        );
+        for line in text.lines() {
+            assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
+            ids.push(field(line, "id").parse::<u64>().unwrap());
+        }
+    }
+    for record in &records {
+        ids.push(field(record, "id").parse::<u64>().unwrap());
+    }
+    assert_eq!(
+        *ids.last().unwrap(),
+        REQUESTS as u64,
+        "the newest record is not the last request"
+    );
+    for pair in ids.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "a record was lost or written twice across a rotation: {ids:?}"
+        );
+    }
+    // And the window is as large as three files of that size can hold.
+    assert!(ids.len() > 30, "only {} records were retained", ids.len());
+}
+
+#[tokio::test]
 async fn a_burst_within_the_queue_loses_no_record() {
     let scratch = Scratch::new("burst");
     fs::write(scratch.file("public/index.html"), "ok").unwrap();

@@ -54,3 +54,19 @@ macro_rules! errln {
         ::std::eprintln!($($arg)*)
     };
 }
+
+/// Records one lifecycle event in the configured log, if there is one.
+///
+/// This is deliberately separate from `outln!`: the human line says what
+/// happened for someone watching a console, and the record says it in a shape
+/// a log shipper can group and alert on. Both are written at the same place so
+/// they cannot disagree, and neither blocks: the record goes to the same
+/// bounded queue every access record goes to.
+macro_rules! lifecycle {
+    ($event:expr $(, $key:literal = $value:expr)* $(,)?) => {
+        $crate::access_log::lifecycle_record(
+            $event,
+            ::std::vec![$(($key, ::std::convert::Into::into($value))),*],
+        )
+    };
+}

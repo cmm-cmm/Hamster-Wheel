@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    access_log::{AccessLog, MaybeObserved},
+    access_log::{AccessLog, MaybeObserved, event},
     admin::{AdminState, Settings as AdminSettings},
     config::{HttpLimits, PhpPoolsError, RuntimeConfig},
     lingering_close::{CloseSignals, LingeringClose},
@@ -103,14 +103,22 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         Some(settings) => {
             let (log, writer) = crate::access_log::start(settings)?;
             outln!(
-                "Access log writing to {} (queue {}, query {})",
+                "Access log writing to {} (queue {}, query {}, rotation {})",
                 settings.target_description(),
                 settings.queue_capacity(),
                 if settings.include_query() {
                     "included"
                 } else {
                     "omitted"
-                }
+                },
+                settings.rotation_description()
+            );
+            crate::access_log::install_lifecycle(&log);
+            lifecycle!(
+                event::STARTED,
+                "pid" = std::process::id(),
+                "generation" = config.generation(),
+                "version" = crate::config::SERVER_NAME,
             );
             (Some(log), Some(writer))
         }
@@ -147,6 +155,12 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
             worker.label,
             worker.pid,
             worker.elapsed.as_secs_f64() * 1_000.0
+        );
+        lifecycle!(
+            event::WORKER_READY,
+            "pool" = worker.label.to_string(),
+            "pid" = worker.pid,
+            "startup_ms" = worker.elapsed.as_secs_f64() * 1_000.0,
         );
     }
     for upstream in config.upstreams() {
@@ -238,10 +252,14 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         // server with no control endpoint would shut down the moment it
         // started serving.
         let _stop_tx = stop_tx;
-        tokio::select! {
-            () = console_shutdown => {}
-            _ = stop_rx.recv() => outln!("Control endpoint requested shutdown"),
-        }
+        let trigger = tokio::select! {
+            () = console_shutdown => "console",
+            _ = stop_rx.recv() => {
+                outln!("Control endpoint requested shutdown");
+                "control"
+            }
+        };
+        lifecycle!(event::DRAINING, "trigger" = trigger);
         // Set before the graceful drain starts, so the first `status` or
         // `/ready` that can observe a drain already reports it.
         drain_flag.store(true, std::sync::atomic::Ordering::Release);
@@ -258,7 +276,14 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
     for listener in &listeners {
         let address = listener.address();
         match &listener.tls {
-            None => outln!("Hamster Wheel listening on http://{address}"),
+            None => {
+                outln!("Hamster Wheel listening on http://{address}");
+                lifecycle!(
+                    event::LISTENER_BOUND,
+                    "scheme" = "http",
+                    "address" = address.to_string(),
+                );
+            }
             Some(tls) => {
                 outln!(
                     "Hamster Wheel listening on https://{address} ({} certificate(s), TLS 1.2/1.3, ALPN http/1.1, handshake timeout {} s)",
@@ -339,29 +364,31 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         let _ = shutdown_tx.send(());
         let _ = task.await;
     }
-    // Every connection task has ended, so no further record can be produced.
-    // Dropping the last sink closes the queue, which is what ends the writer;
-    // waiting for it is what keeps the last requests served out of a lost
-    // tail.
-    drop(access_log);
-    if let Some(writer) = log_writer {
-        writer.finish().await;
-    }
     // Every downstream connection, and therefore every active proxy exchange,
     // has ended. Close what remains idle instead of leaving it to process exit.
     for upstream in config.upstreams() {
         upstream.close_idle();
     }
     let shutdown_result = config.shutdown_workers().await;
-    match (serve_result, shutdown_result) {
+    let outcome = match (serve_result, shutdown_result) {
         (Ok(()), Ok(())) => {
             outln!("Hamster Wheel stopped");
+            lifecycle!(event::STOPPED, "graceful" = true);
             Ok(())
         }
         (Err(error), Ok(())) => Err(ServerError::Io(error)),
         (Ok(()), Err(error)) => Err(ServerError::Worker(error)),
         (Err(source), Err(cleanup)) => Err(ServerError::IoWithWorkerCleanup { source, cleanup }),
+    };
+    // Last, because the lines above are the final records this process will
+    // produce. Dropping the sink closes the queue, which is what ends the
+    // writer; waiting for it is what keeps the last requests served, and the
+    // last thing the server did, out of a lost tail.
+    drop(access_log);
+    if let Some(writer) = log_writer {
+        writer.finish().await;
     }
+    outcome
 }
 
 async fn stop_workers_after(config: &RuntimeConfig, error: io::Error) -> ServerError {
@@ -639,6 +666,7 @@ where
     }
 
     outln!("HTTP listeners drained");
+    lifecycle!(event::LISTENERS_DRAINED);
     Ok(())
 }
 
@@ -930,6 +958,7 @@ async fn report_certificate_reload(tls: &TlsListener) {
                 "TLS certificate reload succeeded ({} certificate(s))",
                 reports.len()
             );
+            lifecycle!(event::CERTIFICATES_RELOADED, "certificates" = reports.len(),);
             for certificate in reports.iter() {
                 outln!(
                     "TLS certificate {} for {}: valid until {} ({} days)",
@@ -944,7 +973,11 @@ async fn report_certificate_reload(tls: &TlsListener) {
             }
         }
         Err(error) => {
-            errln!("TLS certificate reload failed; previous set remains active: {error}")
+            errln!("TLS certificate reload failed; previous set remains active: {error}");
+            lifecycle!(
+                event::CERTIFICATE_RELOAD_REFUSED,
+                "reason" = error.to_string(),
+            );
         }
     }
 }

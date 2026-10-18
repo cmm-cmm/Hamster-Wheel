@@ -222,18 +222,32 @@ mod protocol {
     async fn reload(generations: &Generations) -> Response {
         let serving = generations.current().generation();
         match generations.reload().await {
-            Ok(published) => Response::ok(format!(
-                "pid={}\ngeneration={}\nprevious_generation={serving}",
-                std::process::id(),
-                published.generation()
-            )),
-            Err(error) => Response {
-                body: format!(
-                    "ERR reload_failed\nmessage={}\nactive_generation={serving}\n\n",
-                    single_line(&error.to_string())
-                ),
-                stop_requested: false,
-            },
+            Ok(published) => {
+                lifecycle!(
+                    crate::access_log::event::RELOAD_PUBLISHED,
+                    "generation" = published.generation(),
+                    "previous_generation" = serving,
+                );
+                Response::ok(format!(
+                    "pid={}\ngeneration={}\nprevious_generation={serving}",
+                    std::process::id(),
+                    published.generation()
+                ))
+            }
+            Err(error) => {
+                lifecycle!(
+                    crate::access_log::event::RELOAD_REFUSED,
+                    "reason" = error.to_string(),
+                    "active_generation" = serving,
+                );
+                Response {
+                    body: format!(
+                        "ERR reload_failed\nmessage={}\nactive_generation={serving}\n\n",
+                        single_line(&error.to_string())
+                    ),
+                    stop_requested: false,
+                }
+            }
         }
     }
 
@@ -309,8 +323,9 @@ mod protocol {
             });
             let _ = writeln!(
                 details,
-                "access_log={} queued={queued} written={written} dropped={dropped} failed={failed}",
-                single_line(&settings.target_description())
+                "access_log={} rotation={} queued={queued} written={written} dropped={dropped} failed={failed}",
+                single_line(&settings.target_description()),
+                single_line(&settings.rotation_description())
             );
         }
         let _ = writeln!(
