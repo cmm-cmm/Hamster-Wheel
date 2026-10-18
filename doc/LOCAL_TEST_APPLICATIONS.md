@@ -41,9 +41,31 @@ HAMSTER_PHP_APPS="$PWD/www/php-apps" cargo test --test php_cgi -- --ignored --te
 ```
 
 The Linux script needs PHP 8.4 or newer for Symfony Demo 3.1.0 and leaves
-the extensions to the host PHP. The FastCGI tests pass `output_buffering=0`
-so a distribution `php.ini` (Ubuntu ships 4096) cannot hold `flush()` output
-back.
+the extensions to the host PHP. `--no-dev` skips the Slim skeleton's
+development packages, whose `phpstan/phpstan` exists only as a GitHub archive.
+Run as root, the script stops unless `COMPOSER_ALLOW_SUPERUSER=1` is set:
+Composer disables plugins for root, and Symfony Demo's auto-scripts need
+`symfony/flex`. The FastCGI tests pass `output_buffering=0` so a distribution
+`php.ini` (Ubuntu ships 4096) cannot hold `flush()` output back.
+
+Where no PHP 8.5 package is reachable, the release tag builds from source into
+a prefix outside the repository, NTS by default, with the CLI and CGI SAPIs
+and the extensions the tests use compiled in:
+
+```sh
+git clone --depth 1 --branch php-8.5.11 https://github.com/php/php-src.git
+cd php-src && ./buildconf --force
+./configure --prefix=/opt/php-8.5 --disable-zts --enable-cgi --disable-phpdbg \
+    --enable-mbstring --with-openssl --with-curl --enable-intl --with-zip \
+    --with-sodium --with-sqlite3 --with-pdo-sqlite --with-zlib
+make -j"$(nproc)" && make install
+ln -sfn /opt/php-8.5/bin/php php/8.5/php            # from the repository root
+ln -sfn /opt/php-8.5/bin/php-cgi php/8.5/php-cgi
+```
+
+Ubuntu needs `build-essential autoconf bison re2c pkg-config` and the
+`-dev` packages for libxml2, sqlite3, openssl, curl, libzip, libsodium, ICU,
+oniguruma and zlib.
 
 `tests/php_cgi.rs` starts `php-cgi.exe -b` processes itself, as an operator
 would, on loopback ports selected by the test; eight fixture tests use only

@@ -2,7 +2,7 @@
 # Builds the PHP application workspace used by tests/php_applications.rs on
 # Linux and macOS; prepare_php_apps.ps1 is the Windows counterpart.
 #
-#   fixtures/php-apps/prepare_php_apps.sh [--prefer-source] [--without-dokuwiki] [TARGET]
+#   fixtures/php-apps/prepare_php_apps.sh [--prefer-source] [--no-dev] [--without-dokuwiki] [TARGET]
 #
 # TARGET defaults to www/php-apps (git-ignored). The workspace holds:
 #
@@ -19,21 +19,26 @@
 # so dependencies are resolved for the PHP that serves them. Versions are exact.
 # --prefer-source clones packages with git instead of downloading GitHub
 # archives, for hosts whose network policy blocks codeload.github.com.
+# --no-dev skips the Slim skeleton's development packages, which the tests do
+# not load; its phpstan/phpstan is published only as a GitHub archive. Symfony
+# Demo always installs them: its auto-scripts boot the dev kernel.
 #
 # The Laravel stand-in is built separately by
 # fixtures/php-worker/pms/prepare_scratch_app.sh.
 set -euo pipefail
 
 usage() {
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-prefer=()
+composer_options=()
+slim_options=()
 dokuwiki=1
 target=""
 for argument in "$@"; do
     case "$argument" in
-        --prefer-source) prefer=(--prefer-source) ;;
+        --prefer-source) composer_options+=("$argument") ;;
+        --no-dev) slim_options+=("$argument") ;;
         --without-dokuwiki) dokuwiki=0 ;;
         -h | --help) usage; exit 0 ;;
         -*) echo "unknown option: $argument" >&2; exit 2 ;;
@@ -56,6 +61,12 @@ for extension in openssl mbstring fileinfo curl intl zip sodium sqlite3 pdo_sqli
     "$php" -m | grep -qix "$extension" \
         || { echo "PHP extension $extension is required" >&2; exit 1; }
 done
+# Composer disables plugins for root, and Symfony Demo's auto-scripts need
+# symfony/flex. Allowing plugins as root is the operator's decision.
+if [ "$(id -u)" -eq 0 ] && [ "${COMPOSER_ALLOW_SUPERUSER:-}" != 1 ]; then
+    echo "running as root: Symfony Demo needs Composer plugins; set COMPOSER_ALLOW_SUPERUSER=1 to allow them" >&2
+    exit 1
+fi
 if [ -e "$target" ]; then
     echo "$target already exists; remove it to build a fresh workspace" >&2
     exit 1
@@ -82,9 +93,9 @@ run_php() {
 export COMPOSER_NO_INTERACTION=1
 cd "$target"
 run_php "$composer" create-project symfony/symfony-demo:3.1.0 symfony-demo \
-    ${prefer[@]+"${prefer[@]}"} --no-progress
+    ${composer_options[@]+"${composer_options[@]}"} --no-progress
 run_php "$composer" create-project slim/slim-skeleton:4.5.0 slim-skeleton \
-    ${prefer[@]+"${prefer[@]}"} --no-progress
+    ${composer_options[@]+"${composer_options[@]}"} ${slim_options[@]+"${slim_options[@]}"} --no-progress
 
 if [ "$dokuwiki" -eq 1 ]; then
     release=dokuwiki-2026-07-14c
