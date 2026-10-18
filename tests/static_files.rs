@@ -382,3 +382,49 @@ async fn keeps_http_1_connection_alive() {
 
     server.stop().await;
 }
+
+#[tokio::test]
+async fn answers_sequential_keep_alive_requests_without_delayed_ack_stalls() {
+    const BODY: &[u8] = b"Hello, Hamster Wheel!";
+    const EXCHANGES: usize = 20;
+    let root = TestRoot::new();
+    std::fs::write(root.path.join("index.html"), BODY).expect("index fixture should be written");
+    let server = TestServer::start(root.path.clone()).await;
+
+    // A file response is written as a head and then a body. Without
+    // TCP_NODELAY on the accepted socket, Nagle holds the body until the
+    // client acknowledges the head, and a client waiting for the rest of the
+    // response delays that acknowledgement (40 ms on Linux), so every
+    // keep-alive exchange after the first few costs a delayed-ACK period.
+    let mut stream = TcpStream::connect(server.address)
+        .await
+        .expect("client should connect");
+    let mut elapsed = Vec::with_capacity(EXCHANGES);
+    for _ in 0..EXCHANGES {
+        let started = std::time::Instant::now();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("request should be written");
+        let mut response = Vec::new();
+        let mut buffer = [0; 1024];
+        while !response.ends_with(BODY) {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("response should be read");
+            assert_ne!(read, 0, "server closed a keep-alive connection");
+            response.extend_from_slice(&buffer[..read]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        elapsed.push(started.elapsed());
+    }
+    elapsed.sort();
+    let median = elapsed[EXCHANGES / 2];
+    assert!(
+        median < std::time::Duration::from_millis(20),
+        "median keep-alive exchange took {median:?}"
+    );
+
+    server.stop().await;
+}

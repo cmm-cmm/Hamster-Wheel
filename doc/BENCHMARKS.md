@@ -2149,3 +2149,58 @@ a machine with homogeneous cores; use the in-memory `/api` route to remove
 filesystem variance as the 0.5 admission comparison did; and use the historical
 500,000-request parameters. The driver does not set affinity today.
 
+
+## Downstream TCP_NODELAY — Linux A/B (2026-10-18)
+
+Machine: cloud container, Ubuntu 24.04, 4 vCPU Intel Xeon @ 2.10 GHz, 16 GiB,
+Linux 6.18. PHP 8.5.11 NTS built from the `php-8.5.11` tag. Release build of
+`dev-linux` at `cd1dc9a` (base) against the same tree plus `set_nodelay(true)`
+on accepted sockets (candidate). Client: `oha` 1.16.0 on the same host, closed
+loop, keep-alive, one fresh server per run, 1,000 warm-up requests (200 for
+FastCGI). Three runs per arm, interleaved A B B A A B per cell. CPU is
+`/proc/<pid>/stat` user+system over the measured run divided by requests
+(10 ms tick); RSS is `VmRSS` at the end of the run. No errors and no unexpected
+status in any run.
+
+The 0.5 PowerShell drivers need .NET and do not run here, so these numbers are
+not comparable with the Windows rows above: different client, kernel and host.
+
+| Cell | Requests | Arm | RPS min / median / max | Median-run P50 / P95 / P99 ms | Hamster / PHP CPU us/req | Hamster / PHP RSS MiB |
+|---|---:|---|---|---|---|---|
+| static 22 B, C1 | 2,000 | base | 23 / 23 / 23 | 43.98 / 44.49 / 48.04 | 680 / - | 6.2 / - |
+| static 22 B, C1 | 2,000 | candidate | 2,783 / 3,261 / 3,502 | 0.271 / 0.449 / 0.656 | 270 / - | 6.2 / - |
+| static 22 B, C32 | 20,000 | base | 820 / 831 / 848 | 43.97 / 47.98 / 48.14 | 279 / - | 8.3 / - |
+| static 22 B, C32 | 20,000 | candidate | 11,307 / 11,562 / 11,614 | 2.690 / 4.510 / 5.621 | 210 / - | 8.9 / - |
+| not_found, C1 | 100,000 | base | 19,853 / 19,910 / 20,194 | 0.045 / 0.063 / 0.089 | 24.5 / - | 6.2 / - |
+| not_found, C1 | 100,000 | candidate | 18,996 / 19,385 / 20,007 | 0.046 / 0.067 / 0.096 | 25.0 / - | 5.8 / - |
+| not_found, C32 | 500,000 | base | 109,541 / 118,289 / 121,455 | 0.224 / 0.567 / 0.870 | 14.4 / - | 6.8 / - |
+| not_found, C32 | 500,000 | candidate | 112,247 / 116,182 / 119,045 | 0.231 / 0.558 / 0.861 | 14.2 / - | 6.6 / - |
+| PHP hello, 1 worker, C1 | 20,000 | base | 7,455 / 7,737 / 7,831 | 0.117 / 0.178 / 0.266 | 89.5 / 33.0 | 6.3 / 27.1 |
+| PHP hello, 1 worker, C1 | 20,000 | candidate | 6,417 / 7,434 / 7,520 | 0.121 / 0.188 / 0.290 | 91.0 / 33.5 | 5.9 / 27.0 |
+| PHP hello, 4 workers, C32 | 50,000 | base | 30,124 / 30,812 / 31,040 | 0.988 / 1.402 / 2.332 | 45.8 / 28.8 | 7.8 / 108.4 |
+| PHP hello, 4 workers, C32 | 50,000 | candidate | 30,226 / 31,209 / 31,941 | 0.962 / 1.449 / 2.854 | 43.0 / 28.2 | 7.4 / 108.6 |
+| FastCGI JSON, 4 php-cgi children, C16 | 10,000 | base | 11,026 / 11,143 / 11,182 | 1.321 / 2.224 / 3.529 | 158 / 80 | 7.5 / 73.0 |
+| FastCGI JSON, 4 php-cgi children, C16 | 10,000 | candidate | 10,948 / 11,069 / 11,852 | 1.340 / 2.210 / 3.668 | 157 / 80 | 7.2 / 74.0 |
+
+Static file responses on Linux paid one delayed-ACK period per keep-alive
+exchange: the head and the file body are separate writes, Nagle held the body
+until the head was acknowledged, and the client delays that ACK by 40 ms. The
+candidate removes it: 141x the base throughput at C1 and 14x at C32. Buffered
+responses are a single write and did not change beyond the runs' own spread
+(not_found -2.6% / -1.8%, PHP hello -3.9% / +1.3%, FastCGI -0.7%, every
+candidate median inside the base min-max range or within 3% of it).
+
+Not measured: Windows. The option now applies there too; whether Windows
+static keep-alive had the same stall, and what the option changes there, was
+not checked.
+
+Static responses remain the slowest Linux cell: 270 us of Hamster CPU per
+request at C1 against 25 us for not_found. The non-Windows `resolve_file`
+performs four `tokio::fs` calls (metadata, canonicalize, open, metadata), each
+a blocking-pool round trip, before the body's own reads; the Windows path
+resolves in one blocking task. That is an observation for a later change, not
+measured here.
+
+Soak, candidate, same host, C32: 300,000 static requests at 11,178 RPS, Hamster
+RSS 8.4 → 10.4 MiB; 600,000 PHP hello requests (4 workers) at 31,684 RPS,
+Hamster 7.3 → 7.8 MiB and PHP 107.7 MiB unchanged. All responses 200.

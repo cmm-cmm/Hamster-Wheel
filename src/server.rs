@@ -500,6 +500,11 @@ where
             accept_result = accept_any(&listeners, &mut next_listener), if connections.len() < http_limits.max_connections() => {
                 let (index, stream, peer_addr) = accept_result?;
                 let accepted_at = Instant::now();
+                // A response head and a streamed body (a file, for one) are
+                // separate writes. Nagle would hold the body until the client
+                // acknowledged the head, and the client delays that ACK: 40 ms
+                // per keep-alive exchange on Linux.
+                let _ = stream.set_nodelay(true);
                 let local_addr = match stream.local_addr() {
                     Ok(local_addr) => local_addr,
                     Err(error) => {
