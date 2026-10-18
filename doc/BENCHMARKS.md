@@ -2149,3 +2149,166 @@ a machine with homogeneous cores; use the in-memory `/api` route to remove
 filesystem variance as the 0.5 admission comparison did; and use the historical
 500,000-request parameters. The driver does not set affinity today.
 
+
+## Downstream TCP_NODELAY — Linux A/B (2026-10-18)
+
+Machine: cloud container, Ubuntu 24.04, 4 vCPU Intel Xeon @ 2.10 GHz, 16 GiB,
+Linux 6.18. PHP 8.5.11 NTS built from the `php-8.5.11` tag. Release build of
+`dev-linux` at `cd1dc9a` (base) against the same tree plus `set_nodelay(true)`
+on accepted sockets (candidate). Client: `oha` 1.16.0 on the same host, closed
+loop, keep-alive, one fresh server per run, 1,000 warm-up requests (200 for
+FastCGI). Three runs per arm, interleaved A B B A A B per cell. CPU is
+`/proc/<pid>/stat` user+system over the measured run divided by requests
+(10 ms tick); RSS is `VmRSS` at the end of the run. No errors and no unexpected
+status in any run.
+
+The 0.5 PowerShell drivers need .NET and do not run here, so these numbers are
+not comparable with the Windows rows above: different client, kernel and host.
+
+| Cell | Requests | Arm | RPS min / median / max | Median-run P50 / P95 / P99 ms | Hamster / PHP CPU us/req | Hamster / PHP RSS MiB |
+|---|---:|---|---|---|---|---|
+| static 22 B, C1 | 2,000 | base | 23 / 23 / 23 | 43.98 / 44.49 / 48.04 | 680 / - | 6.2 / - |
+| static 22 B, C1 | 2,000 | candidate | 2,783 / 3,261 / 3,502 | 0.271 / 0.449 / 0.656 | 270 / - | 6.2 / - |
+| static 22 B, C32 | 20,000 | base | 820 / 831 / 848 | 43.97 / 47.98 / 48.14 | 279 / - | 8.3 / - |
+| static 22 B, C32 | 20,000 | candidate | 11,307 / 11,562 / 11,614 | 2.690 / 4.510 / 5.621 | 210 / - | 8.9 / - |
+| not_found, C1 | 100,000 | base | 19,853 / 19,910 / 20,194 | 0.045 / 0.063 / 0.089 | 24.5 / - | 6.2 / - |
+| not_found, C1 | 100,000 | candidate | 18,996 / 19,385 / 20,007 | 0.046 / 0.067 / 0.096 | 25.0 / - | 5.8 / - |
+| not_found, C32 | 500,000 | base | 109,541 / 118,289 / 121,455 | 0.224 / 0.567 / 0.870 | 14.4 / - | 6.8 / - |
+| not_found, C32 | 500,000 | candidate | 112,247 / 116,182 / 119,045 | 0.231 / 0.558 / 0.861 | 14.2 / - | 6.6 / - |
+| PHP hello, 1 worker, C1 | 20,000 | base | 7,455 / 7,737 / 7,831 | 0.117 / 0.178 / 0.266 | 89.5 / 33.0 | 6.3 / 27.1 |
+| PHP hello, 1 worker, C1 | 20,000 | candidate | 6,417 / 7,434 / 7,520 | 0.121 / 0.188 / 0.290 | 91.0 / 33.5 | 5.9 / 27.0 |
+| PHP hello, 4 workers, C32 | 50,000 | base | 30,124 / 30,812 / 31,040 | 0.988 / 1.402 / 2.332 | 45.8 / 28.8 | 7.8 / 108.4 |
+| PHP hello, 4 workers, C32 | 50,000 | candidate | 30,226 / 31,209 / 31,941 | 0.962 / 1.449 / 2.854 | 43.0 / 28.2 | 7.4 / 108.6 |
+| FastCGI JSON, 4 php-cgi children, C16 | 10,000 | base | 11,026 / 11,143 / 11,182 | 1.321 / 2.224 / 3.529 | 158 / 80 | 7.5 / 73.0 |
+| FastCGI JSON, 4 php-cgi children, C16 | 10,000 | candidate | 10,948 / 11,069 / 11,852 | 1.340 / 2.210 / 3.668 | 157 / 80 | 7.2 / 74.0 |
+
+Static file responses on Linux paid one delayed-ACK period per keep-alive
+exchange: the head and the file body are separate writes, Nagle held the body
+until the head was acknowledged, and the client delays that ACK by 40 ms. The
+candidate removes it: 141x the base throughput at C1 and 14x at C32. Buffered
+responses are a single write and did not change beyond the runs' own spread
+(not_found -2.6% / -1.8%, PHP hello -3.9% / +1.3%, FastCGI -0.7%, every
+candidate median inside the base min-max range or within 3% of it).
+
+Not measured: Windows. The option now applies there too; whether Windows
+static keep-alive had the same stall, and what the option changes there, was
+not checked.
+
+Static responses remain the slowest Linux cell: 270 us of Hamster CPU per
+request at C1 against 25 us for not_found. The non-Windows `resolve_file`
+performs four `tokio::fs` calls (metadata, canonicalize, open, metadata), each
+a blocking-pool round trip, before the body's own reads; the Windows path
+resolves in one blocking task. That is an observation for a later change, not
+measured here.
+
+Soak, candidate, same host, C32: 300,000 static requests at 11,178 RPS, Hamster
+RSS 8.4 → 10.4 MiB; 600,000 PHP hello requests (4 workers) at 31,684 RPS,
+Hamster 7.3 → 7.8 MiB and PHP 107.7 MiB unchanged. All responses 200.
+
+## Linux release baseline — `ece1391` (2026-10-18)
+
+Same host and conditions as the TCP_NODELAY A/B above: 4 vCPU Intel Xeon
+@ 2.10 GHz, 16 GiB, Ubuntu 24.04, Linux 6.18, PHP 8.5.11 NTS, `oha` 1.16.0
+on the same host. Driver: `benchmarks/linux_http.py` (checked in with this
+entry), three runs per cell, a fresh server per run, 1,000 warm-up requests
+(200 for FastCGI), keep-alive, nothing else running. The persistent worker
+cells use `fixtures/php-worker/worker.php`; FastCGI uses one `php-cgi -b`
+with `PHP_FCGI_CHILDREN=4` behind `concurrency = 4` and
+`fixtures/php-cgi/bench.php`. Not comparable with the Windows rows: different
+client, kernel and host.
+
+| Cell | Requests | RPS min / median / max | Median-run P50 / P95 / P99 ms | Hamster / PHP CPU us/req | Hamster / PHP RSS MiB | Errors |
+|---|---:|---|---|---|---|---:|
+| static 22 B, C1 | 50,000 | 3,315 / 3,521 / 3,590 | 0.258 / 0.404 / 0.632 | 267.8 / - | 5.8 / - | 0 |
+| static 22 B, C32 | 200,000 | 12,175 / 12,181 / 12,807 | 2.540 / 4.336 / 5.402 | 204.1 / - | 9.6 / - | 0 |
+| not_found, C1 | 100,000 | 17,738 / 18,774 / 19,192 | 0.048 / 0.069 / 0.097 | 25.7 / - | 5.6 / - | 0 |
+| not_found, C32 | 500,000 | 107,791 / 110,920 / 117,799 | 0.237 / 0.619 / 0.986 | 15.4 / - | 6.5 / - | 0 |
+| PHP hello, 1 worker, C1 | 20,000 | 6,364 / 6,408 / 7,466 | 0.132 / 0.216 / 0.419 | 100.0 / 37.5 | 6.1 / 27.2 | 0 |
+| PHP JSON, 1 worker, C1 | 20,000 | 7,237 / 7,847 / 7,965 | 0.117 / 0.172 / 0.252 | 88.5 / 32.5 | 5.8 / 27.2 | 0 |
+| PHP echo 12 B, 1 worker, C1 | 20,000 | 6,487 / 6,697 / 6,848 | 0.137 / 0.194 / 0.257 | 127.0 / 34.5 | 6.0 / 27.2 | 0 |
+| PHP hello, 4 workers, C4 | 50,000 | 19,047 / 19,083 / 19,119 | 0.189 / 0.335 / 0.498 | 70.2 / 35.0 | 6.2 / 108.5 | 0 |
+| PHP hello, 4 workers, C32 | 50,000 | 30,633 / 31,082 / 32,717 | 0.970 / 1.400 / 2.758 | 44.0 / 28.6 | 7.4 / 108.7 | 0 |
+| FastCGI hello, 4 children, C1 | 5,000 | 2,250 / 2,439 / 2,471 | 0.365 / 0.628 / 1.014 | 260.0 / 96.0 | 6.0 / 74.3 | 0 |
+| FastCGI hello, 4 children, C4 | 10,000 | 7,954 / 8,288 / 8,382 | 0.451 / 0.727 / 0.941 | 190.0 / 85.0 | 6.3 / 74.2 | 0 |
+| FastCGI JSON, 4 children, C16 | 10,000 | 11,251 / 11,985 / 12,506 | 1.248 / 2.059 / 2.719 | 152.0 / 78.0 | 7.2 / 76.1 | 0 |
+
+The 1-worker PHP hello median (6,408) sits below the JSON cell (7,847) that
+does more work; its max run (7,466) and the A/B above (7,434-7,737) place it
+with the other two, so read the low median as this cell's run-to-run spread on
+a shared cloud host, not as a hello-specific cost. At C1 the median exchange
+is about 0.12-0.14 ms through a persistent worker and 0.37 ms through FastCGI,
+which starts a fresh PHP request per exchange.
+
+## Hamster vs FrankenPHP — Linux, same host (2026-10-18)
+
+The first same-host comparison: both servers on one machine, the same PHP
+version, interleaved, the same request mix. The earlier FrankenPHP entry above
+combined cells from different runs and configurations and says it is not a
+valid product comparison. The full report, written in Vietnamese like its
+predecessor, is `doc/FRANKENPHP_LINUX_COMPARISON.md`.
+
+**Conditions**
+
+| | |
+|---|---|
+| Host | as in the Linux baseline above: 4 vCPU Xeon @ 2.10 GHz, Ubuntu 24.04, Linux 6.18, `oha` 1.16.0 on the same host |
+| Hamster | release at `7611f32`; PHP 8.5.11 NTS |
+| FrankenPHP | 1.13.1 (Caddy 2.11.7), built from its tag against a glibc `libphp.so` 8.5.11 ZTS with the same extensions |
+| Repeat order | H F F H H F per cell, a fresh server per run |
+| Warm-up | 1,000 requests (200 for classic) |
+| CPU and RSS | whole process tree, as `benchmarks/linux_http.py` measures them |
+| Driver | `benchmarks/frankenphp_linux.py` |
+
+The official static FrankenPHP binary, run once the same way before the glibc
+build, landed on the same side of every cell. No request failed or returned an
+unexpected status.
+
+**The four workloads**
+
+| Workload | Hamster | FrankenPHP |
+|---|---|---|
+| Persistent worker, minimal | `fixtures/php-worker/worker.php` | an equivalent worker script |
+| Classic | FastCGI to one `php-cgi` with 4 children | its in-process mode, 4 threads, on `fixtures/php-cgi/bench.php` |
+| Static file | 22-byte file | Caddy `file_server` |
+| Laravel 12 + Octane | `www/pms-scratch`, 4 workers | Octane's worker, 4 workers |
+
+Laravel ran with `APP_ENV=production`, `APP_DEBUG=false`, array session and cache, and the same
+`php.ini` with OPcache on for both.
+
+Two runs of the same cells, median RPS, Hamster / FrankenPHP:
+
+| Cell | Requests | Run 1 | Run 2 | Hamster / FrankenPHP CPU µs/req (run 1) |
+|---|---:|---|---|---|
+| Laravel `/login`, W4 C1 | 3,000 | 512 / 540 | 582 / 566 | 1,700 / 1,957 |
+| Laravel `/login`, W4 C16 | 10,000 | 2,326 / 2,169 | 2,487 / 2,255 | 1,448 / 1,697 |
+| Laravel welcome 81 KB, W4 C1 | 2,000 | 446 / 453 | 469 / 511 | 2,030 / 2,400 |
+| Laravel welcome 81 KB, W4 C16 | 5,000 | 1,645 / 1,649 | 1,691 / 1,658 | 1,898 / 2,200 |
+| worker hello, W1 C1 | 20,000 | 8,157 / 4,110 | 7,251 / 3,865 | 114 / 297 |
+| worker JSON, W1 C1 | 20,000 | 7,212 / 3,729 | 7,412 / 3,944 | 126 / 324 |
+| worker echo 12 B, W1 C1 | 20,000 | 6,300 / 3,573 | 6,117 / 3,495 | 170 / 321 |
+| worker hello, W4 C4 | 50,000 | 20,490 / 14,130 | 20,148 / 14,083 | 98 / 166 |
+| worker hello, W4 C32 | 50,000 | 32,465 / 16,904 | 30,171 / 18,733 | 72 / 142 |
+| classic hello, C1 | 5,000 | 2,287 / 3,061 | 2,278 / 3,610 | 380 / 388 |
+| classic JSON, C16 | 10,000 | 11,264 / 14,832 | 11,355 / 14,867 | 237 / 167 |
+| static 22 B, C1 | 50,000 | 3,728 / 7,622 | 3,467 / 7,249 | 250 / 154 |
+| static 22 B, C32 | 200,000 | 12,585 / 43,089 | 12,524 / 40,611 | 200 / 62 |
+
+**Laravel throughput is a tie.**
+
+- The two runs straddle parity, from 0.92x to 1.10x Hamster / FrankenPHP.
+- Per-run ranges overlap.
+- Hamster used 9-18% less CPU per request in all eight Laravel cells.
+- FrankenPHP's one process held 125-170 MiB RSS; Hamster's process tree held 239-262 MiB with four worker processes.
+
+**Elsewhere the gaps are large and repeat in both runs.**
+
+- The minimal persistent worker is 1.4-2.0x faster on Hamster.
+- At W1 C1, Hamster uses about 180 µs less CPU per request.
+- FrankenPHP is 1.3-1.6x faster in classic mode and 2.0-3.4x faster on static files.
+
+Latency percentiles, ranges, RSS and the static-binary run are in the report. Not measured:
+
+- TLS, HTTP/2 and HTTP/3, or compression;
+- a database-backed application;
+- failure, recycle or soak behaviour;
+- any host other than this one.

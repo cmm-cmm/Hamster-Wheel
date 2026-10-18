@@ -1,8 +1,13 @@
 //! Permanent regressions for multiple persistent application pools.
 //!
-//! All tests are `#[ignore]`d because they need `php/8.5/php.exe`.
+//! All tests are `#[ignore]`d because they need the repository PHP runtime
+//! (`support::PHP_RELATIVE_PATH`).
 //!
 //! `cargo test --test multipool_probe <name> -- --ignored --nocapture`
+
+mod support;
+
+use support::PHP_RELATIVE_PATH;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -59,10 +64,10 @@ fn multi_pool_runtime_with_server(
     server_settings: &str,
 ) -> config::RuntimeConfig {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let executable = root.join("php/8.5/php.exe");
+    let executable = root.join(PHP_RELATIVE_PATH);
     assert!(
         executable.is_file(),
-        "multi-pool probe requires repository php/8.5/php.exe"
+        "multi-pool probe requires repository {PHP_RELATIVE_PATH}"
     );
     let mut source = format!("[server]\nlisten = \"{listen}\"\n{server_settings}");
     for spec in specs {

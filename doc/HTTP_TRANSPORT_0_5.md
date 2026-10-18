@@ -38,6 +38,15 @@ to obtain the accepted stream's local address closes only that connection and
 returns the accept loop to service. HTTP parse/connection errors now include
 both immediate endpoints in the existing error diagnostic.
 
+Every accepted socket gets `TCP_NODELAY`. A response whose body is not ready
+when Hyper writes the head (a static file, which is read after the head is
+encoded) leaves the server as two writes. With Nagle enabled the second write
+waited for the client's ACK of the first, and a client waiting for the rest of
+the response delays that ACK, so each keep-alive exchange after the first few
+cost one delayed-ACK period: 44 ms on Linux, 23 RPS for a 22-byte static file
+at one connection (`doc/BENCHMARKS.md`, *Downstream TCP_NODELAY*). Buffered
+responses (PHP worker, `not_found`) were one write and never stalled.
+
 ## Why this precedes a larger request context
 
 FACT: the old accept loop discarded its returned peer address. Later PHP,

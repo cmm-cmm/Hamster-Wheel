@@ -19,7 +19,15 @@ to become a crate under `crates/` (for example, `hamster-http` or `hamster-php`)
 
 `php/` is deliberately git-ignored. A locally supplied PHP 8.5 NTS distribution must exist at
 `php/8.5/php.exe` before the checked-in `hamster.toml`, the PHP benchmarks, or the ignored PHP
-integration tests can run.
+integration tests can run. On Linux and other non-Windows hosts the tests and benches look for
+`php/8.5/php` instead, so a symlink to the system binary is enough:
+`mkdir -p php/8.5 && ln -s "$(command -v php8.5)" php/8.5/php`. `hamster.toml` still names
+`php.exe`; point its `executable` at `php/8.5/php` in a local copy to run it there. The crash and
+kill tests use `taskkill`/`tasklist` on Windows and `kill`/`/proc` elsewhere. The Laravel tests
+additionally need `HAMSTER_LARAVEL_TEST_PATH`; `fixtures/php-worker/pms/prepare_scratch_app.sh`
+builds a PMS-shaped Laravel 12 + Octane application for it under the git-ignored `www/`, and
+`fixtures/php-apps/prepare_php_apps.sh` builds the `HAMSTER_PHP_APPS` workspace (Symfony Demo needs
+PHP 8.4 or newer). The FastCGI tests look for `php/8.5/php-cgi`, a symlink to the system `php-cgi`.
 
 ## Build, Test, and Development Commands
 
@@ -44,6 +52,10 @@ integration tests can run.
   `cargo clippy --all-targets` only checks them and misses linker errors.
 - `./benchmarks/static_http.ps1` and `./benchmarks/php_worker*.ps1` are end-to-end .NET load drivers
   that launch the release binary themselves, so build release first.
+- `benchmarks/linux_http.py` is the Linux counterpart (static, `not_found`, PHP worker and FastCGI
+  cells, client `oha`); `doc/LINUX_VERIFICATION.md` records how Linux was verified and what is not.
+- `benchmarks/frankenphp_linux.py --frankenphp PATH [--laravel APP]` runs the same cells against
+  FrankenPHP on the same host, interleaved; results are in `doc/FRANKENPHP_LINUX_COMPARISON.md`.
 
 Never report debug-build results as performance data. Record RPS, latency percentiles, CPU, RAM, and
 test conditions.

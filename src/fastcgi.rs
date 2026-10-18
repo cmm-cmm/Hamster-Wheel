@@ -335,6 +335,7 @@ enum ConnectOutcome {
     Connected(ConnectAttempt, TcpStream),
     Failed(ConnectAttempt, io::Error),
     /// The spawned connect still owns the claims, or dropped them on panic.
+    #[cfg(windows)]
     Detached(io::Error),
 }
 
@@ -962,6 +963,7 @@ async fn run_script(
                     format_args!("connecting to {address} failed: {error}"),
                 );
             }
+            #[cfg(windows)]
             ConnectOutcome::Detached(error) => {
                 backend.record_failure(
                     &backend.counters.connect_failures,

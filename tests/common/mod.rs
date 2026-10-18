@@ -97,3 +97,10 @@ pub fn end_children_with_this_process() {
         }
     });
 }
+
+/// Linux and macOS have no Job Object to join. Children still die through
+/// `kill_on_drop` when the test unwinds; a test process ended by a signal
+/// leaves them to be reparented, as any other process's children would be.
+#[cfg(not(windows))]
+#[allow(dead_code, reason = "some test binaries call it only on Windows")]
+pub fn end_children_with_this_process() {}

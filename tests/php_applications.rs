@@ -15,6 +15,10 @@
 //! `HAMSTER_LARAVEL_TEST_PATH` adds the Laravel stand-in to the side-by-side
 //! test. See `doc/PHP_APPLICATION_COMPATIBILITY.md`.
 
+mod support;
+
+use support::PHP_RELATIVE_PATH;
+
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -79,7 +83,7 @@ struct Pool {
 }
 
 fn host_section(apps: &Path, pool: &Pool) -> String {
-    let php = repository().join("php/8.5/php.exe");
+    let php = repository().join(PHP_RELATIVE_PATH);
     let adapters = repository().join("fixtures/php-worker");
     let ini = apps.join("php.ini");
     let (script, mut env, static_root) = match &pool.app {
@@ -730,7 +734,7 @@ type Part<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a [u8]);
 /// library from the workspace and returns its stdout.
 async fn adapter_checks(script: &str, autoload: &Path) -> String {
     let apps = workspace();
-    let output = tokio::process::Command::new(repository().join("php/8.5/php.exe"))
+    let output = tokio::process::Command::new(repository().join(PHP_RELATIVE_PATH))
         .arg("-c")
         .arg(apps.join("php.ini"))
         // The Slim skeleton's PHP-DI emits deprecations on PHP 8.5.

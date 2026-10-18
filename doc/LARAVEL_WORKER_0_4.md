@@ -165,6 +165,14 @@ Protocol v1 still limits HTTP request bodies to 1 MiB and complete frames to
   application. The scratch-only provider used for PMS testing is checked in
   under `fixtures/php-worker/pms` and is never registered in production PMS;
   it refuses to boot unless the test config sets `HAMSTER_PMS_PROBE=1`.
+- Without a PMS checkout, `fixtures/php-worker/pms/prepare_scratch_app.sh`
+  builds a disposable Laravel 12 + Octane 2 application in the git-ignored
+  `www/pms-scratch` that reproduces what the tests touch: the
+  `Accesstokenlink`/`taikhoan` session model with an expiring `AccessLife`, a
+  `tymon/jwt-auth` parser resolved during provider boot, the probe provider,
+  a `login` route and a PHPRC `php.ini`. Pass `--prefer-source` where GitHub
+  archive downloads are blocked. Against it, the lifecycle suite reports all
+  25 checks, including the JWT and session/auth ones.
 - Rust's existing partial-write, crash and NotStarted tests continue to protect
   at-most-once semantics; protocol v1 is byte-identical.
 

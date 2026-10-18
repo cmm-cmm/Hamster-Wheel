@@ -2853,24 +2853,47 @@ mod tests {
 
     use super::*;
 
-    fn fixture(script: &str) -> PhpWorkerConfig {
-        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
-        assert!(
-            executable.is_file(),
-            "PHP-dependent test requires repository php/8.5/php.exe"
-        );
+    /// The repository PHP runtime, vendored per platform like benches/php_ipc.rs.
+    #[cfg(windows)]
+    const PHP_RELATIVE_PATH: &str = "php/8.5/php.exe";
+    #[cfg(not(windows))]
+    const PHP_RELATIVE_PATH: &str = "php/8.5/php";
+
+    fn worker_config(script: &str) -> PhpWorkerConfig {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         PhpWorkerConfig {
-            executable,
-            script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/php-worker")
-                .join(script),
+            executable: root.join(PHP_RELATIVE_PATH),
+            script: root.join("fixtures/php-worker").join(script),
             ..Default::default()
         }
     }
 
+    fn fixture(script: &str) -> PhpWorkerConfig {
+        let config = worker_config(script);
+        assert!(
+            config.executable.is_file(),
+            "PHP-dependent test requires repository {PHP_RELATIVE_PATH}"
+        );
+        config
+    }
+
     fn pool(script: &str, workers: usize, queue_capacity: usize) -> Arc<PhpWorkerPool> {
+        pool_with(fixture(script), workers, queue_capacity)
+    }
+
+    /// A pool whose workers are never started. Dispatcher tests drive its job
+    /// channels directly, so they must not require a PHP runtime to exist.
+    fn unstarted_pool(workers: usize, queue_capacity: usize) -> Arc<PhpWorkerPool> {
+        pool_with(worker_config("worker.php"), workers, queue_capacity)
+    }
+
+    fn pool_with(
+        worker: PhpWorkerConfig,
+        workers: usize,
+        queue_capacity: usize,
+    ) -> Arc<PhpWorkerPool> {
         Arc::new(PhpWorkerPool::new(PhpWorkerPoolConfig {
-            worker: fixture(script),
+            worker,
             workers,
             queue_capacity,
             label: Arc::from("test"),
@@ -2914,7 +2937,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_provably_unstarted_job_is_queued_again_and_only_once() {
-        let pool = pool("worker.php", 1, 1);
+        let pool = unstarted_pool(1, 1);
         let (jobs_tx, mut jobs_rx) = mpsc::channel(1);
         pool.shared.jobs_tx.set(jobs_tx).unwrap();
 
@@ -2964,7 +2987,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_abort_releases_pending_and_future_callers() {
-        let pool = pool("worker.php", 1, 8);
+        let pool = unstarted_pool(1, 8);
         let (jobs_tx, jobs_rx) = mpsc::channel(8);
         let (_idle_tx, idle_rx) = mpsc::channel(1);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();

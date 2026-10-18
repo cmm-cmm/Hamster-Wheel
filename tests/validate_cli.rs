@@ -5,6 +5,10 @@
 //! configuration names and binds it afterwards: if validation had bound it,
 //! that bind would fail.
 
+mod support;
+
+use support::PHP_RELATIVE_PATH;
+
 use std::{
     fs,
     net::{Ipv4Addr, SocketAddr, TcpListener},
@@ -180,7 +184,7 @@ fn validate_is_rejected_beside_a_control_command() {
 fn a_worker_pool_validates_without_starting_a_worker() {
     let scratch = Scratch::new("pool");
     let address = reserve_address();
-    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+    let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/worker.php");
     let config = scratch.write(
         "hamster.toml",

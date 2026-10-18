@@ -1038,7 +1038,15 @@ Content-Length: 0
 /// The most bytes that kernel and Hyper buffers can plausibly hold between a
 /// writer and a reader on loopback. Anything that buffered a whole payload
 /// would exceed it by several times.
+#[cfg(windows)]
 const BUFFER_SLACK: u64 = 8 * 1_024 * 1_024;
+/// Linux autotunes loopback receive buffers up to `net.ipv4.tcp_rmem`'s
+/// maximum, which some kernels set to 32 MiB. With that ceiling the slow-client
+/// test measured up to 9.3 MiB in flight while the upstream still stopped far
+/// short of `LARGE_PAYLOAD`; with a 6 MiB ceiling it peaked at 7.7 MiB. Whole
+/// payload buffering still exceeds this bound eight times over.
+#[cfg(not(windows))]
+const BUFFER_SLACK: u64 = 16 * 1_024 * 1_024;
 const LARGE_PAYLOAD: u64 = 128 * 1_024 * 1_024;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
