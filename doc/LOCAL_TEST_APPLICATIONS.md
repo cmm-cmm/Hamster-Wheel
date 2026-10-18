@@ -31,6 +31,20 @@ $env:HAMSTER_FLATPRESS_TEST_PATH = 'D:\scratch\flatpress\app'
 cargo test --test php_cgi -- --ignored --test-threads=1  # needs php\8.5\php-cgi.exe
 ```
 
+On Linux, with `php/8.5/php` and `php/8.5/php-cgi` symlinked to the system
+binaries:
+
+```sh
+fixtures/php-apps/prepare_php_apps.sh --prefer-source   # --without-dokuwiki to skip it
+HAMSTER_PHP_APPS="$PWD/www/php-apps" cargo test --test php_applications -- --ignored
+HAMSTER_PHP_APPS="$PWD/www/php-apps" cargo test --test php_cgi -- --ignored --test-threads=1
+```
+
+The Linux script needs PHP 8.4 or newer for Symfony Demo 3.1.0 and leaves
+the extensions to the host PHP. The FastCGI tests pass `output_buffering=0`
+so a distribution `php.ini` (Ubuntu ships 4096) cannot hold `flush()` output
+back.
+
 `tests/php_cgi.rs` starts `php-cgi.exe -b` processes itself, as an operator
 would, on loopback ports selected by the test; eight fixture tests use only
 `fixtures/php-cgi`, while the DokuWiki and FlatPress tests need their prepared
@@ -80,7 +94,7 @@ The script refuses to overwrite an existing directory. It runs
 `tymon/jwt-auth` 2.x, writes the stand-in models, migration, seeder and
 provider list, and runs `jwt:secret`, `migrate` and `db:seed` with the
 repository PHP. The Linux counterpart, `prepare_scratch_app.sh`, writes the
-same application and currently lives on the `dev-linux` branch.
+same application.
 
 Two Windows details are handled by the script and matter for anyone doing
 this by hand:

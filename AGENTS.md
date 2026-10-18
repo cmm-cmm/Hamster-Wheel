@@ -25,7 +25,9 @@ integration tests can run. On Linux and other non-Windows hosts the tests and be
 `php.exe`; point its `executable` at `php/8.5/php` in a local copy to run it there. The crash and
 kill tests use `taskkill`/`tasklist` on Windows and `kill`/`/proc` elsewhere. The Laravel tests
 additionally need `HAMSTER_LARAVEL_TEST_PATH`; `fixtures/php-worker/pms/prepare_scratch_app.sh`
-builds a PMS-shaped Laravel 12 + Octane application for it under the git-ignored `www/`.
+builds a PMS-shaped Laravel 12 + Octane application for it under the git-ignored `www/`, and
+`fixtures/php-apps/prepare_php_apps.sh` builds the `HAMSTER_PHP_APPS` workspace (Symfony Demo needs
+PHP 8.4 or newer). The FastCGI tests look for `php/8.5/php-cgi`, a symlink to the system `php-cgi`.
 
 ## Build, Test, and Development Commands
 
