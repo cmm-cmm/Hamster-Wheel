@@ -253,7 +253,7 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         // started serving.
         let _stop_tx = stop_tx;
         let trigger = tokio::select! {
-            () = console_shutdown => "console",
+            signal = console_shutdown => signal,
             _ = stop_rx.recv() => {
                 outln!("Control endpoint requested shutdown");
                 "control"
@@ -265,6 +265,15 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         drain_flag.store(true, std::sync::atomic::Ordering::Release);
     };
     let mut reload_task = reload.map(tokio::spawn);
+    // Off Windows this is the only way to ask for a configuration reload, so
+    // a failure to install it is a startup failure rather than a server that
+    // silently cannot be reloaded.
+    #[cfg(not(windows))]
+    let mut configuration_reload_task = match configuration_reload_signal(Arc::clone(&generations))
+    {
+        Ok(task) => Some(tokio::spawn(task)),
+        Err(error) => return Err(stop_workers_after(&config, error).await),
+    };
     // Printed once at startup, beside the other readiness lines. A refused
     // request is only explainable if the operator can see what the ceiling was
     // set to, and a configured limit is not something a running server should
@@ -355,6 +364,11 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
         let _ = task.await;
     }
     if let Some(task) = reload_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    #[cfg(not(windows))]
+    if let Some(task) = configuration_reload_task.take() {
         task.abort();
         let _ = task.await;
     }
@@ -929,10 +943,12 @@ pub(crate) fn error_chain_has_io_kind(
 }
 
 #[cfg(windows)]
-fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
+/// The console event that starts a graceful drain, and what to call it.
+fn shutdown_signal() -> io::Result<impl Future<Output = &'static str>> {
     let mut signal = tokio::signal::windows::ctrl_c()?;
     Ok(async move {
         let _ = signal.recv().await;
+        "console"
     })
 }
 
@@ -988,11 +1004,71 @@ async fn report_certificate_reload(tls: &TlsListener) {
 }
 
 #[cfg(not(windows))]
-fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
-    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+/// The signals that start a graceful drain, and what to call each one.
+///
+/// SIGTERM is what `systemctl stop` and `docker stop` send. Without it the
+/// default action ended the process: no drain, and requests in flight cut.
+/// Handling it is the difference between a supervised stop and a kill.
+fn shutdown_signal() -> io::Result<impl Future<Output = &'static str>> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     Ok(async move {
-        let _ = signal.recv().await;
+        tokio::select! {
+            _ = interrupt.recv() => "sigint",
+            _ = terminate.recv() => "sigterm",
+        }
     })
+}
+
+/// Reloads the configuration on SIGUSR1.
+///
+/// SIGHUP keeps its single tested meaning — reload the certificate files
+/// transactionally — so an operator rotating a certificate cannot also pick
+/// up configuration edits they did not mean to publish. A configuration
+/// reload therefore gets its own signal. On Windows the control endpoint's
+/// `reload` command does this; off Windows there is no endpoint yet, and this
+/// is the only trigger.
+#[cfg(not(windows))]
+fn configuration_reload_signal(
+    generations: Arc<Generations>,
+) -> io::Result<impl Future<Output = ()>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    Ok(async move {
+        while signal.recv().await.is_some() {
+            report_configuration_reload(&generations).await;
+        }
+    })
+}
+
+/// Publishes a configuration reload, or reports why it was refused.
+///
+/// Says the same things the control endpoint's answer says, because an
+/// operator reading a log after a signal needs the same facts as one reading
+/// a pipe answer: which generation is serving, and why.
+#[cfg(not(windows))]
+async fn report_configuration_reload(generations: &Generations) {
+    let serving = generations.current().generation();
+    match generations.reload().await {
+        Ok(published) => {
+            outln!(
+                "Configuration reload published generation {} (was {serving})",
+                published.generation()
+            );
+            lifecycle!(
+                event::RELOAD_PUBLISHED,
+                "generation" = published.generation(),
+                "previous_generation" = serving,
+            );
+        }
+        Err(error) => {
+            errln!("Configuration reload refused; generation {serving} still serving: {error}");
+            lifecycle!(
+                event::RELOAD_REFUSED,
+                "reason" = error.to_string(),
+                "active_generation" = serving,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
