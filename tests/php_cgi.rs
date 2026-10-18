@@ -4,9 +4,13 @@
 //! `move_uploaded_file()`, `header()`, `setcookie()`, native sessions,
 //! `flush()` and `exit`.
 //!
-//! Ignored: needs the repository's `php/8.5/php-cgi.exe`.
+//! Ignored: needs the repository's `php/8.5/php-cgi.exe` (`php/8.5/php-cgi` on
+//! other hosts).
 
 mod common;
+mod support;
+
+use support::PHP_CGI_RELATIVE_PATH;
 
 use std::{
     collections::HashMap,
@@ -100,7 +104,7 @@ impl PhpCgi {
 
     fn launch(&mut self, index: usize) {
         let address = self.addresses[index];
-        let mut command = Command::new(repository().join("php/8.5/php-cgi.exe"));
+        let mut command = Command::new(repository().join(PHP_CGI_RELATIVE_PATH));
         if let Some(ini) = &self.ini {
             command.arg("-c").arg(ini);
         }
@@ -114,6 +118,10 @@ impl PhpCgi {
                 "log_errors=1",
                 "-d",
                 "error_log=",
+                // PHP's built-in default. A distribution php.ini (Debian and
+                // Ubuntu ship 4096) would otherwise hold `flush()` output back.
+                "-d",
+                "output_buffering=0",
             ])
             .arg("-d")
             .arg(format!("session.save_path={}", self.sessions.display()))

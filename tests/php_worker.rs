@@ -3422,7 +3422,7 @@ async fn startup_timeout_admits_a_bootstrap_slower_than_the_default_budget() {
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/php-worker/delayed_ready.php");
     let runtime = |extra: &str| {
-        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("php/8.5/php.exe");
+        let executable = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PHP_RELATIVE_PATH);
         let source = format!(
             "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n[[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n[hosts.locations.php]\nexecutable = {}\nscript = {}\nworkers = 1\nqueue_capacity = 8\n{extra}\n[hosts.locations.php.env]\nHAMSTER_READY_DELAY_MS = \"6500\"\n",
             toml_literal(&executable),

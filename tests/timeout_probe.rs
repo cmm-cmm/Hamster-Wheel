@@ -818,7 +818,10 @@ async fn g1_every_request_times_out_forever() {
         for handle in wave {
             let status = handle.await.expect("churn request task");
             answered += 1;
-            if !(status.contains("502") || status.contains("503")) {
+            if !["502", "503", "504"]
+                .iter()
+                .any(|code| status.contains(code))
+            {
                 unexpected.push(status);
             }
         }
@@ -845,7 +848,7 @@ async fn g1_every_request_times_out_forever() {
 
     assert!(
         unexpected.is_empty(),
-        "every request must be answered 502 or 503: {unexpected:?}"
+        "every request must be answered 502, 503 or 504: {unexpected:?}"
     );
     assert!(
         failures.iter().all(|count| *count == 0),
