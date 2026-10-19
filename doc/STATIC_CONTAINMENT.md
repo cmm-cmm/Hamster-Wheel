@@ -25,17 +25,20 @@ Windows static containment validates the final resolved location of the opened
 file handle and serves that same handle:
 
 ```text
-normalize -> (index selection) -> open candidate once
+normalize -> open candidate (index selection only if that open is refused)
           -> GetFinalPathNameByHandleW(handle) -> starts_with(root)
-          -> metadata(handle) -> GET streams handle / HEAD drops handle
+          -> metadata(handle) -> GET of <= 64 KiB: read through the handle
+                               -> larger GET streams handle / HEAD drops handle
 ```
 
 No pathname is reopened after validation. The open, final-path query,
-containment check and metadata all run in one `spawn_blocking` call; the
-validated `std::fs::File` becomes the `tokio::fs::File` owned by
-`ResponseBody::file`, so streaming, the 128 KiB frame limit and Hyper
-backpressure are unchanged. GET and HEAD share one resolution and therefore one
-containment decision.
+containment check, metadata and -- for a GET of at most 64 KiB -- the read all
+run in one `spawn_blocking` call, so a small file costs one blocking-pool
+round trip. Above that size the validated `std::fs::File` becomes the
+`tokio::fs::File` owned by `ResponseBody::file`, so streaming, the 128 KiB
+frame limit and Hyper backpressure are unchanged. GET and HEAD share one
+resolution and therefore one containment decision. A file that shrank between
+the metadata and the read is served as what was read, with that length.
 
 ### Representation
 
@@ -69,12 +72,16 @@ exercised here.
 
 ### Directory and index selection
 
-A pathname metadata lookup still decides whether to append `index.html`. It is
-index selection, not containment: opening a directory would need
-`FILE_FLAG_BACKUP_SEMANTICS` (a plain open returns `ERROR_ACCESS_DENIED`), and
-that flag also changes access checks when the backup privilege is enabled. The
-served handle is therefore always a plain read open. If the namespace changes
-after the lookup, whatever is opened is still validated by its handle.
+The candidate is opened first. A plain open of a directory returns
+`ERROR_ACCESS_DENIED`, and only on that failure does a pathname metadata lookup
+decide whether to append `index.html`; access denied on anything else is
+returned as it was. This is index selection, not containment: opening a
+directory would need `FILE_FLAG_BACKUP_SEMANTICS`, and that flag also changes
+access checks when the backup privilege is enabled. The served handle is
+therefore always a plain read open. On Windows a metadata query is itself an
+open, so a file now costs one open where it used to cost two (2026-10-19). If
+the namespace changes after the lookup, whatever is opened is still validated
+by its handle.
 
 ### Observed filesystem behavior
 

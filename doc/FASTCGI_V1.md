@@ -35,6 +35,8 @@ concurrency = 1                     # exchanges per server at once, 1-256, defau
 index = "doku.php"                  # front controller and directory index, default "index.php"
 connect_timeout = 5                 # seconds, 1-3600: waiting for a slot, then the TCP connect
 response_timeout = 60               # seconds, 1-3600: backend inactivity, head and body
+keep_connections = true             # reuse a connection across exchanges (FCGI_KEEP_CONN)
+resolve_cache = 1                   # seconds, 0-60: reuse a path's script resolution; 0 = every request
 ```
 
 `php-cgi` on Windows serves one connection at a time per process, so each
@@ -64,6 +66,29 @@ Traversal, encoded separators, NUL, drive and stream syntax are refused
 junction for example, is `403`. Because the canonical root is a verbatim
 `\\?\` path, `app.php.` and `app.php%20` name no file (Windows does not strip
 the dot or space beneath such a path) and go to the front controller.
+
+**Resolution cache (`resolve_cache`, default 1 s, owner decision 2026-10-19).**
+When a request path resolves to a script -- a named `.php` file or the front
+controller -- that result is reused for the same raw request path for
+`resolve_cache` seconds without touching the filesystem. Static files,
+directories, refusals and `404`s are resolved on every request, and the host's
+`deny_paths`/`deny_names` policy is applied to every request, cached or not.
+At most 4,096 paths are remembered per location; when full, expired entries go
+first and then all of them, so client-chosen paths cannot grow it. What this
+changes, stated plainly: a script deleted, a new file that would now be served
+statically, or a junction created or retargeted under the root is seen up to
+`resolve_cache` seconds late for a path already cached. A junction that exists
+when a path is first resolved is still refused. The containment check was
+never a guarantee against a concurrent namespace change for scripts, because
+`php-cgi` opens `SCRIPT_FILENAME` by its path after Hamster checked it; the
+cache widens that existing window from microseconds to at most the configured
+period. `resolve_cache = 0` restores a resolution on every request.
+
+Why: on this Windows host each filesystem open through the blocking pool
+costs tens of microseconds of CPU, same-file opens stop scaling at about 40,000
+per second, and a script resolution is several of them. A build that skipped
+resolution for repeated paths ran the classic cells 1.75x (C1) and 1.85x (C16)
+faster, with Hamster's own CPU per request falling from 206-289 us to 75-81 us.
 
 **The root is otherwise served.** Hamster has no `.htaccess`. An application
 that relies on Apache deny rules needs an explicit host-wide file access
@@ -113,7 +138,28 @@ CVE-2016-5385).
 
 ## Exchange
 
-One TCP connection per request (`FCGI_KEEP_CONN` off). The request body is
+With `keep_connections = true` (the default, 2026-10-19) every request sets
+`FCGI_KEEP_CONN`, and a connection is kept for the next exchange on the same
+server when its exchange ended cleanly: END_REQUEST was read, nothing followed
+it in the read buffer, and the whole request body including its end record
+was sent. Every other ending -- a timeout, a malformed or truncated response,
+a client that disconnects, a script that answered before its body was sent,
+`HEAD` -- closes the connection. A kept connection is checked with a
+non-blocking peek before reuse and discarded if the backend closed it or
+wrote to it while idle; a fresh connection is then opened to the same server.
+The connection is the slot: at most `concurrency` connections exist per
+server, so a single-connection `php-cgi` is never left waiting on a second
+one. A backend that closes a kept connection between the check and the
+request makes that request a `502`, never a retry (at-most-once is unchanged).
+`keep_connections = false` restores one connection per request.
+
+Measured on Windows against `php-cgi` with a minimal script, from a direct
+FastCGI client: 320-330 us of wall time and 120-135 us of `php-cgi` CPU per
+request with a new connection each time, against 66-72 us and 37-63 us on a
+kept one. Through Hamster, the classic hello C1 cell went from 1,516 to 3,293
+requests/s and the json C16 cell from 6,844 to 10,726 (`doc/BENCHMARKS.md`).
+
+The request body is
 streamed as `FCGI_STDIN` by its own task while the response is read, so a
 script that answers, or writes more than a socket buffer, before reading its
 input cannot deadlock against Hamster. A request body needs `Content-Length`
@@ -143,9 +189,14 @@ after its HTTP waiter disappears; this does not roll back work already sent.
 The response head is the CGI header block (at most 64 KiB, else `502`):
 `Status:` sets the status, `Location:` without `Status:` is `302`, headers
 repeat as PHP sent them (both `Set-Cookie` lines survive), and hop-by-hop
-fields, `Content-Length` and `Server` from the backend are dropped. The body
-is streamed as PHP produces it: output PHP flushes reaches the client before
-the script ends, and there is no response size limit. `FCGI_STDERR` lines are
+fields, `Content-Length` and `Server` from the backend are dropped. Records
+that arrived together with the head are read without waiting: when they
+already contain END_REQUEST and at most 64 KiB of output -- the usual shape
+of a small page -- the exchange ends there, its connection goes back to the
+idle list and its slot is released before the response is handed to Hyper,
+and the client gets the exact `Content-Length` Hamster counted. Otherwise the
+body is streamed as PHP produces it: output PHP flushes reaches the client
+before the script ends, and there is no response size limit. `FCGI_STDERR` lines are
 written to Hamster's stderr prefixed `FastCGI <host><path> stderr:`.
 
 Failures:
@@ -158,7 +209,8 @@ Failures:
 | Every server tried and refused | `502 FastCGI Unavailable` |
 | No response bytes within `response_timeout` before the head | `504 FastCGI Response Timeout` |
 | Empty, malformed or oversized head | `502 FastCGI Error` |
-| Backend silent or gone after the head | the response ends without its final chunk: never mistaken for complete |
+| Backend gone with the head, before anything reached the client | `502 FastCGI Error` |
+| Backend silent or gone later in the body | the response ends without its final chunk: never mistaken for complete |
 | Client body stalls past `body_read_timeout` before the head | `408` |
 
 A request is never sent twice: once `FCGI_BEGIN_REQUEST` is written, the
@@ -221,12 +273,13 @@ No real PMS, MySQL or Redis was used.
 - Endpoints are operator-managed: a dead `php-cgi` is skipped but never
   restarted by Hamster; `PHP_FCGI_MAX_REQUESTS` must be `0` or the process exits
   after that many requests (500 by default).
-- One connection per request; no keep-alive to the backend. The Windows load
-  measurement is reported in `doc/BENCHMARKS.md`; its variability does not
-  isolate TCP connect overhead, so connection reuse is not justified yet.
+- Kept connections are verified against `php-cgi` 8.5.10 on Windows. A
+  backend that mishandles `FCGI_KEEP_CONN` can be served with
+  `keep_connections = false`. PHP-FPM and Linux are not verified.
 - Request bodies need `Content-Length`; chunked uploads are `411`.
 - A timed-out or disconnected request's script keeps running in PHP.
-- The backend's `Content-Length` is dropped, so script responses are chunked
+- The backend's `Content-Length` is dropped. A response that arrived whole
+  with its head carries the length Hamster counted; a streamed one is chunked
   (HTTP/1.1) or close-delimited (HTTP/1.0).
 - No `.htaccess`, rewrite rules or per-directory PHP settings; use host-wide
   `deny_paths`/`deny_names` for private content.

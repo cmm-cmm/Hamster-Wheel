@@ -15,9 +15,11 @@ use crate::access::AccessPolicy;
 use crate::body_budget::BodyBudget;
 use crate::fastcgi::{
     DEFAULT_CONNECT_TIMEOUT as FASTCGI_DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_INDEX as FASTCGI_DEFAULT_INDEX,
+    DEFAULT_INDEX as FASTCGI_DEFAULT_INDEX, DEFAULT_RESOLVE_CACHE as FASTCGI_DEFAULT_RESOLVE_CACHE,
     DEFAULT_RESPONSE_TIMEOUT as FASTCGI_DEFAULT_RESPONSE_TIMEOUT, FastCgiBackend, FastCgiConfig,
-    MAX_CONCURRENCY as FASTCGI_MAX_CONCURRENCY, MAX_SERVERS as FASTCGI_MAX_SERVERS,
+    MAX_CONCURRENCY as FASTCGI_MAX_CONCURRENCY,
+    MAX_RESOLVE_CACHE_SECONDS as FASTCGI_MAX_RESOLVE_CACHE_SECONDS,
+    MAX_SERVERS as FASTCGI_MAX_SERVERS,
 };
 use crate::php_worker::{
     DEFAULT_REQUEST_TIMEOUT, DEFAULT_STARTUP_TIMEOUT, MAX_QUEUE_CAPACITY, MAX_REQUEST_BODY,
@@ -251,6 +253,8 @@ struct RawFastCgi {
     index: Option<String>,
     connect_timeout: Option<u64>,
     response_timeout: Option<u64>,
+    keep_connections: Option<bool>,
+    resolve_cache: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -962,6 +966,8 @@ enum ValidatedHandler {
         index: String,
         connect_timeout: Duration,
         response_timeout: Duration,
+        keep_connections: bool,
+        resolve_cache: Duration,
     },
 }
 
@@ -1442,6 +1448,16 @@ fn validate_fastcgi(
             FASTCGI_DEFAULT_RESPONSE_TIMEOUT,
             "response_timeout",
         )?,
+        keep_connections: fastcgi.keep_connections.unwrap_or(true),
+        resolve_cache: match fastcgi.resolve_cache {
+            None => FASTCGI_DEFAULT_RESOLVE_CACHE,
+            Some(value @ 0..=FASTCGI_MAX_RESOLVE_CACHE_SECONDS) => Duration::from_secs(value),
+            Some(_) => {
+                return Err(ConfigError::Validation(format!(
+                    "{context}.fastcgi.resolve_cache must be between 0 and {FASTCGI_MAX_RESOLVE_CACHE_SECONDS} seconds"
+                )));
+            }
+        },
     })
 }
 
@@ -1737,6 +1753,8 @@ pub(crate) fn compile_validated_from(
                     index,
                     connect_timeout,
                     response_timeout,
+                    keep_connections,
+                    resolve_cache,
                 } => {
                     let document_root = canonical_directory(
                         &resolved_root,
@@ -1747,7 +1765,7 @@ pub(crate) fn compile_validated_from(
                     )?;
                     let label = format!("{}{}", host.name, location.path);
                     let fingerprint = format!(
-                        "{}|{index:?}|{servers:?}|{concurrency}|{connect_timeout:?}|{response_timeout:?}",
+                        "{}|{index:?}|{servers:?}|{concurrency}|{connect_timeout:?}|{response_timeout:?}|{keep_connections}|{resolve_cache:?}",
                         document_root.display()
                     );
                     identity.fastcgi.insert(label.clone(), fingerprint.clone());
@@ -1767,6 +1785,8 @@ pub(crate) fn compile_validated_from(
                             concurrency,
                             connect_timeout,
                             response_timeout,
+                            keep_connections,
+                            resolve_cache,
                         }),
                     };
                     fastcgi_backends.push(Arc::clone(&backend));

@@ -7,9 +7,16 @@
 //! Hamster does not manage the endpoint processes in this slice.
 //!
 //! One location owns one `FastCgiBackend`: its document root, its servers and
-//! a fixed number of exchange slots (`servers x concurrency`). An exchange is
-//! one TCP connection with one request (`FCGI_KEEP_CONN` off), which is what
-//! `php-cgi` on Windows serves: one connection at a time per process.
+//! a fixed number of exchange slots (`servers x concurrency`). `php-cgi` on
+//! Windows serves one connection at a time per process.
+//!
+//! With `keep_connections` (the default) every request asks the backend to
+//! keep its connection (`FCGI_KEEP_CONN`), and a connection whose exchange
+//! ended cleanly -- END_REQUEST read, nothing buffered after it, the whole
+//! request body sent -- waits in its server's idle list for the next exchange
+//! on that server. Measured against `php-cgi` on Windows, opening a
+//! connection per request cost about 250 us of the 320 us a minimal script
+//! took. Any other ending closes the connection.
 //!
 //! ```text
 //! request path --resolve--> static file | script + PATH_INFO | front controller
@@ -19,7 +26,10 @@
 //!
 //! At-most-once: a request is sent to another server only when connecting
 //! failed, so nothing was sent. Once `FCGI_BEGIN_REQUEST` is written the
-//! exchange is never repeated.
+//! exchange is never repeated. An idle connection is checked before reuse and
+//! discarded if the backend closed it or sent anything while idle; a backend
+//! that closes it between that check and the request answers 502 like any
+//! other failure after the request was sent, and is never retried.
 
 use std::{
     fmt, io,
@@ -74,9 +84,18 @@ const STDIN: u8 = 5;
 const STDOUT: u8 = 6;
 const STDERR: u8 = 7;
 const RESPONDER: u16 = 1;
+/// `FCGI_KEEP_CONN`: the backend keeps the connection after END_REQUEST.
+const KEEP_CONN: u8 = 1;
 const REQUEST_ID: u16 = 1;
 const MAX_CONTENT: usize = 65_535;
 const FAILURE_NOTICE_PERIOD_MS: u64 = 60_000;
+/// Output already received with the head, up to this size, is collected so
+/// that an exchange whose END_REQUEST has also arrived finishes at once.
+const EARLY_BODY_LIMIT: usize = 64 * 1024;
+/// Bound on remembered script resolutions per location.
+const RESOLVE_CACHE_ENTRIES: usize = 4096;
+pub const DEFAULT_RESOLVE_CACHE: Duration = Duration::from_secs(1);
+pub const MAX_RESOLVE_CACHE_SECONDS: u64 = 60;
 #[cfg(windows)]
 const MAX_BLOCKING_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -96,6 +115,11 @@ pub struct FastCgiConfig {
     pub connect_timeout: Duration,
     /// Inactivity while waiting for backend output, head and body alike.
     pub response_timeout: Duration,
+    /// Reuse a connection for later exchanges on the same server.
+    pub keep_connections: bool,
+    /// How long a request path's script resolution is reused. Zero resolves
+    /// every request.
+    pub resolve_cache: Duration,
 }
 
 /// Counters for one backend. Reading them never touches the request path.
@@ -111,6 +135,12 @@ pub struct FastCgiSnapshot {
     pub timeouts: u64,
     /// Missing, malformed or truncated responses.
     pub backend_failures: u64,
+    /// TCP connections opened to a server.
+    pub connections_opened: u64,
+    /// Exchanges that ran on a kept connection instead of a new one.
+    pub connections_reused: u64,
+    /// Requests whose script came from the resolution cache.
+    pub resolutions_reused: u64,
 }
 
 #[derive(Default)]
@@ -122,6 +152,17 @@ struct Counters {
     busy_refusals: AtomicU64,
     timeouts: AtomicU64,
     backend_failures: AtomicU64,
+    connections_opened: AtomicU64,
+    connections_reused: AtomicU64,
+    resolutions_reused: AtomicU64,
+}
+
+/// A request path's script, as resolution found it, until `until`.
+struct CachedScript {
+    filename: PathBuf,
+    script_name: String,
+    path_info: String,
+    until: std::time::Instant,
 }
 
 pub struct FastCgiBackend {
@@ -135,6 +176,11 @@ pub struct FastCgiBackend {
     #[cfg(windows)]
     blocking_connect_slots: Arc<Semaphore>,
     in_flight: Box<[AtomicUsize]>,
+    /// Kept connections per server, at most `concurrency` each: a connection
+    /// exists only while its exchange holds that server's claim or waits here.
+    idle: Box<[std::sync::Mutex<Vec<TcpStream>>]>,
+    /// Script resolutions by raw request path, at most `RESOLVE_CACHE_ENTRIES`.
+    resolved: std::sync::Mutex<std::collections::HashMap<Box<str>, CachedScript>>,
     next: AtomicUsize,
     counters: Counters,
     #[cfg(feature = "profiling")]
@@ -164,6 +210,12 @@ impl FastCgiBackend {
             #[cfg(windows)]
             blocking_connect_slots: Arc::new(Semaphore::new(permits)),
             in_flight: config.servers.iter().map(|_| AtomicUsize::new(0)).collect(),
+            idle: config
+                .servers
+                .iter()
+                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .collect(),
+            resolved: std::sync::Mutex::new(std::collections::HashMap::new()),
             next: AtomicUsize::new(0),
             counters: Counters::default(),
             #[cfg(feature = "profiling")]
@@ -194,7 +246,86 @@ impl FastCgiBackend {
             busy_refusals: counters.busy_refusals.load(Ordering::Relaxed),
             timeouts: counters.timeouts.load(Ordering::Relaxed),
             backend_failures: counters.backend_failures.load(Ordering::Relaxed),
+            connections_opened: counters.connections_opened.load(Ordering::Relaxed),
+            connections_reused: counters.connections_reused.load(Ordering::Relaxed),
+            resolutions_reused: counters.resolutions_reused.load(Ordering::Relaxed),
         }
+    }
+
+    /// The script `uri_path` resolved to, if that was within `resolve_cache`.
+    fn cached_script(&self, uri_path: &str) -> Option<Target> {
+        if self.config.resolve_cache.is_zero() {
+            return None;
+        }
+        let cache = self
+            .resolved
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let entry = cache.get(uri_path)?;
+        if std::time::Instant::now() >= entry.until {
+            return None;
+        }
+        self.counters
+            .resolutions_reused
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Target::Script {
+            filename: entry.filename.clone(),
+            script_name: entry.script_name.clone(),
+            path_info: entry.path_info.clone(),
+        })
+    }
+
+    /// Remembers a script resolution. Request paths are chosen by clients and
+    /// a front controller turns any of them into a script, so the cache is
+    /// bounded: when full it first drops expired entries, then everything.
+    fn remember_script(&self, uri_path: &str, filename: &Path, script_name: &str, path_info: &str) {
+        if self.config.resolve_cache.is_zero() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut cache = self
+            .resolved
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cache.len() >= RESOLVE_CACHE_ENTRIES && !cache.contains_key(uri_path) {
+            cache.retain(|_, entry| entry.until > now);
+            if cache.len() >= RESOLVE_CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            uri_path.into(),
+            CachedScript {
+                filename: filename.to_path_buf(),
+                script_name: script_name.to_owned(),
+                path_info: path_info.to_owned(),
+                until: now + self.config.resolve_cache,
+            },
+        );
+    }
+
+    /// A kept connection to `server` that the backend has neither closed nor
+    /// written to since its last exchange ended. The caller holds that
+    /// server's claim.
+    fn take_idle(&self, server: usize) -> Option<TcpStream> {
+        loop {
+            let candidate = self.idle[server]
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop()?;
+            if quiet(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    /// Keeps a connection whose exchange ended cleanly for the next exchange
+    /// on `server`. The caller still holds that server's claim.
+    fn keep_idle(&self, server: usize, stream: TcpStream) {
+        self.idle[server]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(stream);
     }
 
     #[cfg(feature = "profiling")]
@@ -261,6 +392,31 @@ impl FastCgiBackend {
             FAILURE_NOTICE_PERIOD_MS / 1_000
         );
     }
+}
+
+/// Whether an idle connection is still open and silent: a non-blocking peek
+/// on the socket itself reports would-block. End of stream means the backend
+/// closed it; data is a protocol violation between exchanges; either way it
+/// is not reused. The peek is a direct system call rather than a reactor
+/// read, whose readiness may not yet reflect a close that already arrived.
+fn quiet(stream: &TcpStream) -> bool {
+    #[cfg(windows)]
+    let socket = {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+        // SAFETY: the socket stays owned by `stream`, which outlives this
+        // borrowed view; `ManuallyDrop` keeps the view from closing it.
+        std::mem::ManuallyDrop::new(unsafe {
+            std::net::TcpStream::from_raw_socket(stream.as_raw_socket())
+        })
+    };
+    #[cfg(unix)]
+    let socket = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: as above, for the file descriptor.
+        std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(stream.as_raw_fd()) })
+    };
+    let mut probe = [0_u8; 1];
+    matches!(socket.peek(&mut probe), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
 }
 
 /// The permit owns the active-exchange count, including while a Windows
@@ -687,6 +843,15 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
     pub(crate) async fn next(&mut self) -> io::Result<Option<Record>> {
         std::future::poll_fn(|cx| self.poll_record(cx)).await
     }
+
+    /// Whether bytes past the last returned record have already been read.
+    fn has_buffered(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
 }
 
 // ----- Serving --------------------------------------------------------------
@@ -705,12 +870,38 @@ pub(crate) async fn serve(
     if request.method() == Method::CONNECT {
         return simple_response(StatusCode::NOT_IMPLEMENTED, "Not Implemented");
     }
+    // A script found for this path within `resolve_cache` is used again
+    // without touching the filesystem: on Windows each open costs tens of
+    // microseconds and the opens serialize under concurrency, and PHP opens
+    // the script by its path anyway. Static files and refusals are always
+    // resolved afresh, and the access policy below applies to every request.
+    if let Some(target) = backend.cached_script(request.uri().path()) {
+        return serve_target(
+            backend,
+            access,
+            request,
+            connection,
+            body_read_timeout,
+            target,
+        )
+        .await;
+    }
     let root = backend.config.document_root.clone();
     let index = backend.config.index.clone();
     let uri_path = request.uri().path().to_owned();
     let target = match tokio::task::spawn_blocking(move || resolve(&root, &index, &uri_path)).await
     {
-        Ok(Ok(target)) => target,
+        Ok(Ok(target)) => {
+            if let Target::Script {
+                filename,
+                script_name,
+                path_info,
+            } = &target
+            {
+                backend.remember_script(request.uri().path(), filename, script_name, path_info);
+            }
+            target
+        }
         Ok(Err(error)) => {
             errln!(
                 "FastCGI {}: resolving a request path failed: {error}",
@@ -726,6 +917,26 @@ pub(crate) async fn serve(
             return simple_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
         }
     };
+    serve_target(
+        backend,
+        access,
+        request,
+        connection,
+        body_read_timeout,
+        target,
+    )
+    .await
+}
+
+/// Serves what a request path resolved to, fresh or from the cache alike.
+async fn serve_target(
+    backend: &Arc<FastCgiBackend>,
+    access: &AccessPolicy,
+    request: Request<Incoming>,
+    connection: ConnectionInfo,
+    body_read_timeout: Duration,
+    target: Target,
+) -> HandlerResponse {
     match target {
         Target::BadRequest => simple_response(StatusCode::BAD_REQUEST, "Bad Request"),
         Target::Forbidden => simple_response(StatusCode::FORBIDDEN, "Forbidden"),
@@ -886,13 +1097,52 @@ fn cgi_params(
     out
 }
 
-#[derive(Debug)]
 enum WriterEnd {
-    Done,
+    /// The whole body and its end record were sent. The write half comes back
+    /// so that a kept connection can be reassembled.
+    Done(WriteHalf<BackendStream>),
     /// The client's body did not arrive within `body_read_timeout`.
     ClientTimedOut,
     ClientFailed,
     BackendFailed,
+}
+
+/// The request-sending side of one exchange.
+enum Writer {
+    /// The body is still being streamed by its own task.
+    Sending(JoinHandle<WriterEnd>),
+    /// Everything was sent; the write half is held, never shut down, because
+    /// a half-closed socket may read to a backend as an aborted request.
+    Sent(WriteHalf<BackendStream>),
+    /// Aborted or failed: the connection cannot be kept.
+    Gone,
+}
+
+impl Writer {
+    fn abort(&mut self) {
+        if let Self::Sending(task) = std::mem::replace(self, Self::Gone) {
+            task.abort();
+        }
+    }
+
+    /// The write half, if the whole request is known to have been sent.
+    fn poll_sent(&mut self, cx: &mut Context<'_>) -> Option<WriteHalf<BackendStream>> {
+        if let Self::Sending(task) = self
+            && task.is_finished()
+        {
+            *self = match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok(WriterEnd::Done(half))) => Self::Sent(half),
+                _ => Self::Gone,
+            };
+        }
+        match std::mem::replace(self, Self::Gone) {
+            Self::Sent(half) => Some(half),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
 }
 
 async fn run_script(
@@ -945,15 +1195,26 @@ async fn run_script(
             return simple_response(StatusCode::BAD_GATEWAY, "FastCGI Unavailable");
         };
         tried.push(server);
-        let address = backend.config.servers[server];
         let attempt = ConnectAttempt::new(
             backend,
             server,
             permit.take().expect("one permit per exchange"),
         );
+        if let Some(stream) = backend.take_idle(server) {
+            backend
+                .counters
+                .connections_reused
+                .fetch_add(1, Ordering::Relaxed);
+            break (attempt.into_slot(), stream);
+        }
+        let address = backend.config.servers[server];
         match connect_server(backend, address, attempt).await {
             ConnectOutcome::Connected(attempt, stream) => {
                 let _ = stream.set_nodelay(true);
+                backend
+                    .counters
+                    .connections_opened
+                    .fetch_add(1, Ordering::Relaxed);
                 break (attempt.into_slot(), stream);
             }
             ConnectOutcome::Failed(attempt, error) => {
@@ -981,9 +1242,14 @@ async fn run_script(
 
     let mut preamble = Vec::with_capacity(params.len() + 64);
     let [role_high, role_low] = RESPONDER.to_be_bytes();
+    let flags = if backend.config.keep_connections {
+        KEEP_CONN
+    } else {
+        0
+    };
     record(
         BEGIN_REQUEST,
-        &[role_high, role_low, 0, 0, 0, 0, 0, 0],
+        &[role_high, role_low, flags, 0, 0, 0, 0, 0],
         &mut preamble,
     );
     stream_records(PARAMS, &params, &mut preamble);
@@ -1002,14 +1268,13 @@ async fn run_script(
     let written = std::time::Instant::now();
 
     let mut writer_task = if has_body {
-        Some(tokio::spawn(write_body(
+        Writer::Sending(tokio::spawn(write_body(
             request.into_body(),
             writer,
             body_deadline,
         )))
     } else {
-        drop(writer);
-        None
+        Writer::Sent(writer)
     };
 
     let mut reader = RecordReader::new(reader);
@@ -1029,13 +1294,13 @@ async fn run_script(
         Ok((head, rest)) => match parse_head(&head) {
             Ok(mut response) => {
                 if is_head {
-                    abort(writer_task.take());
+                    writer_task.abort();
                     drop(slot);
                     *response.body_mut() = ResponseBody::buffered(Bytes::new());
                     return response;
                 }
-                let body = FastCgiBody {
-                    reader,
+                let mut body = FastCgiBody {
+                    reader: Some(reader),
                     pending: (!rest.is_empty()).then_some(rest),
                     deadline: ProgressDeadline::new(backend.config.response_timeout),
                     writer: writer_task,
@@ -1043,10 +1308,17 @@ async fn run_script(
                     finished: false,
                 };
                 let (parts, _) = response.into_parts();
-                Response::from_parts(parts, ResponseBody::fastcgi(body))
+                let body = match body.finish_if_arrived() {
+                    Arrived::Whole(bytes) => ResponseBody::buffered(bytes),
+                    Arrived::Failed => {
+                        return simple_response(StatusCode::BAD_GATEWAY, "FastCGI Error");
+                    }
+                    Arrived::Partly => ResponseBody::fastcgi(body),
+                };
+                Response::from_parts(parts, body)
             }
             Err(problem) => {
-                abort(writer_task.take());
+                writer_task.abort();
                 backend.record_failure(
                     &backend.counters.backend_failures,
                     format_args!("invalid response head: {problem}"),
@@ -1055,7 +1327,7 @@ async fn run_script(
             }
         },
         Err(failure) => {
-            abort(writer_task.take());
+            writer_task.abort();
             drop(slot);
             match failure {
                 HeadFailure::TimedOut => {
@@ -1090,12 +1362,6 @@ fn stream_records(kind: u8, content: &[u8], out: &mut Vec<u8>) {
     stream(kind, content, out);
 }
 
-fn abort(task: Option<JoinHandle<WriterEnd>>) {
-    if let Some(task) = task {
-        task.abort();
-    }
-}
-
 /// Streams the client's body as FCGI_STDIN, concurrently with the response:
 /// a script that answers before reading its input, or writes more than a
 /// socket buffer before reading, must not deadlock against this writer.
@@ -1128,10 +1394,7 @@ async fn write_body(
     if writer.write_all(&end).await.is_err() {
         return WriterEnd::BackendFailed;
     }
-    // Keep the write half open: closing it would half-close the socket, and a
-    // backend may treat that as an abort before it has answered.
-    std::future::pending::<()>().await;
-    WriterEnd::Done
+    WriterEnd::Done(writer)
 }
 
 #[derive(Debug)]
@@ -1147,13 +1410,13 @@ enum HeadFailure {
 async fn read_head(
     backend: &FastCgiBackend,
     reader: &mut RecordReader<ReadHalf<BackendStream>>,
-    writer: &mut Option<JoinHandle<WriterEnd>>,
+    writer: &mut Writer,
 ) -> Result<(Vec<u8>, Bytes), HeadFailure> {
     let mut head = Vec::new();
     loop {
         let next = async {
-            match writer.as_mut() {
-                Some(task) if !task.is_finished() => {
+            match writer {
+                Writer::Sending(task) => {
                     tokio::select! {
                         biased;
                         record = reader.next() => Ok(record),
@@ -1166,13 +1429,15 @@ async fn read_head(
         let record = match timeout(backend.config.response_timeout, next).await {
             Err(_) => return Err(HeadFailure::TimedOut),
             Ok(Err(end)) => {
-                *writer = None;
+                *writer = Writer::Gone;
                 match end {
+                    Ok(WriterEnd::Done(half)) => *writer = Writer::Sent(half),
                     Ok(WriterEnd::ClientTimedOut) => return Err(HeadFailure::ClientTimedOut),
                     Ok(WriterEnd::ClientFailed) => return Err(HeadFailure::ClientFailed),
                     // The backend may still answer; keep reading.
-                    _ => continue,
+                    Ok(WriterEnd::BackendFailed) | Err(_) => {}
                 }
+                continue;
             }
             Ok(Ok(record)) => record,
         };
@@ -1297,10 +1562,11 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// The response body: FCGI_STDOUT after the head, until FCGI_END_REQUEST.
 /// It owns the exchange slot and the request-body writer.
 pub(crate) struct FastCgiBody {
-    reader: RecordReader<ReadHalf<BackendStream>>,
+    /// `None` only once the body has finished.
+    reader: Option<RecordReader<ReadHalf<BackendStream>>>,
     pending: Option<Bytes>,
     deadline: ProgressDeadline,
-    writer: Option<JoinHandle<WriterEnd>>,
+    writer: Writer,
     slot: Option<Slot>,
     finished: bool,
 }
@@ -1314,11 +1580,68 @@ impl fmt::Debug for FastCgiBody {
     }
 }
 
+/// What `finish_if_arrived` found already received.
+enum Arrived {
+    /// The whole body and END_REQUEST: the exchange is over.
+    Whole(Bytes),
+    /// The response failed before anything was sent to the client.
+    Failed,
+    /// More is coming; the body streams, holding what arrived so far.
+    Partly,
+}
+
 impl FastCgiBody {
+    /// Reads, without waiting, the records that have already arrived. A
+    /// response that ends within them -- the common case for a small page,
+    /// whose END_REQUEST arrives with its output -- completes the exchange
+    /// here: the connection returns to its server's idle list and the slot is
+    /// released before the response is even handed to Hyper, instead of after
+    /// Hyper has written the head and polled the body to its end.
+    fn finish_if_arrived(&mut self) -> Arrived {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut collected = BytesMut::new();
+        loop {
+            match Pin::new(&mut *self).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        collected.extend_from_slice(&data);
+                    }
+                    if collected.len() > EARLY_BODY_LIMIT {
+                        break;
+                    }
+                }
+                Poll::Ready(None) => return Arrived::Whole(collected.freeze()),
+                Poll::Ready(Some(Err(_))) => return Arrived::Failed,
+                Poll::Pending => break,
+            }
+        }
+        if !collected.is_empty() {
+            self.pending = Some(collected.freeze());
+        }
+        Arrived::Partly
+    }
+
     fn end(&mut self) {
         self.finished = true;
-        abort(self.writer.take());
+        self.reader = None;
+        self.writer.abort();
         drop(self.slot.take());
+    }
+
+    /// END_REQUEST was read. The connection is kept only when nothing
+    /// follows it in the buffer and the whole request was sent; the slot is
+    /// released after the connection is back in the idle list, so the next
+    /// exchange on this server finds it.
+    fn complete(&mut self, cx: &mut Context<'_>) {
+        if let Some(slot) = &self.slot
+            && slot.backend.config.keep_connections
+            && let Some(reader) = self.reader.take_if(|reader| !reader.has_buffered())
+            && let Some(write_half) = self.writer.poll_sent(cx)
+        {
+            let stream = reader.into_inner().unsplit(write_half).into_inner();
+            slot.backend.keep_idle(slot.server, stream);
+        }
+        self.end();
     }
 
     fn fail(&mut self, what: String) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
@@ -1349,7 +1672,10 @@ impl Body for FastCgiBody {
             return Poll::Ready(Some(Ok(Frame::data(pending))));
         }
         loop {
-            match this.reader.poll_record(cx) {
+            let Some(reader) = this.reader.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match reader.poll_record(cx) {
                 Poll::Pending => {
                     return match this.deadline.poll_stalled(cx) {
                         Poll::Ready(()) => {
@@ -1376,7 +1702,7 @@ impl Body for FastCgiBody {
                             }
                         }
                         END_REQUEST => {
-                            this.end();
+                            this.complete(cx);
                             return Poll::Ready(None);
                         }
                         _ => {}
@@ -1402,7 +1728,7 @@ impl Body for FastCgiBody {
 
 impl Drop for FastCgiBody {
     fn drop(&mut self) {
-        abort(self.writer.take());
+        self.writer.abort();
     }
 }
 

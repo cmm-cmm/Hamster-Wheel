@@ -119,14 +119,18 @@ concurrency = 1               # 1-256 exchanges per server at once
 index = "index.php"           # relative .php path: front controller and directory index
 connect_timeout = 5           # seconds, 1-3600: waiting for a slot, then the connect
 response_timeout = 60         # seconds, 1-3600: backend inactivity
+keep_connections = true       # keep connections for later exchanges (FCGI_KEEP_CONN)
+resolve_cache = 1             # seconds, 0-60: reuse a path's script resolution; 0 = off
 ```
 
 `php-cgi` on Windows serves one connection at a time, so each process is one
 `servers` entry with `concurrency = 1`. Hostnames are refused rather than
 resolved. On Windows, that single-exchange configuration uses a bounded
 blocking-pool TCP connect when `connect_timeout <= 5`; longer timeouts and
-multiplexing endpoints use async connect. Each request still opens a fresh
-connection. A canceled HTTP waiter cannot send a FastCGI request from a
+multiplexing endpoints use async connect, and only for a server that has no
+kept connection: with `keep_connections` (the default) a connection whose
+exchange ended cleanly serves the next exchange on that server, and the
+connect cost is paid once per connection (`doc/FASTCGI_V1.md`). A canceled HTTP waiter cannot send a FastCGI request from a
 detached connect task. If that task has not started, its exchange slot is
 released immediately; if it has started, the slot is held until connect
 returns. Queued blocking connect work is capped per location, with async

@@ -1296,8 +1296,13 @@ fn validates_and_compiles_fastcgi_locations() {
     assert_eq!(backend.servers(), ["127.0.0.1:9000".parse().unwrap()]);
 
     let full = block(
-        "concurrency = 4\nindex = \"app/front.php\"\nconnect_timeout = 2\nresponse_timeout = 120",
+        "concurrency = 4\nindex = \"app/front.php\"\nconnect_timeout = 2\nresponse_timeout = 120\nkeep_connections = false\nresolve_cache = 60",
     );
+    config::compile_str(
+        &location("root = \"public\"", &block("resolve_cache = 0")),
+        &temporary.path,
+    )
+    .expect("a zero resolve_cache turns the cache off");
     config::compile_str(&location("root = \"public\"", &full), &temporary.path)
         .expect("every field in range compiles");
 
@@ -1319,6 +1324,7 @@ fn validates_and_compiles_fastcgi_locations() {
         ("root = \"public\"", "index = \"c:index.php\"", None),
         ("root = \"public\"", "connect_timeout = 0", None),
         ("root = \"public\"", "response_timeout = 3601", None),
+        ("root = \"public\"", "resolve_cache = 61", None),
         (
             "root = \"public\"\nphp = { executable = \"php.exe\", script = \"w.php\" }",
             "",

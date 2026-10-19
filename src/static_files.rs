@@ -19,6 +19,11 @@ use crate::{
 };
 
 const INDEX_FILE: &str = "index.html";
+/// A GET for a file of at most this many bytes reads it in the blocking task
+/// that opened and validated it, instead of streaming it through a later read
+/// on the blocking pool. One request then costs one blocking-pool round trip,
+/// and the memory it holds is bounded by this size.
+const SMALL_FILE: u64 = 64 * 1_024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PathError {
@@ -42,8 +47,16 @@ struct ResolvedFile {
     /// Location of the served object. On Windows this is the final resolved
     /// location of the opened handle, which is also what containment checked.
     path: PathBuf,
-    file: tokio::fs::File,
+    content: FileContent,
     length: u64,
+}
+
+enum FileContent {
+    /// The whole file, read through the validated handle.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Read(Bytes),
+    /// The validated handle, to stream.
+    Open(tokio::fs::File),
 }
 
 pub async fn serve(
@@ -72,7 +85,7 @@ async fn respond(
     uri_path: &str,
     access: &AccessPolicy,
 ) -> Response<ResponseBody> {
-    match resolve_file(document_root, uri_path).await {
+    match resolve_file(document_root, uri_path, !is_head).await {
         Ok(file)
             if access.denies_final_path(document_root, &file.path) || is_php_source(&file.path) =>
         {
@@ -83,11 +96,13 @@ async fn respond(
             ResponseBody::buffered(Bytes::new()),
             file.length,
         ),
-        Ok(file) => file_response(
-            &file.path,
-            ResponseBody::file(file.file, file.length),
-            file.length,
-        ),
+        Ok(file) => {
+            let body = match file.content {
+                FileContent::Read(bytes) => ResponseBody::buffered(bytes),
+                FileContent::Open(handle) => ResponseBody::file(handle, file.length),
+            };
+            file_response(&file.path, body, file.length)
+        }
         Err(error) => error_response(error),
     }
 }
@@ -110,18 +125,51 @@ fn relative_request_path(uri_path: &str) -> Result<PathBuf, FileError> {
 /// `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`; both sides of the comparison
 /// therefore share one representation and the filesystem's stored name casing.
 #[cfg(windows)]
-async fn resolve_file(document_root: &Path, uri_path: &str) -> Result<ResolvedFile, FileError> {
+async fn resolve_file(
+    document_root: &Path,
+    uri_path: &str,
+    read_small: bool,
+) -> Result<ResolvedFile, FileError> {
     let relative = relative_request_path(uri_path)?;
     let document_root = document_root.to_path_buf();
-    let (path, file, length) =
-        tokio::task::spawn_blocking(move || open_contained(&document_root, relative))
-            .await
-            .map_err(|error| FileError::Io(io::Error::other(error)))??;
-    Ok(ResolvedFile {
-        path,
-        file: tokio::fs::File::from_std(file),
-        length,
+    tokio::task::spawn_blocking(move || {
+        let (path, file, length) = open_contained(&document_root, relative)?;
+        if read_small && length <= SMALL_FILE {
+            let (bytes, length) = read_whole(file, length).map_err(map_io_error)?;
+            return Ok(ResolvedFile {
+                path,
+                content: FileContent::Read(bytes),
+                length,
+            });
+        }
+        Ok(ResolvedFile {
+            path,
+            content: FileContent::Open(tokio::fs::File::from_std(file)),
+            length,
+        })
     })
+    .await
+    .map_err(|error| FileError::Io(io::Error::other(error)))?
+}
+
+/// Reads at most `length` bytes, the size the validated handle reported. A
+/// file that shrank since is served as what was read, with that length; one
+/// that grew is cut at the reported size, as the streamed path does.
+#[cfg(windows)]
+fn read_whole(mut file: std::fs::File, length: u64) -> io::Result<(Bytes, u64)> {
+    use std::io::Read;
+    let mut buffer = vec![0_u8; usize::try_from(length).unwrap_or(usize::MAX)];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    buffer.truncate(filled);
+    Ok((Bytes::from(buffer), filled as u64))
 }
 
 #[cfg(windows)]
@@ -130,20 +178,22 @@ fn open_contained(
     relative: PathBuf,
 ) -> Result<(PathBuf, std::fs::File, u64), FileError> {
     let mut candidate = document_root.join(relative);
-    // Index selection only: this lookup decides which name to open and is not
-    // a containment check. A directory cannot be opened without
+    // Index selection only: this decides which name to open and is not a
+    // containment check. A directory cannot be opened without
     // FILE_FLAG_BACKUP_SEMANTICS, which also changes access checks when the
     // backup privilege is enabled, so the served handle is never opened that
-    // way. If the namespace changes after this lookup, the object that is
-    // opened is still validated below.
-    if std::fs::metadata(&candidate)
-        .map_err(map_io_error)?
-        .is_dir()
-    {
-        candidate.push(INDEX_FILE);
-    }
-
-    let file = std::fs::File::open(&candidate).map_err(map_io_error)?;
+    // way: opening one fails, and only then is the name looked up as a
+    // directory. A file, the common case, costs one open instead of a
+    // metadata query (itself an open on Windows) followed by an open. If the
+    // namespace changes in between, the object that is opened is still
+    // validated below.
+    let file = match open_unless_directory(&candidate).map_err(map_io_error)? {
+        Some(file) => file,
+        None => {
+            candidate.push(INDEX_FILE);
+            std::fs::File::open(&candidate).map_err(map_io_error)?
+        }
+    };
     #[cfg(test)]
     test_seam::reached(test_seam::Checkpoint::Opened, &candidate);
 
@@ -161,6 +211,24 @@ fn open_contained(
         return Err(FileError::NotFound);
     }
     Ok((final_location, file, metadata.len()))
+}
+
+/// Opens `candidate` for reading, or returns `None` when it names a directory.
+/// Opening a directory without backup semantics fails with access denied, so
+/// the metadata query runs only on that failure; any other failure, and access
+/// denied on something that is not a directory, is returned as it was.
+#[cfg(windows)]
+fn open_unless_directory(candidate: &Path) -> io::Result<Option<std::fs::File>> {
+    match std::fs::File::open(candidate) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            match std::fs::metadata(candidate) {
+                Ok(metadata) if metadata.is_dir() => Ok(None),
+                _ => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// `GetFinalPathNameByHandleW` with `FILE_NAME_NORMALIZED | VOLUME_NAME_DOS`,
@@ -215,7 +283,11 @@ fn final_path_of(file: &std::fs::File) -> io::Result<PathBuf> {
 /// This does not provide the opened-handle guarantee of the Windows path and
 /// is not qualified against concurrent namespace changes.
 #[cfg(not(windows))]
-async fn resolve_file(document_root: &Path, uri_path: &str) -> Result<ResolvedFile, FileError> {
+async fn resolve_file(
+    document_root: &Path,
+    uri_path: &str,
+    _read_small: bool,
+) -> Result<ResolvedFile, FileError> {
     let relative = relative_request_path(uri_path)?;
     let mut candidate = document_root.join(relative);
 
@@ -243,7 +315,7 @@ async fn resolve_file(document_root: &Path, uri_path: &str) -> Result<ResolvedFi
 
     Ok(ResolvedFile {
         path: canonical,
-        file,
+        content: FileContent::Open(file),
         length: metadata.len(),
     })
 }
@@ -316,16 +388,9 @@ pub(crate) enum Lookup {
 #[cfg(windows)]
 pub(crate) fn lookup_within(document_root: &Path, relative: &Path) -> io::Result<Lookup> {
     let candidate = document_root.join(relative);
-    let metadata = match std::fs::metadata(&candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if is_missing(&error) => return Ok(Lookup::Missing),
-        Err(error) => return Err(error),
-    };
-    if metadata.is_dir() {
-        return Ok(Lookup::Directory);
-    }
-    let file = match std::fs::File::open(&candidate) {
-        Ok(file) => file,
+    let file = match open_unless_directory(&candidate) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(Lookup::Directory),
         Err(error) if is_missing(&error) => return Ok(Lookup::Missing),
         Err(error) => return Err(error),
     };

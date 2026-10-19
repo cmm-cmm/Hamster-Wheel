@@ -93,6 +93,11 @@ impl<T> WriteProgressTimeout<T> {
         }
     }
 
+    /// The wrapped I/O, for a caller that keeps it beyond this deadline's use.
+    pub(crate) fn into_inner(self) -> T {
+        self.inner
+    }
+
     fn observe_write(
         &mut self,
         cx: &mut Context<'_>,

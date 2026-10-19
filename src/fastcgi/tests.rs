@@ -21,8 +21,8 @@ use tokio::{
 };
 
 use super::{
-    BEGIN_REQUEST, END_REQUEST, FastCgiBackend, FastCgiConfig, PARAMS, RecordReader, STDERR, STDIN,
-    STDOUT, Target, record, resolve,
+    BEGIN_REQUEST, END_REQUEST, FastCgiBackend, FastCgiConfig, KEEP_CONN, PARAMS, RecordReader,
+    STDERR, STDIN, STDOUT, Target, record, resolve,
 };
 use crate::{
     config::HttpLimits,
@@ -299,6 +299,8 @@ impl Server {
             concurrency: 1,
             connect_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(5),
+            keep_connections: false,
+            resolve_cache: Duration::ZERO,
         };
         tweak(&mut config);
         let backend = FastCgiBackend::new(config);
@@ -475,8 +477,11 @@ async fn cgi_variables_and_the_body_reach_the_backend_and_the_response_streams_b
     assert!(reply.complete);
     assert_eq!(reply.all("set-cookie"), ["a=1", "b=2"]);
     assert_eq!(reply.all("content-type"), ["text/plain"]);
-    assert!(
-        reply.all("content-length").is_empty(),
+    // The backend claimed 99 bytes. Its length is never trusted; a response
+    // that arrived whole is sent with the length Hamster actually counted.
+    assert_eq!(
+        reply.all("content-length"),
+        ["5"],
         "the backend's length is not trusted"
     );
 
@@ -748,14 +753,18 @@ async fn a_backend_that_closes_mid_body_never_produces_a_complete_response() {
     });
     let raw = raw_exchange(server.address, GET).await;
     backend.await.unwrap();
-    // Hyper closes the connection when a body fails and may not flush what it
-    // had buffered, so the client can see nothing at all. Whatever it sees,
-    // the response never looks complete.
+    // A close that has already arrived with the head is seen before anything
+    // reaches the client, which then gets a 502. A later close fails the body
+    // after commit: Hyper closes the connection and may not flush what it had
+    // buffered, so the client can see nothing at all. Whatever it sees, a
+    // response never looks complete.
     if !raw.is_empty() {
         let answer = parse_reply(&raw);
-        assert_eq!(answer.status, 200);
-        assert!(b"half".starts_with(&answer.body));
-        assert!(!answer.complete);
+        if answer.status != 502 {
+            assert_eq!(answer.status, 200);
+            assert!(b"half".starts_with(&answer.body));
+            assert!(!answer.complete);
+        }
     }
     assert_eq!(server.backend.snapshot().backend_failures, 1);
     server.stop().await;
@@ -865,6 +874,8 @@ async fn canceled_blocking_connect_keeps_its_slot_until_the_attempt_exits() {
         concurrency: 1,
         connect_timeout: Duration::from_secs(1),
         response_timeout: Duration::from_secs(1),
+        keep_connections: false,
+        resolve_cache: Duration::ZERO,
     });
     let permit = Arc::clone(&backend.slots).acquire_owned().await.unwrap();
     backend
@@ -938,6 +949,8 @@ fn queued_connect_timeout_and_cancellation_release_slots_before_blocking_pool_re
             concurrency: 1,
             connect_timeout: Duration::from_millis(100),
             response_timeout: Duration::from_secs(1),
+            keep_connections: false,
+            resolve_cache: Duration::ZERO,
         });
         let permit = Arc::clone(&backend.slots).acquire_owned().await.unwrap();
         backend
@@ -1188,4 +1201,300 @@ fn backend_paths_drop_the_verbatim_prefix() {
         r"\\server\share\app"
     );
     assert_eq!(super::display_path(Path::new("/srv/app")), "/srv/app");
+}
+
+// ----- Kept connections -----------------------------------------------------
+
+/// Reads one kept-connection request from a reader that persists across the
+/// connection's exchanges: BEGIN_REQUEST must ask for FCGI_KEEP_CONN.
+async fn receive_kept<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut RecordReader<R>,
+    read_stdin: bool,
+) -> Received {
+    let begin = reader.next().await.unwrap().unwrap();
+    assert_eq!(begin.kind, BEGIN_REQUEST);
+    assert_eq!(
+        &begin.content[..3],
+        &[0, 1, KEEP_CONN],
+        "responder role, keep-conn"
+    );
+    let mut params = Vec::new();
+    loop {
+        let record = reader.next().await.unwrap().unwrap();
+        assert_eq!(record.kind, PARAMS);
+        if record.content.is_empty() {
+            break;
+        }
+        params.extend_from_slice(&record.content);
+    }
+    let mut received = Received {
+        params: decode_params(&params),
+        stdin: Vec::new(),
+    };
+    if read_stdin {
+        loop {
+            let record = reader.next().await.unwrap().unwrap();
+            assert_eq!(record.kind, STDIN);
+            if record.content.is_empty() {
+                break;
+            }
+            received.stdin.extend_from_slice(&record.content);
+        }
+    }
+    received
+}
+
+fn keep(config: &mut FastCgiConfig) {
+    config.keep_connections = true;
+}
+
+fn ok_reply(body: &[u8]) -> Vec<u8> {
+    let mut head = b"Content-Type: text/plain\r\n\r\n".to_vec();
+    head.extend_from_slice(body);
+    records(&[(STDOUT, &head)], true)
+}
+
+#[tokio::test]
+async fn kept_connections_carry_consecutive_requests_and_their_bodies() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], keep).await;
+    let backend = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.split();
+        let mut reader = RecordReader::new(read);
+        let mut bodies = Vec::new();
+        for round in 0..3_u8 {
+            let received = receive_kept(&mut reader, true).await;
+            bodies.push(received.stdin);
+            write.write_all(&ok_reply(&[b'0' + round])).await.unwrap();
+        }
+        let second = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+        (bodies, second.is_err())
+    });
+
+    let get = exchange(server.address, GET).await;
+    let post = exchange(
+        server.address,
+        b"POST /app.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    )
+    .await;
+    let again = exchange(server.address, GET).await;
+    let (bodies, no_second_connection) = backend.await.unwrap();
+
+    assert_eq!((get.status, get.body.as_slice()), (200, &b"0"[..]));
+    assert_eq!((post.status, post.body.as_slice()), (200, &b"1"[..]));
+    assert_eq!((again.status, again.body.as_slice()), (200, &b"2"[..]));
+    assert_eq!(bodies, [b"".to_vec(), b"hello".to_vec(), b"".to_vec()]);
+    assert!(no_second_connection);
+    let snapshot = server.backend.snapshot();
+    assert_eq!(
+        (snapshot.connections_opened, snapshot.connections_reused),
+        (1, 2)
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_kept_connection_the_backend_closed_while_idle_is_replaced() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], keep).await;
+    let backend = tokio::spawn(async move {
+        for round in 0..2_u8 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = RecordReader::new(&mut stream);
+            receive_kept(&mut reader, true).await;
+            drop(reader);
+            stream.write_all(&ok_reply(&[b'0' + round])).await.unwrap();
+            // Closing after the answer leaves Hamster an idle connection
+            // that is already dead when the next request arrives.
+        }
+    });
+
+    let first = exchange(server.address, GET).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second = exchange(server.address, GET).await;
+    backend.await.unwrap();
+
+    assert_eq!((first.status, first.body.as_slice()), (200, &b"0"[..]));
+    assert_eq!((second.status, second.body.as_slice()), (200, &b"1"[..]));
+    let snapshot = server.backend.snapshot();
+    assert_eq!(
+        (snapshot.connections_opened, snapshot.connections_reused),
+        (2, 0)
+    );
+    assert_eq!(snapshot.backend_failures, 0);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_connection_is_not_kept_when_its_request_body_was_not_all_sent() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], keep).await;
+    let backend = tokio::spawn(async move {
+        // The first script answers without reading its input, so the body
+        // writer is still sending when END_REQUEST arrives.
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut reader = RecordReader::new(&mut first);
+        receive_kept(&mut reader, false).await;
+        drop(reader);
+        first.write_all(&ok_reply(b"early")).await.unwrap();
+        let (mut second, _) = listener.accept().await.unwrap();
+        let mut reader = RecordReader::new(&mut second);
+        receive_kept(&mut reader, true).await;
+        drop(reader);
+        second.write_all(&ok_reply(b"fresh")).await.unwrap();
+        drop(first);
+    });
+
+    let body = vec![b'x'; 4 * 1024 * 1024];
+    let mut request = format!(
+        "POST /app.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    let early = exchange(server.address, &request).await;
+    let fresh = exchange(server.address, GET).await;
+    backend.await.unwrap();
+
+    assert_eq!((early.status, early.body.as_slice()), (200, &b"early"[..]));
+    assert_eq!((fresh.status, fresh.body.as_slice()), (200, &b"fresh"[..]));
+    let snapshot = server.backend.snapshot();
+    assert_eq!(
+        (snapshot.connections_opened, snapshot.connections_reused),
+        (2, 0)
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn bytes_after_end_request_keep_the_connection_from_being_reused() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], keep).await;
+    let backend = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut reader = RecordReader::new(&mut first);
+        receive_kept(&mut reader, true).await;
+        drop(reader);
+        let mut reply = ok_reply(b"one");
+        record(STDOUT, b"stray", &mut reply);
+        first.write_all(&reply).await.unwrap();
+        let (mut second, _) = listener.accept().await.unwrap();
+        let mut reader = RecordReader::new(&mut second);
+        receive_kept(&mut reader, true).await;
+        drop(reader);
+        second.write_all(&ok_reply(b"two")).await.unwrap();
+        drop(first);
+    });
+
+    let one = exchange(server.address, GET).await;
+    let two = exchange(server.address, GET).await;
+    backend.await.unwrap();
+
+    assert_eq!((one.status, one.body.as_slice()), (200, &b"one"[..]));
+    assert_eq!((two.status, two.body.as_slice()), (200, &b"two"[..]));
+    assert_eq!(server.backend.snapshot().connections_opened, 2);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn without_keep_connections_every_exchange_opens_its_own_connection() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], |_| {}).await;
+    let backend = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            receive(&mut stream, true).await;
+            stream.write_all(&ok_reply(b"x")).await.unwrap();
+        }
+    });
+    assert_eq!(exchange(server.address, GET).await.status, 200);
+    assert_eq!(exchange(server.address, GET).await.status, 200);
+    backend.await.unwrap();
+    let snapshot = server.backend.snapshot();
+    assert_eq!(
+        (snapshot.connections_opened, snapshot.connections_reused),
+        (2, 0)
+    );
+    server.stop().await;
+}
+
+// ----- Resolution cache -----------------------------------------------------
+
+async fn answer_scripts(listener: TcpListener, count: usize) {
+    for _ in 0..count {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        receive(&mut stream, true).await;
+        stream.write_all(&ok_reply(b"ran")).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_script_resolution_is_reused_only_until_resolve_cache_expires() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], |config| {
+        config.resolve_cache = Duration::from_millis(500);
+    })
+    .await;
+    let backend = tokio::spawn(answer_scripts(listener, 2));
+
+    assert_eq!(exchange(server.address, GET).await.status, 200);
+    std::fs::remove_file(server._root.path.join("app.php")).unwrap();
+    // Within the cache period the script that was found is still run; PHP
+    // itself would report the missing file.
+    assert_eq!(exchange(server.address, GET).await.status, 200);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Once it expires, the path is resolved again and the backend is not
+    // contacted for a script that no longer exists.
+    assert_eq!(exchange(server.address, GET).await.status, 404);
+    backend.await.unwrap();
+
+    let snapshot = server.backend.snapshot();
+    assert_eq!((snapshot.scripts, snapshot.resolutions_reused), (2, 1));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn without_resolve_cache_every_request_resolves_afresh() {
+    let (listener, address) = fake().await;
+    let server = Server::start(vec![address], |_| {}).await;
+    let backend = tokio::spawn(answer_scripts(listener, 1));
+
+    assert_eq!(exchange(server.address, GET).await.status, 200);
+    std::fs::remove_file(server._root.path.join("app.php")).unwrap();
+    assert_eq!(exchange(server.address, GET).await.status, 404);
+    backend.await.unwrap();
+
+    assert_eq!(server.backend.snapshot().resolutions_reused, 0);
+    server.stop().await;
+}
+
+#[test]
+fn the_resolution_cache_stays_bounded_whatever_paths_clients_send() {
+    let root = Root::new(&[("index.php", "front")]);
+    let backend = FastCgiBackend::new(FastCgiConfig {
+        label: Arc::from("bounded/"),
+        document_root: root.path.clone(),
+        index: "index.php".to_owned(),
+        servers: vec!["127.0.0.1:9".parse().unwrap()],
+        concurrency: 1,
+        connect_timeout: Duration::from_secs(1),
+        response_timeout: Duration::from_secs(1),
+        keep_connections: true,
+        resolve_cache: Duration::from_secs(60),
+    });
+    let script = root.path.join("index.php");
+    for request in 0..super::RESOLVE_CACHE_ENTRIES + 10 {
+        backend.remember_script(&format!("/{request}"), &script, "/index.php", "");
+        assert!(backend.resolved.lock().unwrap().len() <= super::RESOLVE_CACHE_ENTRIES);
+    }
+    assert!(
+        backend.cached_script("/0").is_none(),
+        "the full cache was dropped"
+    );
+    assert!(
+        backend
+            .cached_script(&format!("/{}", super::RESOLVE_CACHE_ENTRIES + 9))
+            .is_some()
+    );
 }

@@ -1,6 +1,53 @@
 # AI Handoff
 
-## Current: dev-linux merged, and the follow-ups it left (2026-10-18)
+## Current: performance against FrankenPHP on Windows (2026-10-19)
+
+Owner direction: no release work for now; close the measured gap to
+FrankenPHP. Windows first. Numbers and method: `doc/BENCHMARKS.md`, *Hamster
+vs FrankenPHP — Windows, same host, and the FastCGI/static fixes*.
+
+FACT, before: on this Windows host Hamster lost classic FastCGI badly (0.38-
+0.41x) and small static files at C32 (0.77-0.85x), won the worker path
+(1.7-2.0x), and was 0.89-0.98x on Laravel.
+
+FACT, changed and measured:
+- FastCGI keeps connections (`FCGI_KEEP_CONN`, `keep_connections`, default
+  on); a connection is kept only after a clean END_REQUEST with nothing
+  buffered after it and the whole request body sent, checked with a direct
+  non-blocking peek before reuse. 5 unit tests.
+- Windows static/FastCGI lookups open first and query metadata only when the
+  open is refused; static GETs of <= 64 KiB are read in the validating
+  blocking task.
+- A FastCGI response that arrived whole with its head finishes its exchange
+  before Hyper; it now carries an exact `Content-Length`, and a backend that
+  closes before anything reached the client is a 502 instead of a truncated
+  200 (two existing tests updated for that).
+- `resolve_cache` (default 1 s, 0-60, owner decision 2026-10-19) reuses a
+  request path's *script* resolution; static, refusals and the access policy
+  are evaluated every request. 3 unit tests; semantics in
+  `doc/FASTCGI_V1.md`.
+- Result: every cell wins or ties except Laravel C1 (0.88-0.89x): static
+  1.02-1.26x, worker 1.6-2.05x, classic 1.70x (C1) and 1.33x (C16).
+
+FACT, incident: the first benchmark driver stopped servers by a parent-PID
+process tree and killed the operator's VS Code (PID reuse). Fixed: it stops
+only the process it started; descendants are counted only if created after
+their parent. `benchmarks/laravel_pms_0_4.ps1` and `laravel_pms_soak_0_4.ps1`
+still select `php.exe` by ParentProcessId -- fix before running them.
+
+Verified for this commit: fmt, clippy `--all-targets --all-features -D
+warnings`, `cargo test` (310 passed), the eight fixture tests of
+`tests/php_cgi.rs` against real `php-cgi`. NOT run: the full ignored suites,
+the mutation set prepared for the new guards, the complete A/B against
+`4d933fc` with the fixed driver, Linux (the new static read and
+`open_unless_directory` are Windows-only; the cache and kept connections are
+portable code, unverified there).
+
+Next: re-run the A/B and the two cells whose memory/CPU were contaminated;
+run the mutations and the full Windows gate; profile Laravel C1 (the adapter's
+request reconstruction is the inference, not a measurement).
+
+## Previous: dev-linux merged, and the follow-ups it left (2026-10-18)
 
 `dev-linux` is merged at `a3c4412`, the two signal gaps are fixed at
 `96aa0b1`, and this section covers the rest. The Linux work itself is

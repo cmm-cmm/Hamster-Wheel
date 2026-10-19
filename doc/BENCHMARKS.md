@@ -2372,3 +2372,119 @@ Not measured: any remote client, on either platform; TLS; and the PHP and
 FastCGI cells on Windows, which are single-write responses that the Linux A/B
 found unaffected.
 
+
+## Hamster vs FrankenPHP — Windows, same host, and the FastCGI/static fixes (2026-10-19)
+
+Driver: `benchmarks/frankenphp_windows.py` (new), the Windows counterpart of
+`frankenphp_linux.py`. Same cells plus a `baseline` group (404 with no file or
+PHP) and static 64 KiB / 1 MiB. Each cell runs each arm three times in the
+order A B B A A B, a fresh server per run; reported values are the median run.
+Client `oha` 1.16.0 on the same host, HTTP/1.1 keep-alive. CPU is user+kernel
+time of the server's process tree (plus the four `php-cgi` processes in
+Hamster's classic cells) over the measured run, divided by requests.
+
+Conditions: Windows 11 Pro 26200, 12 logical CPUs, on-access scanning enabled,
+release `x86_64-pc-windows-msvc` builds. Hamster uses the repository PHP 8.5.10
+NTS (`php.exe` workers, `php-cgi.exe` for classic: four processes on four
+ports, `concurrency = 1` each). FrankenPHP 1.12.7 (Caddy 2.11.4, PHP 8.5.10
+ZTS), `num_threads` = workers + 1, `num_threads 4` for classic, its own
+`php.ini` through `PHPRC`. Laravel cells use the stand-in `www/pms-scratch`
+built by `prepare_scratch_app.ps1` (not the PMS), OPcache on for both.
+
+Run-to-run drift of the host was about 15% between groups (FrankenPHP's own
+static C1 median moved from 4,749 to 4,089 between two groups), so only ratios
+inside one interleaved group are compared.
+
+### Before the changes (`4d933fc`)
+
+| Cell | Hamster RPS | FrankenPHP RPS | Ratio | CPU us/req H / F |
+|---|---:|---:|---:|---|
+| static 22 B C1 | 5,769 | 4,749 | 1.21 | 174 / 225 |
+| static 22 B C32 | 9,728 | 12,578 | 0.77 | 316 / 313 |
+| static 64 KiB C32 | 8,234 | 9,673 | 0.85 | 424 / 411 |
+| static 1 MiB C8 | 4,899 | 4,366 | 1.12 | 1,231 / 1,144 |
+| worker hello W1 C1 | 6,438 | 3,797 | 1.70 | 202 / 298 |
+| worker hello W4 C32 | 39,995 | 20,249 | 1.98 | 173 / 288 |
+| classic hello C1 | 1,516 | 3,698 | 0.41 | 747 / 266 |
+| classic json C16 | 6,844 | 18,078 | 0.38 | 825 / 330 |
+| laravel /login C1 / C16 | 710 / 3,043 | 798 / 3,234 | 0.89 / 0.94 | 1,411 / 1,490, 1,428 / 1,489 |
+| laravel welcome C1 / C16 | 644 / 2,421 | 706 / 2,465 | 0.91 / 0.98 | 1,438 / 1,664, 1,838 / 1,881 |
+
+### Where the cost was
+
+- `baseline` (404, no file, no PHP): Hamster 24-34 us of CPU per request
+  against Caddy's 41-78, so the HTTP layer was never the gap.
+- A direct FastCGI client against one `php-cgi`: a new connection per request
+  cost 320-330 us of wall time and 120-135 us of `php-cgi` CPU; a kept
+  connection (`FCGI_KEEP_CONN`) 66-72 us and 37-63 us.
+- `benches/windows_filesystem -- operations`: each filesystem call through the
+  blocking pool cost 37-70 us of CPU, same-file metadata stopped scaling at
+  about 40,000 per second whatever the concurrency, and the full static
+  resolution sequence cost 220 us at C1.
+- A build that skipped FastCGI script resolution for repeated paths ran the
+  classic cells 1.75x (C1) and 1.85x (C16) faster than the build with the
+  first three fixes, Hamster's own CPU falling from 206-289 to 75-81 us.
+
+### Changes measured
+
+1. FastCGI kept connections (`keep_connections`, default on).
+2. Windows static and FastCGI lookups open the candidate first and query
+   metadata only if that open is refused (a metadata query is itself an open
+   on Windows); a static GET of <= 64 KiB is read in the same blocking task.
+3. A FastCGI response that arrived whole with its head ends its exchange
+   before it is handed to Hyper.
+4. FastCGI script-resolution cache (`resolve_cache`, default 1 s; owner
+   decision).
+
+### A/B against `4d933fc`, changes 1-3 (interleaved, same group)
+
+| Cell | Base RPS | New RPS | Ratio | CPU us/req base / new |
+|---|---:|---:|---:|---|
+| not_found C1 / C32 (control) | 21,381 / 121,123 | 20,018 / 123,253 | 0.94 / 1.02 | 28 / 30, 29 / 31 |
+| static 22 B C1 | 4,858 | 5,163 | 1.06 | 204 / 169 |
+| static 22 B C32 | 9,012 | 12,072 | 1.34 | 348 / 284 |
+| static 64 KiB C32 | 8,531 | 11,399 | 1.34 | 422 / 322 |
+| static 1 MiB C8 | 4,637 | 4,941 | 1.07 | 1,200 / 1,172 |
+| classic hello C1 | 1,527 | 3,869 | 2.53 | 712 / 250 |
+| classic json C16 | 6,985 | 13,003 | 1.86 | 812 / 439 |
+
+The control cells did not change code; their spread is the noise floor. The
+A/B of all four changes against `4d933fc` was started and stopped before it
+finished (see the measurement defect below) and is not reported.
+
+### After all four changes, against FrankenPHP
+
+| Cell | Hamster RPS | FrankenPHP RPS | Ratio | CPU us/req H / F | p99 ms H / F |
+|---|---:|---:|---:|---|---|
+| not_found C1 / C32 | 20,899 / 113,770 | 15,416 / 109,194 | 1.36 / 1.04 | 28 / 76, 33 / 43 | 0.12 / 0.15, 0.62 / 2.18 |
+| static 22 B C1 | 5,076 | 4,184 | 1.21 | 175 / 254 | 0.42 / 0.45 |
+| static 22 B C32 | 12,071 | 11,821 | 1.02 | 292 / 350 | 3.28 / 8.36 |
+| static 64 KiB C32 | 11,354 | 9,680 | 1.17 | 340 / 424 | 3.65 / 27.21 |
+| static 1 MiB C8 | 4,765 | 3,769 | 1.26 | 1,203 / 1,309 | 2.97 / 3.90 |
+| worker hello / json / echo W1 C1 | 5,754 / 5,654 / 5,424 | 3,420 / 3,493 / 3,313 | 1.68 / 1.62 / 1.64 | 209-243 / 320-327 | 0.30 / 0.51 |
+| worker hello W4 C4 | 22,428 | 11,337 | 1.98 | not reported | 0.29 / 0.69 |
+| worker hello W4 C32 | 35,533 | 17,304 | 2.05 | 169 / 325 | 1.43 / 5.05 |
+| classic hello C1 | 5,805 | 3,414 | 1.70 | 162 / 344 | 0.38 / 0.55 |
+| classic json C16 | 23,091 | 17,423 | 1.33 | 205 / 380 | 0.99 / 1.79 |
+| laravel /login C1 / C16 | 649 / 2,890 | 737 / 2,918 | 0.88 / 0.99 | 1,641 / 1,521, 1,548 / 1,616 | 2.36 / 2.20, 7.10 / 7.35 |
+| laravel welcome C1 / C16 | 530 / 2,265 | 593 / 2,141 | 0.89 / 1.06 | not reported, 1,941 / 2,103 | 2.91 / 2.80, 9.18 / 10.06 |
+
+Zero errors and zero unexpected statuses in every run. Memory, private bytes
+(commit charge), which does not count shared pages once per process: Laravel
+W4 94-113 MiB for Hamster against 101-127 for FrankenPHP; the 240-260 MiB
+reported before for Hamster on Linux was RSS, which does. The remaining loss
+is Laravel at C1 (0.88-0.89); the HTTP and FastCGI layers are not where it is
+(inference: the Laravel adapter's request reconstruction in PHP; not
+profiled).
+
+**Measurement defect, found and fixed during this run.** The first version
+of the driver found a server's descendants by parent process ID. Windows
+reuses process IDs and keeps a child's recorded parent ID after the parent
+exits, so unrelated processes were counted -- the Laravel welcome C1 and
+worker W4 C4 cells reported 4,782 and 181 MiB of private bytes, and their CPU
+may include foreign processes -- and, because the same tree was used to stop
+the server, an unrelated application (the operator's VS Code) was killed.
+The driver now stops only the process it started and counts a descendant only
+if it was created after its parent. The two cells' memory and CPU are not
+reported; their RPS is unaffected. Not yet re-run with the fixed driver: the
+full A/B against `4d933fc`, and those two cells.

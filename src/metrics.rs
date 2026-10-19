@@ -534,6 +534,18 @@ const FASTCGI_SERIES: &[(&str, &str, &str, FastCgiPick)] = &[
         "counter",
         |snapshot| snapshot.backend_failures,
     ),
+    (
+        "hamster_fastcgi_connections_opened_total",
+        "TCP connections opened to FastCGI servers",
+        "counter",
+        |snapshot| snapshot.connections_opened,
+    ),
+    (
+        "hamster_fastcgi_connections_reused_total",
+        "FastCGI exchanges that ran on a kept connection",
+        "counter",
+        |snapshot| snapshot.connections_reused,
+    ),
 ];
 
 fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
