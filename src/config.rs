@@ -42,6 +42,19 @@ use crate::tls::{
 
 pub const SERVER_NAME: &str = concat!("HamsterWheel/", env!("CARGO_PKG_VERSION"));
 
+/// The version this build reports, without the product name.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What tree this build came from: `git describe` at build time, or
+/// `unknown` when built outside a repository.
+///
+/// Deliberately absent from the `Server:` header, which a client reads: a
+/// version number is all a client needs, and a commit identifies the build
+/// to whoever can already see the machine. It is reported where an operator
+/// looks instead — `--validate`, the control endpoint's `status`, the
+/// `started` lifecycle record, and the `hamster_build_info` metric.
+pub const BUILD_STAMP: &str = env!("HAMSTER_BUILD_STAMP");
+
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_DOCUMENT_ROOT: &str = "public";
 const DEFAULT_MAX_CONNECTIONS: usize = 1_024;

@@ -326,9 +326,9 @@ Required for an edge-capable 1.0:
   cancellation and backend contracts;
 - cross-platform packaging, upgrade/rollback instructions and compatibility
   matrices (`doc/PACKAGING_UPGRADE_ROLLBACK.md` covers deployment, the upgrade
-  and rollback sequences and the compatibility rule; still open there: an
-  installer or package, code signing, a version resource in the executable and
-  a version number that identifies the build);
+  and rollback sequences, the compatibility rule and, since the version
+  resource and build stamp, artifact identification; still open there: an
+  installer or package, and code signing);
 - long mixed-workload, connection, memory, worker, FastCGI, proxy, reload and
   TLS failure soaks;
 - security review of HTTP parsing policy, forwarding trust, filesystem

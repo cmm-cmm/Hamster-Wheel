@@ -21,6 +21,14 @@ use crate::config::RuntimeConfig;
 pub fn report(config: &RuntimeConfig) -> String {
     let mut out = String::with_capacity(1_024);
     out.push_str("configuration=ok\n");
+    // Which build read the file. A deployment that validates with one binary
+    // and starts another has learned nothing, so the answer names itself.
+    let _ = writeln!(
+        out,
+        "version={} build={}",
+        crate::config::VERSION,
+        single_line(crate::config::BUILD_STAMP)
+    );
 
     if let Some(address) = config.listen_address() {
         let _ = writeln!(out, "listener=http://{address}");

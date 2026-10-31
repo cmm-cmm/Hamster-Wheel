@@ -178,6 +178,19 @@ impl MetricsView<'_> {
             "1 when this server should be sent application traffic",
             u64::from(ready),
         );
+        // One series, labelled from compile-time constants: a scrape can group
+        // by build without the label set growing with traffic.
+        let _ = writeln!(
+            out,
+            "# HELP hamster_build_info The version and tree this binary was built from"
+        );
+        let _ = writeln!(out, "# TYPE hamster_build_info gauge");
+        let _ = writeln!(
+            out,
+            "hamster_build_info{{version=\"{}\",build=\"{}\"}} 1",
+            escape_label(crate::config::VERSION),
+            escape_label(crate::config::BUILD_STAMP)
+        );
         gauge(
             &mut out,
             "hamster_config_generation",

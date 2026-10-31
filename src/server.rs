@@ -118,7 +118,8 @@ pub async fn run(config: Arc<RuntimeConfig>) -> Result<(), ServerError> {
                 event::STARTED,
                 "pid" = std::process::id(),
                 "generation" = config.generation(),
-                "version" = crate::config::SERVER_NAME,
+                "version" = crate::config::VERSION,
+                "build" = crate::config::BUILD_STAMP,
             );
             (Some(log), Some(writer))
         }

@@ -262,6 +262,12 @@ mod protocol {
         let _ = writeln!(details, "generation={}", config.generation());
         let _ = writeln!(
             details,
+            "version={} build={}",
+            crate::config::VERSION,
+            single_line(crate::config::BUILD_STAMP)
+        );
+        let _ = writeln!(
+            details,
             "uptime_seconds={:.3}",
             started.elapsed().as_secs_f64()
         );

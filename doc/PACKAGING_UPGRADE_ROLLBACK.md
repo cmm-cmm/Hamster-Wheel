@@ -64,21 +64,45 @@ Ubuntu 24.04 with PHP built from source. musl and aarch64 are **NOT VERIFIED**.
 
 ## Identifying what is deployed
 
-This is the weakest part of the current artifact, and it is a release blocker
-rather than a detail:
+The executable says what it is, and the same answer is available from a
+running server. Windows file properties:
 
-- **The executable carries no version resource.** `icon/hamster-wheel.rc`
-  contains only `1 ICON`, so Windows file properties show an empty
-  `FileVersion`, `ProductVersion`, `CompanyName` and `FileDescription`. A
-  deployed `hamster-wheel.exe` cannot be identified by looking at it.
-- **The version it does report is stale.** `Cargo.toml` says `0.3.1`, so the
-  `Server:` header, `--validate` output and the `started` lifecycle record all
-  say `HamsterWheel/0.3.1` on a tree that contains the 0.5 through 0.8 work.
-  Two different builds months apart report the same string.
+```text
+FileVersion       0.8.0
+ProductVersion    0.8.0 (v0.3.1-51-g3c438fe29cec-dirty)
+ProductName       Hamster Wheel
+OriginalFilename  hamster-wheel.exe
+FileDescription   HTTP server with static files, routing, configuration, ...
+```
 
-Until both are fixed, record the commit you built from, outside the artifact,
-and keep it with the deployment. The fixes are small and independent: a
-`VERSIONINFO` block in the `.rc`, and an owner decision on the version number.
+`build.rs` generates the resource script from Cargo's version and `git
+describe --always --dirty --abbrev=12` at build time, so the version follows
+the package and the stamp follows the tree — including a `-dirty` suffix when
+the build came from uncommitted work, which is exactly what a deployed
+artifact should admit. A source tree without git still builds and stamps
+`unknown`.
+
+The same pair is reported where an operator looks, and nowhere a client does:
+
+```text
+hamster-wheel.exe --config ... --validate   version=0.8.0 build=v0.3.1-51-g...
+hamster-wheel.exe --config ... --control status   version=0.8.0 build=v0.3.1-51-g...
+/metrics    hamster_build_info{version="0.8.0",build="v0.3.1-51-g..."} 1
+the log     {"kind":"lifecycle","event":"started",...,"version":"0.8.0","build":"v0.3.1-51-g..."}
+```
+
+The `Server:` header deliberately carries the version only. A version number
+is all a client needs; the commit identifies the build to whoever can already
+see the machine.
+
+`tests/build_identity.rs` reads the resource back out of the built binary and
+requires `FILEVERSION` to match the package version, the strings to be
+present, and `--validate` to report the same build the resource does. Losing
+the resource again fails the suite rather than a deployment.
+
+The version number itself is `0.8.0`: the 0.8 scope in
+`doc/ROADMAP_0_5_TO_1_0.md` is met on Windows, and 0.9 is in progress. It is
+one line in `Cargo.toml` if the owner reads the milestone differently.
 
 ## Upgrading
 
