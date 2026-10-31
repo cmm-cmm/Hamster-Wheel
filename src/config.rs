@@ -664,7 +664,8 @@ impl fmt::Display for ConfigError {
                 source,
             } => write!(
                 formatter,
-                "failed to parse configuration {source_name}: {source}"
+                "failed to parse configuration {source_name}: {}",
+                located_parse_failure(source)
             ),
             Self::Validation(message) => write!(formatter, "invalid configuration: {message}"),
             Self::Compile(message) => {
@@ -856,6 +857,32 @@ fn compile_str_named(
 ) -> Result<RuntimeConfig, ConfigError> {
     let raw = parse_raw(source, source_name)?;
     compile_raw_from(raw, base_directory, selection, None)
+}
+
+/// A parse failure with its position and reason, and without the line it
+/// happened on.
+///
+/// The TOML error's own text includes a snippet of the source, and a
+/// configuration file holds secrets: `[hosts.locations.php] env` is where an
+/// application's database password and app key are written. A syntax error on
+/// such a line printed it verbatim to stderr, which a supervisor captures and
+/// a log shipper can forward off the host. The position and the parser's
+/// reason locate the problem for whoever can read the file; the file itself
+/// stays in the file.
+fn located_parse_failure(error: &toml::de::Error) -> String {
+    let text = error.to_string();
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return "unparseable".to_owned();
+    };
+    // Keeping only the first and last lines is deliberate rather than a
+    // filter over the snippet's shape: a future toml release could render the
+    // snippet differently, and a filter that stopped matching would start
+    // echoing the file again.
+    match lines.next_back() {
+        Some(reason) if reason != first => format!("{first}: {reason}"),
+        _ => first.to_owned(),
+    }
 }
 
 pub(crate) fn parse_raw(source: &str, source_name: &str) -> Result<RawConfig, ConfigError> {
@@ -2711,6 +2738,38 @@ path = \"ignored\"
         // silently reload something else.
         let in_memory = compile_str(&reloadable("127.0.0.1:8080", "."), Path::new(".")).unwrap();
         assert!(matches!(reload(&in_memory), Err(ConfigError::Reload(_))));
+    }
+
+    #[test]
+    fn a_parse_failure_names_where_it_happened_without_echoing_the_file() {
+        // `[hosts.locations.php] env` is where an application's database
+        // password and app key are written, and a configuration error is
+        // printed to stderr, which a supervisor captures and a log shipper
+        // can forward off the host. A syntax error on such a line used to
+        // print the line.
+        let secret = "s3cret-production-password";
+        let source = format!(
+            "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[hosts]]\nname = \"localhost\"\n\n\
+             [[hosts.locations]]\npath = \"/\"\nhandler = \"php_worker\"\n\n\
+             [hosts.locations.php]\nexecutable = \"php\"\nscript = \"worker.php\"\n\
+             env = {{ DB_PASSWORD = \"{secret}\\q\" }}\n"
+        );
+        let reported = match compile_str(&source, Path::new(".")) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the source should not parse"),
+        };
+        assert!(
+            !reported.contains(secret),
+            "the configuration was echoed: {reported}"
+        );
+        // What is left still locates the problem and says what it was.
+        assert!(reported.contains("line 14"), "{reported}");
+        assert!(reported.contains("column"), "{reported}");
+        assert!(reported.contains("escaped value"), "{reported}");
+        assert!(
+            !reported.contains('|'),
+            "a source snippet survived: {reported}"
+        );
     }
 
     #[test]

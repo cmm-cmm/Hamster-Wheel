@@ -333,6 +333,13 @@ Required for an edge-capable 1.0:
   TLS failure soaks;
 - security review of HTTP parsing policy, forwarding trust, filesystem
   containment, configuration secrets, admin exposure and backend isolation.
+  `doc/SECURITY_REVIEW_0_9.md` is that review for Windows: it found and fixed
+  one leak (configuration parse errors echoed the offending source line, where
+  a worker's `env` holds an application's database password) and records what
+  each surface enforces, which test proves it, and what is not covered. Still
+  open from it: no fuzzing, no race harness against the containment property,
+  no dependency audit, no third-party review, and nothing on Linux beyond
+  reading the paths that differ.
   Filesystem containment has a known opening: off Windows the file is opened by
   its canonical pathname after the containment check, which
   `src/static_files.rs` states and which is not qualified against concurrent
