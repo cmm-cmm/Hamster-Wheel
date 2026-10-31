@@ -189,18 +189,30 @@ server until that request ends — stated there by inference, not tested. No
 privilege separation: Hamster and its workers run as the same account, and
 nothing drops privileges.
 
-## Dependency advisories (checked 2026-10-31)
+## Dependency advisories (audited 2026-10-31)
 
-The tree is 111 crates. Checked against the RustSec database and OSV by name
-and pinned version, concentrating on the network, TLS, crypto and
-configuration-parsing paths. Three pins were inside an advisory range and were
-moved; the rest of the examined set was already clear.
+`cargo audit` 0.22.2 against 1,395 advisories from the RustSec database, over
+all 118 crates in `Cargo.lock`. Three pins were inside an advisory range and
+were moved. After the updates the tree is clean, including informational
+advisories:
 
-| Crate | Was | Now | Advisory |
-|---|---|---|---|
-| `rustls` | 0.23.45 | **0.23.46** | RUSTSEC-2026-0346, -0347, -0348, -0349 |
-| `rustls-webpki` | 0.103.15 | **0.103.16** | RUSTSEC-2026-0382, -0383 (CVE-2026-111943) |
-| `tokio` | 1.53.1 | **1.53.3** | RUSTSEC-2026-0386 |
+```text
+cargo audit                  118 crate dependencies, no findings
+cargo audit --deny warnings  118 crate dependencies, no findings
+```
+
+The same tool on the lockfile as it stood before the updates (`c89f102`)
+reports exactly the set below and nothing else — five vulnerabilities and one
+informational warning:
+
+| Crate | Was | Now | Advisory | Severity |
+|---|---|---|---|---|
+| `rustls` | 0.23.45 | **0.23.46** | RUSTSEC-2026-0346 `Debug` impls expose TLS secrets | 4.0 medium |
+| `rustls` | | | RUSTSEC-2026-0347 buffered application data after ECH rejection | 2.3 low |
+| `rustls` | | | RUSTSEC-2026-0348 Brotli certificate decompression allocates up to 1 GiB pre-authentication | 3.7 low |
+| `rustls` | | | RUSTSEC-2026-0349 unauthenticated ServerHello downgrades later connections | 3.7 low |
+| `rustls-webpki` | 0.103.15 | **0.103.16** | RUSTSEC-2026-0382 verification may accept distrusted intermediates | none given |
+| `tokio` | 1.53.1 | **1.53.3** | RUSTSEC-2026-0386 `AsyncFd::new` violates I/O safety | informational |
 
 What each one means for **this** server, because a version range is not an
 exposure:
@@ -220,9 +232,12 @@ exposure:
   `AsyncFd` constructors accept a raw descriptor, which can reach a
   use-after-free through descriptor reuse. `AsyncFd` is Unix-only and appears
   nowhere in this crate.
-- **RUSTSEC-2026-0382/-0383** sit in certificate-path validation, which a
-  server only performs when it verifies client certificates. Hamster does not
-  offer client authentication.
+- **RUSTSEC-2026-0382** sits in certificate-path validation, which a server
+  only performs when it verifies client certificates. Hamster does not offer
+  client authentication. (The related RUSTSEC-2026-0383 and CVE-2026-111943,
+  about distrusted roots after the eMudhra intermediate CA compromise, are
+  against `webpki-roots`, which this tree does not depend on: the audit does
+  not flag it, and the tests use their own CA.)
 
 So none of the three was exploitable here as the code stands. They were
 updated anyway: "not reachable today" is a property of today's code, the
@@ -246,15 +261,17 @@ Examined and already clear at the pinned version:
 
 Toolchain at the time of the check: rustc and cargo 1.98.1.
 
-**How this was checked, and the limit of it.** By name and version against
-rustsec.org and OSV, not by a tool: installing `cargo-audit` was refused in
-this environment as external code. A by-hand check covers what it was pointed
-at, so it can miss an advisory against a crate it did not examine — the
-build-only and test-only tail (`embed-resource`, `rcgen`, `ring`,
-`subtle`, `untrusted`) was not examined one by one. Running
-`cargo audit` (or `cargo deny check advisories`) over `Cargo.lock` is the
-complete form of this check and should become a gate; it needs a one-time
-`cargo install cargo-audit --locked`, which an operator can run.
+**How this was checked.** First by hand against rustsec.org and OSV, by name
+and pinned version, which found the three crates above; then by `cargo audit`
+over the whole lockfile, which found the same three and nothing more. The
+by-hand pass had admitted not examining the build-only and test-only tail
+(`embed-resource`, `rcgen`, `ring`, `subtle`, `untrusted`) one by one; the
+tool covers it, and that tail is clean.
+
+The audit reads `Cargo.lock`, so it reports what a build of this tree would
+use. It does not read the PHP distribution, the WinSW wrapper or anything
+else an operator deploys beside the binary; those carry their own advisories
+and their own update duty.
 
 After the three updates: fmt, strict MSVC Clippy `--all-targets
 --all-features -D warnings`, the default suite (313 passed), the TLS process
@@ -264,7 +281,9 @@ release build, and the profiling bench link gate all pass.
 ## What this review did not do
 
 - No fuzzing, no race harness, no penetration test and no third-party review.
-- No automated dependency audit, as above: the check was by hand and by name.
+- The dependency audit covers the Rust tree only, and only as pinned in
+  `Cargo.lock`. Nothing checks PHP, the WinSW wrapper or the operator's own
+  application dependencies.
 - Nothing on Linux beyond reading the code paths that differ. The same three
   updates apply there, and `doc/LINUX_VERIFICATION.md` predates them.
 - No review of HTTP/2, which does not exist, or of TLS client authentication,
