@@ -51,6 +51,10 @@ PHP 8.4 or newer). The FastCGI tests look for `php/8.5/php-cgi`, a symlink to th
   `all`.
 - `cargo bench --no-run --features profiling` is the gate that links every bench;
   `cargo clippy --all-targets` only checks them and misses linker errors.
+- `cargo audit` over `Cargo.lock` is the dependency-advisory gate (one-time
+  `cargo install cargo-audit --locked`). Run it before a release and when
+  bumping a network, TLS or crypto crate; `doc/SECURITY_REVIEW_0_9.md` records
+  the last check, which was by hand, and what it covered.
 - `./benchmarks/static_http.ps1` and `./benchmarks/php_worker*.ps1` are end-to-end .NET load drivers
   that launch the release binary themselves, so build release first.
 - `benchmarks/linux_http.py` is the Linux counterpart (static, `not_found`, PHP worker and FastCGI

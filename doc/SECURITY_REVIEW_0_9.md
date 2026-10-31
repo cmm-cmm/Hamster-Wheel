@@ -189,10 +189,83 @@ server until that request ends — stated there by inference, not tested. No
 privilege separation: Hamster and its workers run as the same account, and
 nothing drops privileges.
 
+## Dependency advisories (checked 2026-10-31)
+
+The tree is 111 crates. Checked against the RustSec database and OSV by name
+and pinned version, concentrating on the network, TLS, crypto and
+configuration-parsing paths. Three pins were inside an advisory range and were
+moved; the rest of the examined set was already clear.
+
+| Crate | Was | Now | Advisory |
+|---|---|---|---|
+| `rustls` | 0.23.45 | **0.23.46** | RUSTSEC-2026-0346, -0347, -0348, -0349 |
+| `rustls-webpki` | 0.103.15 | **0.103.16** | RUSTSEC-2026-0382, -0383 (CVE-2026-111943) |
+| `tokio` | 1.53.1 | **1.53.3** | RUSTSEC-2026-0386 |
+
+What each one means for **this** server, because a version range is not an
+exposure:
+
+- **RUSTSEC-2026-0346** (CVSS 4.0, `Debug` on TLS 1.2/1.3 client session
+  values printed the master secret or resumption PSK) and **-0349** (CVSS 3.7,
+  a client recorded the server's key-exchange group before authentication and
+  could be steered to a classical-only share) are **client-side**. Hamster is
+  a TLS *server*: `rustls` client types appear only in
+  `src/server/tls_tests.rs`, and the reverse proxy speaks cleartext upstream.
+  Neither is reachable from the shipped binary.
+- **RUSTSEC-2026-0347** (ECH) and **-0348** (Brotli certificate
+  decompression, a 1 GiB pre-authentication allocation) need features this
+  build does not enable: the enabled set is `aws-lc-rs`, `aws_lc_rs`, `std`
+  and `tls12`, with no `brotli` and no ECH.
+- **RUSTSEC-2026-0386** (tokio) is an unsoundness report, not a CVE: the safe
+  `AsyncFd` constructors accept a raw descriptor, which can reach a
+  use-after-free through descriptor reuse. `AsyncFd` is Unix-only and appears
+  nowhere in this crate.
+- **RUSTSEC-2026-0382/-0383** sit in certificate-path validation, which a
+  server only performs when it verifies client certificates. Hamster does not
+  offer client authentication.
+
+So none of the three was exploitable here as the code stands. They were
+updated anyway: "not reachable today" is a property of today's code, the
+versions are a one-line lockfile change, and a server whose TLS stack is
+knowingly behind its advisories is not one to hand to an operator.
+
+Examined and already clear at the pinned version:
+
+- `aws-lc-sys` 0.45.0 — above the 0.39.0 fix for RUSTSEC-2026-0044, -0046,
+  -0047 (CVE-2026-3338, `PKCS7_verify` signature bypass) and -0048
+  (CVE-2026-4428, CRL scope check). These are the ones that would have
+  mattered most, being the crypto provider.
+- `bytes` 1.12.1 — above the 1.11.1 fix for RUSTSEC-2026-0007, an unchecked
+  addition in `BytesMut::reserve` that wraps in release builds.
+- `hyper` 1.11.1 — every hyper advisory on record (request smuggling,
+  `Transfer-Encoding` overflow, header splitting) is against the 0.x line.
+- `rustls-pki-types` 1.15.1, `http` 1.5.0, `http-body` 1.1.0, `hyper-util`
+  0.1.20, `toml` 1.1.6, `winnow` 1.0.4, `serde` 1.0.229, `socket2` 0.6.5,
+  `mio` 1.2.3, `libc` 0.2.189, `windows-sys` 0.61.2 — no advisory found
+  against the pinned versions.
+
+Toolchain at the time of the check: rustc and cargo 1.98.1.
+
+**How this was checked, and the limit of it.** By name and version against
+rustsec.org and OSV, not by a tool: installing `cargo-audit` was refused in
+this environment as external code. A by-hand check covers what it was pointed
+at, so it can miss an advisory against a crate it did not examine — the
+build-only and test-only tail (`embed-resource`, `rcgen`, `ring`,
+`subtle`, `untrusted`) was not examined one by one. Running
+`cargo audit` (or `cargo deny check advisories`) over `Cargo.lock` is the
+complete form of this check and should become a gate; it needs a one-time
+`cargo install cargo-audit --locked`, which an operator can run.
+
+After the three updates: fmt, strict MSVC Clippy `--all-targets
+--all-features -D warnings`, the default suite (313 passed), the TLS process
+suite `tls_reload_process` 3/3 and `windows_control` 16/16 ignored, the MSVC
+release build, and the profiling bench link gate all pass.
+
 ## What this review did not do
 
 - No fuzzing, no race harness, no penetration test and no third-party review.
-- No audit of the dependency tree beyond what `Cargo.lock` pins.
-- Nothing on Linux beyond reading the code paths that differ.
+- No automated dependency audit, as above: the check was by hand and by name.
+- Nothing on Linux beyond reading the code paths that differ. The same three
+  updates apply there, and `doc/LINUX_VERIFICATION.md` predates them.
 - No review of HTTP/2, which does not exist, or of TLS client authentication,
   which is not implemented.
