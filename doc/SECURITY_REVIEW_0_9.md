@@ -278,6 +278,90 @@ After the three updates: fmt, strict MSVC Clippy `--all-targets
 suite `tls_reload_process` 3/3 and `windows_control` 16/16 ignored, the MSVC
 release build, and the profiling bench link gate all pass.
 
+## The deployment set outside the Rust tree (checked 2026-10-31)
+
+`cargo audit` reads `Cargo.lock`, so it says nothing about the two other
+binaries a deployment runs. Both were checked by version against their
+vendors.
+
+### PHP: both recorded environments are behind a known-exploited RCE
+
+| Where | Version in use | Status |
+|---|---|---|
+| This Windows host, `php/8.5/php.exe` and `php-cgi.exe` | **8.5.10** (NTS, VS17 x64, built 2026-08-25) | **vulnerable** |
+| `doc/LINUX_VERIFICATION.md`, built from the `php-8.5.11` tag | **8.5.11** | **vulnerable** |
+| `doc/FRANKENPHP_LINUX_COMPARISON.md`, both servers | 8.5.11 | same |
+
+**PHP 8.5.12** (released 22 October 2026) is a security release fixing two
+Core advisories, GHSA-w8hw-w9fx-j79w and GHSA-6wmf-4rv5-p3rp, both described
+as "avoid state corruption via bailout". Secondary reporting ties them to
+CVE-2026-109618 and CVE-2026-109619, describes them as unauthenticated remote
+code execution, and says CISA added both to its Known Exploited
+Vulnerabilities catalogue on 26 October 2026. PHP's own guidance is that no
+configuration change fully mitigates them; the fix is to update.
+
+Every version before 8.5.12 is affected, so **8.5.10 and 8.5.11 both are**.
+Nothing in Hamster changes that: the PHP distribution is operator-supplied
+and git-ignored, so this is an operator action, not a code change.
+
+On **Windows the target is 8.5.12-1**, not 8.5.12. The official Windows builds
+were re-rolled on 26 October 2026 for a Brotli security fix, and this
+repository's `php/8.5/` ships `brotlicommon.dll` and `brotlidec.dll`, so the
+bundled Brotli is present in what runs here. Verify the download against the
+SHA-256 the download page lists.
+
+One claim is left unresolved on purpose: CVE-2026-115560, remote code
+execution through session upload progress, was reported after 8.5.12 and the
+sources seen disagree about whether it is patched. Treat it as open until
+php.net says otherwise.
+
+What this means for the records in this repository: the Linux verification and
+both FrankenPHP comparisons were measured on 8.5.11. Their **functional and
+performance** results stand — they describe what Hamster did with that
+runtime — but neither should be read as a statement that the environment is
+patched, and the Linux re-run that `doc/AI_HANDOFF.md` already owes should use
+8.5.12 or later.
+
+### WinSW 2.11.0: no advisory against the wrapper, and an upgrade is not free
+
+No security advisory was found against WinSW itself. One GitHub issue
+(winsw/winsw#1117, September 2025) reports that 2.11.0 bundles zlib 1.2.11.1
+and links it to CVE-2022-37434, a heap buffer over-read in zlib's
+`inflateGetHeader`.
+
+**That path is not reachable in this project's pinned configuration.** WinSW
+uses zlib to compress rotated logs, and
+`examples/winsw/HamsterWheelService.xml` uses `roll-by-size` with
+`keepFiles`, with no compression setting, so nothing asks the wrapper to
+deflate anything.
+
+Two facts belong beside that, because they point in opposite directions:
+
+- 2.11.0 was published in March 2021 and a 2.12.0 exists, so the pin is years
+  behind.
+- The qualified integration depends on the pin. `HamsterLifecycleExtension.cs`
+  validates the exact vendor SHA-256 and assembly layout at startup and fails
+  closed on a mismatch, and the whole Service qualification in
+  `doc/WINDOWS_SERVICE_LIFECYCLE_GAPS.md` was run against 2.11.0 NET461. A
+  WinSW bump therefore invalidates that qualification until the hash, the
+  layout and the two full Service runs are redone.
+
+So moving WinSW is a decision with a cost rather than a patch to apply, and
+nothing found so far forces it. What would force it is an advisory against a
+path this configuration uses, or a decision to enable log compression.
+
+The NET461 target is not the same as an unpatched runtime: a NET461 assembly
+runs on the installed .NET Framework 4.x, and 4.8 is in support and patched
+through Windows Update.
+
+### The standing duty
+
+Neither of these is checked by any gate in this repository, because neither
+binary is in it. Before a release, and on the vendors' own schedules, check:
+PHP against php.net's release archive, and WinSW against its releases page and
+issue tracker. `doc/PACKAGING_UPGRADE_ROLLBACK.md` lists what a deployment
+contains; this is the part of that list that updates on someone else's clock.
+
 ## What this review did not do
 
 - No fuzzing, no race harness, no penetration test and no third-party review.
