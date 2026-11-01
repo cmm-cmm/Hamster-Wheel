@@ -116,3 +116,18 @@ Linux trong phép đo này.
 và profiling hẹp Hello C1/POST với control 404. Owner có thể dùng tài liệu
 này để chọn slice; không coi việc ghi tài liệu là phê duyệt redesign hoặc
 production change. Historical results và raw evidence giữ nguyên.
+
+## Follow-up từ FrankenPHP retest
+
+[Kết quả riêng](../benchmarks/results/frankenphp_windows_20261101_current.md)
+đã tái hiện thêm một Hamster cold Laravel preflight **504** ở deadline 5 s.
+Trạng thái hạng mục cold request: **REPRODUCED / PARTIALLY LOCALIZED /
+NOT FIXED**. Probe trên scratch adapter/vendor định vị gateway 3505,56 ms
+ở lần đầu, so với 120,87/48,63 ms ở process mới dùng lại cùng scratch app;
+không tự tái hiện 504 trong probe, chưa kết luận nguyên nhân IO/cache/CPU.
+
+Giữ ưu tiên chẩn đoán cold request trước tối ưu rộng. Không thay các mốc
+Node phía trên bằng số FrankenPHP, không ghép hai matrix thành phép đo ba
+bên xen kẽ, không sửa historical raw hoặc coi mục tiêu cold availability
+đã đạt nhờ 78 timed runs tiếp theo không lỗi. Không triển khai production
+fix trong lượt kiểm tra này.

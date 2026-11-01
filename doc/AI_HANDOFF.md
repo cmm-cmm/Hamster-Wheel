@@ -1,6 +1,52 @@
 # AI Handoff
 
-## Current: Node.js Windows performance supplement (2026-11-01)
+## Current: FrankenPHP current-binary retest + cold Laravel 504 (2026-11-01)
+
+Read `benchmarks/results/frankenphp_windows_20261101_current.md` and assessment
+section 11. FrankenPHP 1.13.4 / PHP 8.5.12 ZTS / Caddy 2.11.7 vs isolated PHP
+8.5.12-1 NTS; current Hamster release SHA remains
+D1E2B14CF48611844762B5C1B3CC6D13EEAD8DA0D87825A6803071FC63F74163 (same as Node).
+HEAD moved externally to 9519e18 during preparation; agent did not commit/push.
+Binary/source hashes fixed through the matrix. No production source change.
+
+13 predeclared cells, three fresh process trees/arm, H F F H H F, warm-up 1000,
+10-second oha -w. Completed 78 measured rows: 5,125,180 expected responses,
+zero transport/unexpected status errors in timed data; 78 pre/post checks pass.
+Median H/F: Hello W1/C1 2396/1234, W4/C32 14331/7290; JSON 14484/5672;
+POST 1 MiB 897/343; CPU hash 456/404 (spread overlap). Laravel login C1
+274/322, C16 1644/1119; Welcome C1 423/441, C16 884/930 (overlap). Static
+small also overlaps. Full min/median/max and independent resources in report.
+W4/framework H has higher summed WS but lower private bytes; not lower RAM
+universally. FrankenPHP retains W+1 spare classic threads beyond W workers.
+
+IMPORTANT: one additional H Laravel /login preflight returned 504 after 42
+timed rows; default request_timeout=5s, startup_timeout=30s, all four READY
+~3092 ms. Driver aborted, never transparently replayed; original raw/log kept.
+Continuation (_current_remaining.jsonl) finished the remaining 36 rows in a
+new scratch clone/processes; do not count the failed preflight as PASS or
+erase it when interpreting steady-state numbers. Not an all-clear on cold
+availability. No timeout was increased to hide the failure.
+
+Scratch probe (_cold_probe.json, ignored script diagnose_laravel_cold.py):
+three fresh H4 trees on the same scratch app, exactly one request each, all 200,
+HTTP 3725.75/133.40/73.54 ms. First Octane gateway 3505.56 ms vs 120.87/48.63,
+443->563 included files each process; frame/build/flush small in this probe.
+504 itself was NOT reproduced by the instrumented probe. Gateway phase is
+localized; filesystem/OPcache/antivirus/CPU cause and original timeout remain
+unproven. No production fix/prewarm/timeout workaround. Next priority is
+deeper cold gateway phase evidence, not a speculative dispatcher rewrite.
+
+Driver: repeatable --cell exact selection, new JSON W4/C32, pre/post body
+checks for static/worker/classic (timed method unchanged). PASS release/fmt,
+13 Python tests/PHP lints/diff check. Reuse prior 317 Rust/default + strict
+Clippy on unchanged production content; ignored PHP/lifecycle and bench link
+not rerun. Cleanup audit: 384 matrix/probe PID+creation identities gone, all
+four failed-log workers gone, cached-PHP inventory empty, zero temp roots/
+benchmark listeners; source and binary hashes unchanged. Logs/tools/probe
+source retained in ignored cache. No unrelated service/data/env changes or
+agent commit/tag/push/merge/release; no Linux measurement.
+
+## Previous: Node.js Windows performance supplement (2026-11-01)
 
 Owner requested a separate record for evaluation/targets:
 `doc/PERFORMANCE_TARGETS_WINDOWS_NODE_20261101.md`. It preserves measured

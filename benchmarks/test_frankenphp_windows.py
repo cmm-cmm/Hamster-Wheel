@@ -11,6 +11,32 @@ if sys.platform == "win32":
 
 @unittest.skipUnless(sys.platform == "win32", "Windows benchmark driver")
 class DriverTests(unittest.TestCase):
+    def test_exact_cells_select_a_predeclared_matrix_without_substring_overlap(self):
+        names = ["worker hello W1 C1", "worker json W4 C32"]
+        rows = driver.select_plan(["worker"], cells=names)
+        self.assertEqual([row[1] for row in rows], names)
+        with self.assertRaisesRegex(ValueError, "unknown cells"):
+            driver.select_plan(["worker"], cells=["worker json W4 C33"])
+        with self.assertRaisesRegex(ValueError, "unknown cells"):
+            driver.select_plan(["static"], cells=names)
+
+    def test_static_body_check_uses_the_actual_fixture_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="hamster-bench-config-") as directory:
+            with open(f"{directory}/index.html", "wb") as handle:
+                handle.write(b"\x00\xfffixture\r\n")
+            check = driver.body_verifier("static", "/", None, directory)
+        self.assertTrue(check(b"\x00\xfffixture\r\n"))
+        self.assertFalse(check(b"fixture\n"))
+
+    def test_worker_and_classic_checks_reject_wrong_bodies_despite_correct_status(self):
+        for group, path in (("worker", "/json"), ("classic", "/bench.php?workload=json")):
+            check = driver.body_verifier(group, path, None, "unused")
+            self.assertTrue(check(b'{"message":"Hello from PHP"}'))
+            self.assertFalse(check(b"Hello from PHP"))
+        check = driver.body_verifier("worker", "/echo", "hello world!", "unused")
+        self.assertTrue(check(b"hello world!"))
+        self.assertFalse(check(b"hello"))
+
     def test_caddy_environment_values_include_explicit_empty_strings(self):
         with tempfile.TemporaryDirectory(prefix="hamster-bench-config-") as temporary:
             directory = temporary.replace("\\", "/")

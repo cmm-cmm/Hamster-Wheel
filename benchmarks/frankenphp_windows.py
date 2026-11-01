@@ -11,7 +11,7 @@ once per process, and private bytes (commit charge), which does not.
 
   python benchmarks/frankenphp_windows.py [--frankenphp PATH] [--oha PATH]
       [--laravel APP | --laravel-source APP] [--runs N] [--bin PATH] [--against PATH] [--only TEXT]
-      [--php-dir PATH] [--duration SECONDS] [--output PATH]
+      [--php-dir PATH] [--duration SECONDS] [--output PATH] [--cell EXACT_NAME ...]
       [GROUP ...]
 
 --against replaces FrankenPHP with a second Hamster binary, for an
@@ -253,6 +253,32 @@ def check_response(path, method, body, expected, verify_body):
         return True
     finally:
         client.close()
+
+
+def body_verifier(group, path, body, static_root):
+    """Independent pre/post checks, outside the measured resource window."""
+    if group == "baseline":
+        return lambda received: True  # status checked; error bodies may differ
+    if group == "laravel":
+        return ((lambda received: received == b"login placeholder") if path == "/login"
+                else (lambda received: b"Laravel" in received))
+    if group == "static":
+        filename = "index.html" if path == "/" else path.lstrip("/")
+        with open(f"{static_root}/{filename}", "rb") as handle:
+            expected = handle.read()
+    elif group == "heavy" and path == "/body":
+        expected = hashlib.sha256(b"x" * 1024 * 1024).hexdigest().encode()
+    elif group == "heavy" and path == "/cpu":
+        expected = b"a" * 64
+        for _ in range(20_000):
+            expected = hashlib.sha256(expected).hexdigest().encode()
+    elif path == "/echo":
+        expected = body.encode() if isinstance(body, str) else body
+    elif path == "/json" or path.endswith("?workload=json"):
+        expected = b'{"message":"Hello from PHP"}'
+    else:
+        expected = b"Hello from PHP"
+    return lambda received: received == expected
 
 
 # --------------------------------------------------------------- configuration
@@ -511,6 +537,7 @@ PLAN = [
      "POST", "hello world!"),
     ("worker", "worker hello W4 C4", "php_w4", "worker_w4", "/hello", 50000, 4, 200),
     ("worker", "worker hello W4 C32", "php_w4", "worker_w4", "/hello", 50000, 32, 200),
+    ("worker", "worker json W4 C32", "php_w4", "worker_w4", "/json", 50000, 32, 200),
     ("classic", "classic hello 4 C1", "fcgi", "classic", "/bench.php", 5000, 1, 200),
     ("classic", "classic json 4 C16", "fcgi", "classic", "/bench.php?workload=json",
      10000, 16, 200),
@@ -524,6 +551,17 @@ PLAN = [
     ("heavy", "hello overload W4 C64", "heavy", "heavy", "/hello", 50000, 64, 200),
     ("heavy", "hello overload W4 C128", "heavy", "heavy", "/hello", 50000, 128, 200),
 ]
+
+
+def select_plan(groups, only=None, cells=None):
+    """Select before launch, rejecting misspelled or out-of-group cell names."""
+    selected = [row for row in PLAN if row[0] in groups]
+    if cells:
+        missing = set(cells) - {row[1] for row in selected}
+        if missing:
+            raise ValueError(f"unknown cells in selected groups: {sorted(missing)}")
+        selected = [row for row in selected if row[1] in cells]
+    return [row for row in selected if not only or only in row[1]]
 
 
 def main():
@@ -540,6 +578,7 @@ def main():
     parser.add_argument("--bin", default=f"{REPO}/target/x86_64-pc-windows-msvc/release/"
                                          "hamster-wheel.exe")
     parser.add_argument("--only", help="run only the cells whose name contains this text")
+    parser.add_argument("--cell", action="append", help="exact cell name; repeat to select a matrix")
     parser.add_argument("--against", help="a second Hamster binary to run in place of "
                                           "FrankenPHP, for a build-against-build A/B")
     parser.add_argument("--php-dir", default=PHP_DIR)
@@ -568,6 +607,12 @@ def main():
     for group in groups:
         if group not in {row[0] for row in PLAN}:
             parser.error(f"unknown group: {group}")
+    try:
+        selected = select_plan(groups, args.only, args.cell)
+    except ValueError as error:
+        parser.error(str(error))
+    if not selected:
+        parser.error("no matching cells")
     if any(group in groups for group in ("worker", "classic", "laravel", "heavy")):
         for name in ("php.exe", "php-cgi.exe"):
             if not os.path.isfile(f"{PHP_DIR}/{name}"):
@@ -613,25 +658,11 @@ def main():
                 shutil.copy(f"{laravel}/vendor/laravel/octane/src/Commands/stubs/"
                             "frankenphp-worker.php", stub)
         try:
-            for group, cell, ham, fr, path, requests, concurrency, expected, *rest in PLAN:
-                if group not in groups or (args.only and args.only not in cell):
-                    continue
+            for group, cell, ham, fr, path, requests, concurrency, expected, *rest in selected:
                 method, body = (rest[0], rest[1]) if rest else ("GET", None)
-                verify_body = None
-                if group == "heavy":
-                    if isinstance(body, dict):
-                        body = {"file": body_file}
-                        expected_body = hashlib.sha256(b"x" * 1024 * 1024).hexdigest().encode()
-                    elif path == "/cpu":
-                        expected_body = b"a" * 64
-                        for _ in range(20_000):
-                            expected_body = hashlib.sha256(expected_body).hexdigest().encode()
-                    else:
-                        expected_body = b"Hello from PHP"
-                    verify_body = lambda received, expected_body=expected_body: received == expected_body
-                elif group == "laravel":
-                    verify_body = ((lambda received: received == b"login placeholder") if path == "/login"
-                                   else (lambda received: b"Laravel" in received))
+                if group == "heavy" and isinstance(body, dict):
+                    body = {"file": body_file}
+                verify_body = body_verifier(group, path, body, static_root)
                 warmup = 200 if group == "classic" else 1000
                 ini = "franken-laravel-ini" if group == "laravel" else "franken-ini"
                 if args.against:

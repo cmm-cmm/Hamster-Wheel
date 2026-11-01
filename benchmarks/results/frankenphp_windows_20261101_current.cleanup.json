@@ -1,0 +1,41 @@
+{
+  "checked_at": "2026-11-01T14:52:34.149347+00:00",
+  "completed_measured_runs": 78,
+  "measured_requests": 5125180,
+  "measured_transport_errors": 0,
+  "measured_unexpected_statuses": 0,
+  "additional_failed_preflight": {
+    "status": 504,
+    "cell": "laravel /login W4 C1",
+    "log": "target/tools/benchmark-20261101/franken-current.logs/hamster-wheel.exe-a7iwr0gu.log",
+    "logged_worker_pids_current": [
+      {
+        "pid": 24196,
+        "current_creation_time": null
+      },
+      {
+        "pid": 21608,
+        "current_creation_time": null
+      },
+      {
+        "pid": 15008,
+        "current_creation_time": null
+      },
+      {
+        "pid": 9596,
+        "current_creation_time": null
+      }
+    ],
+    "parent_pid_not_captured": true
+  },
+  "diagnostic_only_trees": 3,
+  "recorded_process_identities": 384,
+  "matching_live_identities": [],
+  "cached_runtime_php_inventory": [],
+  "remaining_owned_temp_roots": [],
+  "listening_benchmark_ports": [],
+  "all_recorded_binary_source_hashes_unchanged": true,
+  "diagnostic_script_sha256": "0cea66c6da2a5132e7ee42685205caa98045a4c13f5c89d44423595b2573efa3",
+  "retained_artifacts": "raw/metadata/probe evidence in benchmarks/results; diagnostic script, tools and logs in ignored target cache; temporary application trees removed",
+  "git_head_now": "9519e1842a4a4f7035e0fa121420bb3c553ee496"
+}

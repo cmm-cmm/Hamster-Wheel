@@ -2593,3 +2593,33 @@ serve identical success bodies, but 404 differs (Hamster 9 B, Node empty).
 Node static is a fixture allowlist, not a qualified general-purpose server.
 Lower Hamster end RAM here is not a peak/leak result or a minimum-Node claim.
 No Laravel-to-Node framework equivalence or Linux result is asserted.
+
+### 2026-11-01 — FrankenPHP retest, current Hamster binary
+
+[Report](../benchmarks/results/frankenphp_windows_20261101_current.md),
+[first 42 timed rows](../benchmarks/results/frankenphp_windows_20261101_current.jsonl),
+[remaining 36](../benchmarks/results/frankenphp_windows_20261101_current_remaining.jsonl),
+[cold phase probe](../benchmarks/results/frankenphp_windows_20261101_cold_probe.json).
+Same D1E2... release binary as Node pass, FrankenPHP 1.13.4 / PHP 8.5.12,
+NTS PHP 8.5.12-1, oha 1.16.0, Windows i5-1235U. Thirteen predeclared cells,
+H F F H H F, three fresh trees/arm, warm-up 1000 and ten-second oha -w.
+78 timed runs, 5,125,180 expected responses, zero transport/unexpected status
+errors in timed data, 78 pre/post checks passed. Independent medians and
+RPS min/median/max are in the report; no older baseline is rewritten.
+
+Median H/F RPS: Hello W1/C1 2396/1234, W4/C32 14331/7290; JSON W4/C32
+14484/5672; POST 1 MiB 897/343; CPU 456/404 (ranges overlap). Laravel login
+C1 274/322, C16 1644/1119; Welcome C1 423/441, C16 884/930 (overlap).
+Static 23 B C32 4097/4333 also overlaps; static 1 MiB C8 2074/1324.
+Do not inherit Hello's result for frameworks or equate lower private bytes
+with lower summed WS. Configuration retains W workers plus W+1 spare
+FrankenPHP classic threads. No three-way interleaved Node comparison.
+
+**One extra H Laravel preflight failed 504**, before warm-up/timed rows of
+that cell. Driver aborted; continuation used a new clone/processes, no
+transparent replay. Report this failure alongside steady-state data.
+Three diagnostic-only fresh H4 trees on one scratch app gave 200 in
+3725.75/133.40/73.54 ms; gateway took 3505.56/120.87/48.63 ms and included
+120 additional files each. This localizes a slow first framework path in
+the probe, NOT the root cause of the original five-second failure. Default
+request_timeout stayed five seconds. No production optimization/fix made.

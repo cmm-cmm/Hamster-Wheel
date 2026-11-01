@@ -376,3 +376,39 @@ RAM. Node fixture thiếu tương đương aggregate body budget, job admission,
 static containment và các policy production của Hamster. End RAM thấp hơn
 ở Hamster không phải bằng chứng memory stability. Node standalone,
 framework/database/TLS/remote/soak và Linux không được đo trong lượt này.
+
+## 11. Kiểm tra lại FrankenPHP trên binary hiện tại
+
+[Báo cáo riêng, raw và phase evidence](../benchmarks/results/frankenphp_windows_20261101_current.md).
+FrankenPHP 1.13.4 / PHP 8.5.12, Hamster dùng NTS 8.5.12-1. SHA Hamster
+`D1E2...` trùng Node pass; không dùng `AF03...` của bảng cũ làm A/B.
+13 cell, ba fresh process/arm, 10 giây/run, H F F H H F. Hoàn tất **78 timed
+rows, 5.125.180 response đúng status dự kiến, zero transport/unexpected
+status errors trong phần đo**. **Có thêm một cold Laravel preflight 504**;
+không được diễn giải timed data thành toàn bộ qualification không lỗi.
+
+Median RPS H/F: Hello W1/C1 **2396/1234**, W4/C32 **14331/7290**; JSON
+**14484/5672**; POST 1 MiB **897/343**. CPU-heavy **456/404** nhưng spread
+overlap. Static nhỏ cũng overlap. Laravel `/login` C16 **1644/1119**;
+Welcome C1 **423/441**, C16 **884/930**, cả hai overlap. Không ngoại suy
+ưu thế Hello thành ưu thế framework. W4/framework có summed WS cao hơn
+nhưng private bytes thấp hơn FrankenPHP, không phải ít RAM hơn nói chung.
+
+**FACT mới:** attempt gốc dừng sau 42 rows khi H `/login` preflight trả 504,
+slot 0 generation 1 hết request deadline 5 s sau khi pool đã READY. Không
+retry hoặc tăng timeout. Sáu cell còn thiếu hoàn tất trong continuation
+riêng với clone/process mới; original failure/log/raw giữ nguyên.
+
+**Probe riêng, không làm performance data:** ba cây H4 mới trên cùng scratch
+app, ba request khác marker, đều 200: **3725,75 / 133,40 / 73,54 ms**.
+Octane gateway lần lượt **3505,56 / 120,87 / 48,63 ms**, mỗi process tăng
+120 included files qua gateway. Decode/build/flush nhỏ trong chính probe.
+Không sửa production; instrumentation chỉ ở scratch adapter/vendor copy.
+
+**INFERENCE:** cold first-use framework là hướng điều tra có evidence mạnh
+hơn speculative dispatcher optimization. **Chưa chứng minh** filesystem,
+OPcache, antivirus hay CPU là nguyên nhân; probe không tự tái hiện 504 và
+không xác định toàn bộ 5 s ở failed run. Mục tiêu cold-request chuyển thành
+**REPRODUCED / PARTIALLY LOCALIZED / NOT FIXED**, không đóng bởi steady-state
+success. Startup budget 30 s và request deadline 5 s vẫn độc lập; không tăng
+timeout hoặc prewarm route ngầm để làm kết quả đẹp. Không đo Linux lượt này.

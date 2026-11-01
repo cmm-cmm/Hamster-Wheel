@@ -1,0 +1,833 @@
+[
+  {
+    "cycle": 1,
+    "parent_pid": 26596,
+    "log": "D:\\Project\\Hamster-Wheel\\target\\tools\\benchmark-20261101\\laravel-cold-phases.logs\\hamster-wheel.exe-873chv4f.log",
+    "request_timeout_seconds": 5,
+    "same_scratch_app": true,
+    "identities": [
+      {
+        "pid": 26596,
+        "created": 134380174411896091
+      },
+      {
+        "pid": 22948,
+        "created": 134380174412862993
+      },
+      {
+        "pid": 10172,
+        "created": 134380174412087021
+      },
+      {
+        "pid": 26636,
+        "created": 134380174412892903
+      },
+      {
+        "pid": 25968,
+        "created": 134380174413040887
+      },
+      {
+        "pid": 22672,
+        "created": 134380174412665775
+      },
+      {
+        "pid": 15504,
+        "created": 134380174412802612
+      },
+      {
+        "pid": 24852,
+        "created": 134380174412945818
+      },
+      {
+        "pid": 20984,
+        "created": 134380174412826588
+      },
+      {
+        "pid": 25468,
+        "created": 134380174412780784
+      }
+    ],
+    "status": 200,
+    "body": "login placeholder",
+    "elapsed_seconds": 3.7257534000018495,
+    "log_text": "PHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"script.enter\",\"ns\":45119653773200,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":20984,\"phase\":\"script.enter\",\"ns\":45119655503400,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":22672,\"phase\":\"script.enter\",\"ns\":45119655634500,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26636,\"phase\":\"script.enter\",\"ns\":45119656183100,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26636,\"phase\":\"autoload.begin\",\"ns\":45119857511600,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":22672,\"phase\":\"autoload.begin\",\"ns\":45119857719600,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":20984,\"phase\":\"autoload.begin\",\"ns\":45119858064800,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"autoload.begin\",\"ns\":45119858074200,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"autoload.end\",\"ns\":45119949495200,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":20984,\"phase\":\"autoload.end\",\"ns\":45119951085500,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26636,\"phase\":\"autoload.end\",\"ns\":45119953096700,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":22672,\"phase\":\"autoload.end\",\"ns\":45119953633300,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":22672,\"phase\":\"boot.begin\",\"ns\":45120146880200,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26636,\"phase\":\"boot.begin\",\"ns\":45120147039800,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"boot.begin\",\"ns\":45120147393700,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":20984,\"phase\":\"boot.begin\",\"ns\":45120147463100,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26636,\"phase\":\"boot.end\",\"ns\":45121614135100,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"boot.end\",\"ns\":45121614118700,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":20984,\"phase\":\"boot.end\",\"ns\":45121614113900,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":22672,\"phase\":\"boot.end\",\"ns\":45121614294200,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":20984,\"phase\":\"ready\",\"ns\":45121668921000,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"ready\",\"ns\":45121669035700,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":22672,\"phase\":\"ready\",\"ns\":45121669350900,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26636,\"phase\":\"ready\",\"ns\":45121669609200,\"files\":440}\nPHP worker pool localhost/ worker 25468 ready after 2270.536 ms\nPHP worker pool localhost/ worker 22672 ready after 2270.845 ms\nPHP worker pool localhost/ worker 20984 ready after 2270.660 ms\nPHP worker pool localhost/ worker 26636 ready after 2271.012 ms\nRequest body memory budget 67108864 bytes\nHamster Wheel listening on http://127.0.0.1:8080\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"frame.received\",\"ns\":45122205942100,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"frame.decoded\",\"ns\":45122206038000,\"files\":440}\nHAMSTER_PHASE {\"pid\":25468,\"phase\":\"request.build.begin\",\"ns\":45122206052200,\"files\":440}\nHAMSTER_PHASE {\"pid\":25468,\"phase\":\"request.build.end\",\"ns\":45122206137000,\"files\":440}\nHAMSTER_PHASE {\"pid\":25468,\"phase\":\"handle.begin\",\"ns\":45122206153100,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"gateway.begin\",\"ns\":45122212506300,\"files\":443}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"gateway.end\",\"ns\":45125718059200,\"files\":563}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"terminate.begin\",\"ns\":45125761326100,\"files\":564}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"terminate.end\",\"ns\":45125852959200,\"files\":572}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"handle.end\",\"ns\":45125853064800,\"files\":572}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"cleanup.end\",\"ns\":45125929217100,\"files\":573}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":25468,\"phase\":\"flush.begin\",\"ns\":45125929284900,\"files\":573}\nHAMSTER_PHASE {\"pid\":25468,\"phase\":\"flush.end\",\"ns\":45125929325400,\"files\":573}\n",
+    "phases": [
+      {
+        "pid": 25468,
+        "phase": "script.enter",
+        "ns": 45119653773200,
+        "files": 1
+      },
+      {
+        "pid": 20984,
+        "phase": "script.enter",
+        "ns": 45119655503400,
+        "files": 1
+      },
+      {
+        "pid": 22672,
+        "phase": "script.enter",
+        "ns": 45119655634500,
+        "files": 1
+      },
+      {
+        "pid": 26636,
+        "phase": "script.enter",
+        "ns": 45119656183100,
+        "files": 1
+      },
+      {
+        "pid": 26636,
+        "phase": "autoload.begin",
+        "ns": 45119857511600,
+        "files": 6
+      },
+      {
+        "pid": 22672,
+        "phase": "autoload.begin",
+        "ns": 45119857719600,
+        "files": 6
+      },
+      {
+        "pid": 20984,
+        "phase": "autoload.begin",
+        "ns": 45119858064800,
+        "files": 6
+      },
+      {
+        "pid": 25468,
+        "phase": "autoload.begin",
+        "ns": 45119858074200,
+        "files": 6
+      },
+      {
+        "pid": 25468,
+        "phase": "autoload.end",
+        "ns": 45119949495200,
+        "files": 65
+      },
+      {
+        "pid": 20984,
+        "phase": "autoload.end",
+        "ns": 45119951085500,
+        "files": 65
+      },
+      {
+        "pid": 26636,
+        "phase": "autoload.end",
+        "ns": 45119953096700,
+        "files": 65
+      },
+      {
+        "pid": 22672,
+        "phase": "autoload.end",
+        "ns": 45119953633300,
+        "files": 65
+      },
+      {
+        "pid": 22672,
+        "phase": "boot.begin",
+        "ns": 45120146880200,
+        "files": 73
+      },
+      {
+        "pid": 26636,
+        "phase": "boot.begin",
+        "ns": 45120147039800,
+        "files": 73
+      },
+      {
+        "pid": 25468,
+        "phase": "boot.begin",
+        "ns": 45120147393700,
+        "files": 73
+      },
+      {
+        "pid": 20984,
+        "phase": "boot.begin",
+        "ns": 45120147463100,
+        "files": 73
+      },
+      {
+        "pid": 26636,
+        "phase": "boot.end",
+        "ns": 45121614135100,
+        "files": 439
+      },
+      {
+        "pid": 25468,
+        "phase": "boot.end",
+        "ns": 45121614118700,
+        "files": 439
+      },
+      {
+        "pid": 20984,
+        "phase": "boot.end",
+        "ns": 45121614113900,
+        "files": 439
+      },
+      {
+        "pid": 22672,
+        "phase": "boot.end",
+        "ns": 45121614294200,
+        "files": 439
+      },
+      {
+        "pid": 20984,
+        "phase": "ready",
+        "ns": 45121668921000,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "ready",
+        "ns": 45121669035700,
+        "files": 440
+      },
+      {
+        "pid": 22672,
+        "phase": "ready",
+        "ns": 45121669350900,
+        "files": 440
+      },
+      {
+        "pid": 26636,
+        "phase": "ready",
+        "ns": 45121669609200,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "frame.received",
+        "ns": 45122205942100,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "frame.decoded",
+        "ns": 45122206038000,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "request.build.begin",
+        "ns": 45122206052200,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "request.build.end",
+        "ns": 45122206137000,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "handle.begin",
+        "ns": 45122206153100,
+        "files": 440
+      },
+      {
+        "pid": 25468,
+        "phase": "gateway.begin",
+        "ns": 45122212506300,
+        "files": 443
+      },
+      {
+        "pid": 25468,
+        "phase": "gateway.end",
+        "ns": 45125718059200,
+        "files": 563
+      },
+      {
+        "pid": 25468,
+        "phase": "terminate.begin",
+        "ns": 45125761326100,
+        "files": 564
+      },
+      {
+        "pid": 25468,
+        "phase": "terminate.end",
+        "ns": 45125852959200,
+        "files": 572
+      },
+      {
+        "pid": 25468,
+        "phase": "handle.end",
+        "ns": 45125853064800,
+        "files": 572
+      },
+      {
+        "pid": 25468,
+        "phase": "cleanup.end",
+        "ns": 45125929217100,
+        "files": 573
+      },
+      {
+        "pid": 25468,
+        "phase": "flush.begin",
+        "ns": 45125929284900,
+        "files": 573
+      },
+      {
+        "pid": 25468,
+        "phase": "flush.end",
+        "ns": 45125929325400,
+        "files": 573
+      }
+    ]
+  },
+  {
+    "cycle": 2,
+    "parent_pid": 17752,
+    "log": "D:\\Project\\Hamster-Wheel\\target\\tools\\benchmark-20261101\\laravel-cold-phases.logs\\hamster-wheel.exe-v5i4pid7.log",
+    "request_timeout_seconds": 5,
+    "same_scratch_app": true,
+    "identities": [
+      {
+        "pid": 20960,
+        "created": 134380174483909933
+      },
+      {
+        "pid": 26304,
+        "created": 134380174483880946
+      },
+      {
+        "pid": 2788,
+        "created": 134380174483946896
+      },
+      {
+        "pid": 7272,
+        "created": 134380174483866680
+      },
+      {
+        "pid": 10796,
+        "created": 134380174483893026
+      },
+      {
+        "pid": 26796,
+        "created": 134380174483765619
+      },
+      {
+        "pid": 19312,
+        "created": 134380174483855072
+      },
+      {
+        "pid": 22224,
+        "created": 134380174483433657
+      },
+      {
+        "pid": 12596,
+        "created": 134380174483844086
+      },
+      {
+        "pid": 17752,
+        "created": 134380174483363536
+      }
+    ],
+    "status": 200,
+    "body": "login placeholder",
+    "elapsed_seconds": 0.13340050000260817,
+    "log_text": "PHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":12596,\"phase\":\"script.enter\",\"ns\":45126626882900,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"script.enter\",\"ns\":45126626917600,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":7272,\"phase\":\"script.enter\",\"ns\":45126628446300,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":10796,\"phase\":\"script.enter\",\"ns\":45126629644500,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":12596,\"phase\":\"autoload.begin\",\"ns\":45126632646000,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":10796,\"phase\":\"autoload.begin\",\"ns\":45126632945400,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"autoload.begin\",\"ns\":45126633007200,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":7272,\"phase\":\"autoload.begin\",\"ns\":45126633022900,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":7272,\"phase\":\"autoload.end\",\"ns\":45126690764900,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":10796,\"phase\":\"autoload.end\",\"ns\":45126691353800,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"autoload.end\",\"ns\":45126691504200,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":12596,\"phase\":\"autoload.end\",\"ns\":45126691534900,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":12596,\"phase\":\"boot.begin\",\"ns\":45126694944100,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"boot.begin\",\"ns\":45126695405700,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":10796,\"phase\":\"boot.begin\",\"ns\":45126695432300,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":7272,\"phase\":\"boot.begin\",\"ns\":45126695403900,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":7272,\"phase\":\"boot.end\",\"ns\":45127003158600,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":10796,\"phase\":\"boot.end\",\"ns\":45127003410600,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"boot.end\",\"ns\":45127003624600,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":12596,\"phase\":\"boot.end\",\"ns\":45127003670900,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":7272,\"phase\":\"ready\",\"ns\":45127003839300,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"ready\",\"ns\":45127003850000,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":10796,\"phase\":\"ready\",\"ns\":45127003880300,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":12596,\"phase\":\"ready\",\"ns\":45127003904900,\"files\":440}\nPHP worker pool localhost/ worker 12596 ready after 494.983 ms\nPHP worker pool localhost/ worker 26796 ready after 495.069 ms\nPHP worker pool localhost/ worker 10796 ready after 494.926 ms\nPHP worker pool localhost/ worker 7272 ready after 494.915 ms\nRequest body memory budget 67108864 bytes\nHamster Wheel listening on http://127.0.0.1:8080\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"frame.received\",\"ns\":45127780845600,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"frame.decoded\",\"ns\":45127780981900,\"files\":440}\nHAMSTER_PHASE {\"pid\":26796,\"phase\":\"request.build.begin\",\"ns\":45127781002700,\"files\":440}\nHAMSTER_PHASE {\"pid\":26796,\"phase\":\"request.build.end\",\"ns\":45127781103500,\"files\":440}\nHAMSTER_PHASE {\"pid\":26796,\"phase\":\"handle.begin\",\"ns\":45127781124700,\"files\":440}\nHAMSTER_PHASE {\"pid\":26796,\"phase\":\"gateway.begin\",\"ns\":45127783492900,\"files\":443}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"gateway.end\",\"ns\":45127904369700,\"files\":563}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"terminate.begin\",\"ns\":45127904815500,\"files\":564}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"terminate.end\",\"ns\":45127910125300,\"files\":572}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"handle.end\",\"ns\":45127910203400,\"files\":572}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"cleanup.end\",\"ns\":45127911537700,\"files\":573}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26796,\"phase\":\"flush.begin\",\"ns\":45127911596900,\"files\":573}\nHAMSTER_PHASE {\"pid\":26796,\"phase\":\"flush.end\",\"ns\":45127911642400,\"files\":573}\n",
+    "phases": [
+      {
+        "pid": 12596,
+        "phase": "script.enter",
+        "ns": 45126626882900,
+        "files": 1
+      },
+      {
+        "pid": 26796,
+        "phase": "script.enter",
+        "ns": 45126626917600,
+        "files": 1
+      },
+      {
+        "pid": 7272,
+        "phase": "script.enter",
+        "ns": 45126628446300,
+        "files": 1
+      },
+      {
+        "pid": 10796,
+        "phase": "script.enter",
+        "ns": 45126629644500,
+        "files": 1
+      },
+      {
+        "pid": 12596,
+        "phase": "autoload.begin",
+        "ns": 45126632646000,
+        "files": 6
+      },
+      {
+        "pid": 10796,
+        "phase": "autoload.begin",
+        "ns": 45126632945400,
+        "files": 6
+      },
+      {
+        "pid": 26796,
+        "phase": "autoload.begin",
+        "ns": 45126633007200,
+        "files": 6
+      },
+      {
+        "pid": 7272,
+        "phase": "autoload.begin",
+        "ns": 45126633022900,
+        "files": 6
+      },
+      {
+        "pid": 7272,
+        "phase": "autoload.end",
+        "ns": 45126690764900,
+        "files": 65
+      },
+      {
+        "pid": 10796,
+        "phase": "autoload.end",
+        "ns": 45126691353800,
+        "files": 65
+      },
+      {
+        "pid": 26796,
+        "phase": "autoload.end",
+        "ns": 45126691504200,
+        "files": 65
+      },
+      {
+        "pid": 12596,
+        "phase": "autoload.end",
+        "ns": 45126691534900,
+        "files": 65
+      },
+      {
+        "pid": 12596,
+        "phase": "boot.begin",
+        "ns": 45126694944100,
+        "files": 73
+      },
+      {
+        "pid": 26796,
+        "phase": "boot.begin",
+        "ns": 45126695405700,
+        "files": 73
+      },
+      {
+        "pid": 10796,
+        "phase": "boot.begin",
+        "ns": 45126695432300,
+        "files": 73
+      },
+      {
+        "pid": 7272,
+        "phase": "boot.begin",
+        "ns": 45126695403900,
+        "files": 73
+      },
+      {
+        "pid": 7272,
+        "phase": "boot.end",
+        "ns": 45127003158600,
+        "files": 439
+      },
+      {
+        "pid": 10796,
+        "phase": "boot.end",
+        "ns": 45127003410600,
+        "files": 439
+      },
+      {
+        "pid": 26796,
+        "phase": "boot.end",
+        "ns": 45127003624600,
+        "files": 439
+      },
+      {
+        "pid": 12596,
+        "phase": "boot.end",
+        "ns": 45127003670900,
+        "files": 439
+      },
+      {
+        "pid": 7272,
+        "phase": "ready",
+        "ns": 45127003839300,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "ready",
+        "ns": 45127003850000,
+        "files": 440
+      },
+      {
+        "pid": 10796,
+        "phase": "ready",
+        "ns": 45127003880300,
+        "files": 440
+      },
+      {
+        "pid": 12596,
+        "phase": "ready",
+        "ns": 45127003904900,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "frame.received",
+        "ns": 45127780845600,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "frame.decoded",
+        "ns": 45127780981900,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "request.build.begin",
+        "ns": 45127781002700,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "request.build.end",
+        "ns": 45127781103500,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "handle.begin",
+        "ns": 45127781124700,
+        "files": 440
+      },
+      {
+        "pid": 26796,
+        "phase": "gateway.begin",
+        "ns": 45127783492900,
+        "files": 443
+      },
+      {
+        "pid": 26796,
+        "phase": "gateway.end",
+        "ns": 45127904369700,
+        "files": 563
+      },
+      {
+        "pid": 26796,
+        "phase": "terminate.begin",
+        "ns": 45127904815500,
+        "files": 564
+      },
+      {
+        "pid": 26796,
+        "phase": "terminate.end",
+        "ns": 45127910125300,
+        "files": 572
+      },
+      {
+        "pid": 26796,
+        "phase": "handle.end",
+        "ns": 45127910203400,
+        "files": 572
+      },
+      {
+        "pid": 26796,
+        "phase": "cleanup.end",
+        "ns": 45127911537700,
+        "files": 573
+      },
+      {
+        "pid": 26796,
+        "phase": "flush.begin",
+        "ns": 45127911596900,
+        "files": 573
+      },
+      {
+        "pid": 26796,
+        "phase": "flush.end",
+        "ns": 45127911642400,
+        "files": 573
+      }
+    ]
+  },
+  {
+    "cycle": 3,
+    "parent_pid": 20392,
+    "log": "D:\\Project\\Hamster-Wheel\\target\\tools\\benchmark-20261101\\laravel-cold-phases.logs\\hamster-wheel.exe-o9bnimt_.log",
+    "request_timeout_seconds": 5,
+    "same_scratch_app": true,
+    "identities": [
+      {
+        "pid": 23616,
+        "created": 134380174503621560
+      },
+      {
+        "pid": 7460,
+        "created": 134380174503229827
+      },
+      {
+        "pid": 20392,
+        "created": 134380174503174175
+      },
+      {
+        "pid": 200,
+        "created": 134380174503568341
+      },
+      {
+        "pid": 23372,
+        "created": 134380174503635353
+      },
+      {
+        "pid": 18704,
+        "created": 134380174503671417
+      },
+      {
+        "pid": 16432,
+        "created": 134380174503593033
+      },
+      {
+        "pid": 23440,
+        "created": 134380174503467477
+      },
+      {
+        "pid": 19416,
+        "created": 134380174503550321
+      },
+      {
+        "pid": 26748,
+        "created": 134380174503580496
+      }
+    ],
+    "status": 200,
+    "body": "login placeholder",
+    "elapsed_seconds": 0.07354119999945397,
+    "log_text": "PHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23616,\"phase\":\"script.enter\",\"ns\":45128591938900,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":19416,\"phase\":\"script.enter\",\"ns\":45128592021300,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"script.enter\",\"ns\":45128593570600,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26748,\"phase\":\"script.enter\",\"ns\":45128594549800,\"files\":1}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23616,\"phase\":\"autoload.begin\",\"ns\":45128596901600,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":19416,\"phase\":\"autoload.begin\",\"ns\":45128597029600,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26748,\"phase\":\"autoload.begin\",\"ns\":45128597001300,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"autoload.begin\",\"ns\":45128597399300,\"files\":6}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":19416,\"phase\":\"autoload.end\",\"ns\":45128645677100,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26748,\"phase\":\"autoload.end\",\"ns\":45128645953000,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"autoload.end\",\"ns\":45128647075100,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23616,\"phase\":\"autoload.end\",\"ns\":45128647075000,\"files\":65}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"boot.begin\",\"ns\":45128649042400,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23616,\"phase\":\"boot.begin\",\"ns\":45128649096700,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":19416,\"phase\":\"boot.begin\",\"ns\":45128649243500,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26748,\"phase\":\"boot.begin\",\"ns\":45128649334900,\"files\":73}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23616,\"phase\":\"boot.end\",\"ns\":45128956586900,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"boot.end\",\"ns\":45128956702900,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26748,\"phase\":\"boot.end\",\"ns\":45128956850100,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":19416,\"phase\":\"boot.end\",\"ns\":45128956864500,\"files\":439}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23616,\"phase\":\"ready\",\"ns\":45128957082000,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"ready\",\"ns\":45128957132700,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":19416,\"phase\":\"ready\",\"ns\":45128957311600,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":26748,\"phase\":\"ready\",\"ns\":45128957346400,\"files\":440}\nPHP worker pool localhost/ worker 23440 ready after 478.242 ms\nPHP worker pool localhost/ worker 19416 ready after 478.421 ms\nPHP worker pool localhost/ worker 23616 ready after 478.154 ms\nPHP worker pool localhost/ worker 26748 ready after 478.361 ms\nRequest body memory budget 67108864 bytes\nHamster Wheel listening on http://127.0.0.1:8080\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"frame.received\",\"ns\":45129505525900,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"frame.decoded\",\"ns\":45129505638900,\"files\":440}\nHAMSTER_PHASE {\"pid\":23440,\"phase\":\"request.build.begin\",\"ns\":45129505655600,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"request.build.end\",\"ns\":45129505738900,\"files\":440}\nHAMSTER_PHASE {\"pid\":23440,\"phase\":\"handle.begin\",\"ns\":45129505754700,\"files\":440}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"gateway.begin\",\"ns\":45129507012700,\"files\":443}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"gateway.end\",\"ns\":45129555638800,\"files\":563}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"terminate.begin\",\"ns\":45129555898100,\"files\":564}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"terminate.end\",\"ns\":45129558921700,\"files\":572}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"handle.end\",\"ns\":45129558977100,\"files\":572}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"cleanup.end\",\"ns\":45129559641600,\"files\":573}\nPHP worker pool localhost/ stderr: HAMSTER_PHASE {\"pid\":23440,\"phase\":\"flush.begin\",\"ns\":45129559672800,\"files\":573}\nHAMSTER_PHASE {\"pid\":23440,\"phase\":\"flush.end\",\"ns\":45129559696700,\"files\":573}\n",
+    "phases": [
+      {
+        "pid": 23616,
+        "phase": "script.enter",
+        "ns": 45128591938900,
+        "files": 1
+      },
+      {
+        "pid": 19416,
+        "phase": "script.enter",
+        "ns": 45128592021300,
+        "files": 1
+      },
+      {
+        "pid": 23440,
+        "phase": "script.enter",
+        "ns": 45128593570600,
+        "files": 1
+      },
+      {
+        "pid": 26748,
+        "phase": "script.enter",
+        "ns": 45128594549800,
+        "files": 1
+      },
+      {
+        "pid": 23616,
+        "phase": "autoload.begin",
+        "ns": 45128596901600,
+        "files": 6
+      },
+      {
+        "pid": 19416,
+        "phase": "autoload.begin",
+        "ns": 45128597029600,
+        "files": 6
+      },
+      {
+        "pid": 26748,
+        "phase": "autoload.begin",
+        "ns": 45128597001300,
+        "files": 6
+      },
+      {
+        "pid": 23440,
+        "phase": "autoload.begin",
+        "ns": 45128597399300,
+        "files": 6
+      },
+      {
+        "pid": 19416,
+        "phase": "autoload.end",
+        "ns": 45128645677100,
+        "files": 65
+      },
+      {
+        "pid": 26748,
+        "phase": "autoload.end",
+        "ns": 45128645953000,
+        "files": 65
+      },
+      {
+        "pid": 23440,
+        "phase": "autoload.end",
+        "ns": 45128647075100,
+        "files": 65
+      },
+      {
+        "pid": 23616,
+        "phase": "autoload.end",
+        "ns": 45128647075000,
+        "files": 65
+      },
+      {
+        "pid": 23440,
+        "phase": "boot.begin",
+        "ns": 45128649042400,
+        "files": 73
+      },
+      {
+        "pid": 23616,
+        "phase": "boot.begin",
+        "ns": 45128649096700,
+        "files": 73
+      },
+      {
+        "pid": 19416,
+        "phase": "boot.begin",
+        "ns": 45128649243500,
+        "files": 73
+      },
+      {
+        "pid": 26748,
+        "phase": "boot.begin",
+        "ns": 45128649334900,
+        "files": 73
+      },
+      {
+        "pid": 23616,
+        "phase": "boot.end",
+        "ns": 45128956586900,
+        "files": 439
+      },
+      {
+        "pid": 23440,
+        "phase": "boot.end",
+        "ns": 45128956702900,
+        "files": 439
+      },
+      {
+        "pid": 26748,
+        "phase": "boot.end",
+        "ns": 45128956850100,
+        "files": 439
+      },
+      {
+        "pid": 19416,
+        "phase": "boot.end",
+        "ns": 45128956864500,
+        "files": 439
+      },
+      {
+        "pid": 23616,
+        "phase": "ready",
+        "ns": 45128957082000,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "ready",
+        "ns": 45128957132700,
+        "files": 440
+      },
+      {
+        "pid": 19416,
+        "phase": "ready",
+        "ns": 45128957311600,
+        "files": 440
+      },
+      {
+        "pid": 26748,
+        "phase": "ready",
+        "ns": 45128957346400,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "frame.received",
+        "ns": 45129505525900,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "frame.decoded",
+        "ns": 45129505638900,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "request.build.begin",
+        "ns": 45129505655600,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "request.build.end",
+        "ns": 45129505738900,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "handle.begin",
+        "ns": 45129505754700,
+        "files": 440
+      },
+      {
+        "pid": 23440,
+        "phase": "gateway.begin",
+        "ns": 45129507012700,
+        "files": 443
+      },
+      {
+        "pid": 23440,
+        "phase": "gateway.end",
+        "ns": 45129555638800,
+        "files": 563
+      },
+      {
+        "pid": 23440,
+        "phase": "terminate.begin",
+        "ns": 45129555898100,
+        "files": 564
+      },
+      {
+        "pid": 23440,
+        "phase": "terminate.end",
+        "ns": 45129558921700,
+        "files": 572
+      },
+      {
+        "pid": 23440,
+        "phase": "handle.end",
+        "ns": 45129558977100,
+        "files": 572
+      },
+      {
+        "pid": 23440,
+        "phase": "cleanup.end",
+        "ns": 45129559641600,
+        "files": 573
+      },
+      {
+        "pid": 23440,
+        "phase": "flush.begin",
+        "ns": 45129559672800,
+        "files": 573
+      },
+      {
+        "pid": 23440,
+        "phase": "flush.end",
+        "ns": 45129559696700,
+        "files": 573
+      }
+    ]
+  }
+]

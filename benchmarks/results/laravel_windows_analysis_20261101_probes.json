@@ -1,0 +1,188 @@
+{
+  "kind": "semantic/lifecycle correctness probes, NOT performance benchmark",
+  "frankenphp": "FrankenPHP 1.13.4 PHP 8.5.12 Caddy v2.11.7 h1:yj0Y4fYZGPkSvibBJ1sTWE33xC0fxztVyXEW5iIdUT4=",
+  "identities": [
+    {
+      "pid": 12840,
+      "created": 134380195259400768
+    },
+    {
+      "pid": 27148,
+      "created": 134380195259289548
+    },
+    {
+      "pid": 12840,
+      "created": 134380195259400768
+    },
+    {
+      "pid": 27148,
+      "created": 134380195259289548
+    },
+    {
+      "pid": 396,
+      "created": 134380195577352979
+    },
+    {
+      "pid": 25772,
+      "created": 134380195577276775
+    },
+    {
+      "pid": 396,
+      "created": 134380195577352979
+    },
+    {
+      "pid": 25772,
+      "created": 134380195577276775
+    }
+  ],
+  "logs": [
+    "D:\\Project\\Hamster-Wheel\\target\\tools\\benchmark-20261101\\laravel-analysis.logs\\frankenphp.exe-rpf6672_.log",
+    "D:\\Project\\Hamster-Wheel\\target\\tools\\benchmark-20261101\\laravel-analysis.logs\\frankenphp.exe-43hxyhyy.log"
+  ],
+  "source_hashes": {
+    "www/laravel/composer.lock": "6832e8b07471ae7b045ac9ceeb29c9033f00ad2b567c5fd3e410d8f2d45bfa03",
+    "www/laravel/vendor/laravel/octane/bin/frankenphp-worker.php": "7ff015fe661ea86f389f25b46c3b614bae8835487dd3a9aef5ec668d35c8bf4a",
+    "www/laravel/vendor/symfony/http-foundation/Response.php": "424ddb7fb3d79f1db899dc2f5f39930218a89e5457330d5ec573dd9d719642cf",
+    "benchmarks/frankenphp_windows.py": "07734e53891694ec676f760024106432036848470e192924fa73a0a760513e61"
+  },
+  "response_boundary": {
+    "runtime": {
+      "pid": 27148,
+      "sapi": "frankenphp",
+      "fastcgi_finish_request": true,
+      "frankenphp_finish_request": true,
+      "headers": [
+        "X-Powered-By: PHP/8.5.12",
+        "Cache-Control: no-cache, private",
+        "Date: Sun, 01 Nov 2026 15:12:07 GMT",
+        "Content-type: text/html; charset=UTF-8"
+      ]
+    },
+    "headers_before_release": true,
+    "full_body_before_release": true,
+    "client": {
+      "status": 200,
+      "body": "semantic probe"
+    },
+    "headers": {
+      "status": 200,
+      "headers": [
+        [
+          "Cache-Control",
+          "no-cache, private"
+        ],
+        [
+          "Content-Type",
+          "text/html; charset=UTF-8"
+        ],
+        [
+          "Date",
+          "Sun, 01 Nov 2026 15:12:07 GMT"
+        ],
+        [
+          "Server",
+          "FrankenPHP Caddy"
+        ],
+        [
+          "X-Powered-By",
+          "PHP/8.5.12"
+        ],
+        [
+          "Content-Length",
+          "14"
+        ]
+      ]
+    },
+    "tail_completed_after_release": true,
+    "probe_does_not_infer_full_octane_cleanup_cost": true
+  },
+  "octane_default_recycle": {
+    "requests": 4200,
+    "statuses": {
+      "200": 4200
+    },
+    "errors": {},
+    "starts": 8,
+    "ends": 4,
+    "events": [
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "908198ce30c59360",
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "70c8c13e3f4d2679",
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "8c7be6541c5d0ff2",
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "6354cec248f0f0dd",
+        "limit": 1000
+      },
+      {
+        "phase": "end",
+        "pid": 25772,
+        "token": "70c8c13e3f4d2679",
+        "handled": 1000,
+        "limit": 1000
+      },
+      {
+        "phase": "end",
+        "pid": 25772,
+        "token": "908198ce30c59360",
+        "handled": 1000,
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "b2dbdb39ab15e0be",
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "6d8a484d4008140c",
+        "limit": 1000
+      },
+      {
+        "phase": "end",
+        "pid": 25772,
+        "token": "8c7be6541c5d0ff2",
+        "handled": 1000,
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "45298486fe15e804",
+        "limit": 1000
+      },
+      {
+        "phase": "end",
+        "pid": 25772,
+        "token": "6354cec248f0f0dd",
+        "handled": 1000,
+        "limit": 1000
+      },
+      {
+        "phase": "start",
+        "pid": 25772,
+        "token": "c64c3fc391d9efee",
+        "limit": 1000
+      }
+    ],
+    "MAX_REQUESTS_unset_in_child_environment": true,
+    "not_a_throughput_result": true
+  }
+}
