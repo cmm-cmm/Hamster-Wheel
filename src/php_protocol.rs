@@ -142,9 +142,33 @@ where
         return Err(too_large(payload.len()));
     }
     let length = u32::try_from(payload.len()).map_err(|_| too_large(payload.len()))?;
+    write_parts_tracked(writer, &[&length.to_be_bytes()[..], payload]).await
+}
 
+/// Writes an encoded REQUEST frame, with the same failure accounting as
+/// [`write_frame_tracked`].
+pub(crate) async fn write_request_frame_tracked<W>(
+    writer: &mut W,
+    frame: &RequestFrame<'_>,
+) -> Result<(), FrameWriteError>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_parts_tracked(writer, &frame.parts()).await
+}
+
+/// Writes `parts` back to back and flushes. `write_all` cannot say how far it
+/// got, so every part goes through one loop that counts its own progress.
+///
+/// Each `write` on a Tokio child pipe is a round trip through the blocking
+/// pool, which is why callers hand over as few parts as they can.
+async fn write_parts_tracked<W>(writer: &mut W, parts: &[&[u8]]) -> Result<(), FrameWriteError>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut transferred = 0_usize;
-    for mut chunk in [&length.to_be_bytes()[..], payload] {
+    for &part in parts {
+        let mut chunk = part;
         while !chunk.is_empty() {
             match writer.write(chunk).await {
                 Ok(0) => {
@@ -208,17 +232,57 @@ pub(crate) fn decode_ready(payload: &[u8]) -> Result<ReadyFrame, ProtocolError> 
     Ok(ReadyFrame { pid })
 }
 
-pub(crate) fn encode_request(
+/// Bodies up to this size are copied into the frame's head, so the whole
+/// frame reaches the pipe in one write. Larger ones are written from the
+/// request's own buffer instead of being copied a second time.
+///
+/// On Windows each write on a Tokio child pipe is a blocking-pool round trip,
+/// which costs more than copying a small body. A large body is the opposite
+/// case: a second buffer of that size is a fresh allocation whose pages are
+/// faulted in on every request. The boundary matches the 64 KiB pipe buffer.
+const INLINE_BODY_LIMIT: usize = 64 * 1024;
+
+/// A REQUEST frame ready for the pipe: the length prefix and every field up to
+/// and including the body length in `head`, then the body bytes that were not
+/// copied into it. Written back to back, the parts are exactly the bytes of
+/// one length-prefixed frame; the split is invisible to the worker.
+pub(crate) struct RequestFrame<'a> {
+    head: Vec<u8>,
+    body: &'a [u8],
+}
+
+impl RequestFrame<'_> {
+    fn parts(&self) -> [&[u8]; 2] {
+        [&self.head, self.body]
+    }
+}
+
+pub(crate) fn encode_request_frame(
     request_id: u64,
     request: &WorkerRequest,
-) -> Result<Vec<u8>, ProtocolError> {
+) -> Result<RequestFrame<'_>, ProtocolError> {
     if request.headers.len() > MAX_HEADERS {
         return Err(ProtocolError::Invalid(format!(
             "request has {} headers; maximum is {MAX_HEADERS}",
             request.headers.len()
         )));
     }
-    let mut payload = Vec::new();
+    let inline = request.body.len() <= INLINE_BODY_LIMIT;
+    // Fixed fields: kind, id, version, scheme, two endpoints of at most
+    // 1 + 16 + 2 bytes, five length prefixes and the header count.
+    let fields = request
+        .headers
+        .iter()
+        .map(|(name, value)| 6 + name.len() + value.len())
+        .sum::<usize>()
+        + request.method.len()
+        + request.uri.len()
+        + request.path.len()
+        + request.query.len()
+        + if inline { request.body.len() } else { 0 };
+    let mut payload = Vec::with_capacity(4 + 11 + 2 * 19 + 18 + 2 + fields);
+    // The length prefix, filled in once the payload length is known.
+    payload.extend_from_slice(&[0; 4]);
     payload.push(REQUEST);
     push_u64(&mut payload, request_id);
     payload.push(match request.http_version {
@@ -244,10 +308,39 @@ pub(crate) fn encode_request(
         push_bytes_u16(&mut payload, name, "header name")?;
         push_bytes_u32(&mut payload, value, "header value")?;
     }
-    push_bytes_u32(&mut payload, &request.body, "body")?;
-    if payload.len() > MAX_FRAME_LEN {
-        return Err(ProtocolError::FrameTooLarge(payload.len()));
+    let body: &[u8] = if inline {
+        push_bytes_u32(&mut payload, &request.body, "body")?;
+        &[]
+    } else {
+        push_u32(
+            &mut payload,
+            u32::try_from(request.body.len()).map_err(|_| {
+                ProtocolError::Invalid(format!("body length {} exceeds u32", request.body.len()))
+            })?,
+        );
+        &request.body
+    };
+    let length = payload.len() - 4 + body.len();
+    if length > MAX_FRAME_LEN {
+        return Err(ProtocolError::FrameTooLarge(length));
     }
+    let prefix = u32::try_from(length).map_err(|_| ProtocolError::FrameTooLarge(length))?;
+    payload[..4].copy_from_slice(&prefix.to_be_bytes());
+    Ok(RequestFrame {
+        head: payload,
+        body,
+    })
+}
+
+/// The REQUEST payload without its length prefix, as one buffer.
+#[cfg(test)]
+pub(crate) fn encode_request(
+    request_id: u64,
+    request: &WorkerRequest,
+) -> Result<Vec<u8>, ProtocolError> {
+    let frame = encode_request_frame(request_id, request)?;
+    let mut payload = frame.head[4..].to_vec();
+    payload.extend_from_slice(frame.body);
     Ok(payload)
 }
 
@@ -419,9 +512,8 @@ mod tests {
         SocketAddr::new(address, decoder.u16().unwrap())
     }
 
-    #[test]
-    fn request_encoding_is_binary_safe_and_preserves_repeated_headers() {
-        let request = WorkerRequest {
+    fn sample_request() -> WorkerRequest {
+        WorkerRequest {
             http_version: WorkerHttpVersion::Http10,
             scheme: Scheme::Https,
             peer_addr: "127.0.0.2:43210".parse().unwrap(),
@@ -435,7 +527,12 @@ mod tests {
                 (b"x-repeat".to_vec(), b"two\0\nthree".to_vec()),
             ],
             body: vec![0, 10, 13, 255],
-        };
+        }
+    }
+
+    #[test]
+    fn request_encoding_is_binary_safe_and_preserves_repeated_headers() {
+        let request = sample_request();
         let encoded = encode_request(7, &request).unwrap();
         let mut decoder = Decoder::new(&encoded);
         decoder.expect_kind(REQUEST, "REQUEST").unwrap();
@@ -457,6 +554,97 @@ mod tests {
         assert_eq!(decoder.bytes_u32().unwrap(), request.body);
         decoder.finish().unwrap();
         assert!(encoded.windows(4).any(|bytes| bytes == [0, 10, 13, 255]));
+    }
+
+    #[test]
+    fn request_frame_is_one_length_prefixed_frame_whether_or_not_the_body_is_copied() {
+        // Either side of the inline limit, the bytes on the pipe must be
+        // exactly what `read_frame` expects: a prefix giving the length of the
+        // rest, then the payload. Only where the body comes from may differ.
+        for size in [
+            0,
+            1,
+            INLINE_BODY_LIMIT - 1,
+            INLINE_BODY_LIMIT,
+            INLINE_BODY_LIMIT + 1,
+            1024 * 1024,
+        ] {
+            let request = WorkerRequest {
+                body: (0..size).map(|index| index as u8).collect(),
+                ..sample_request()
+            };
+            let frame = encode_request_frame(9, &request).unwrap();
+            let wire = frame.parts().concat();
+            let length = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+            assert_eq!(length, wire.len() - 4, "body {size}");
+            assert_eq!(
+                wire[4..],
+                encode_request(9, &request).unwrap(),
+                "body {size}"
+            );
+
+            let mut decoder = Decoder::new(&wire[4..]);
+            decoder.expect_kind(REQUEST, "REQUEST").unwrap();
+            assert_eq!(decoder.u64().unwrap(), 9);
+            decoder.bytes(2).unwrap();
+            decode_endpoint(&mut decoder);
+            decode_endpoint(&mut decoder);
+            decoder.bytes_u16().unwrap();
+            for _ in 0..3 {
+                decoder.bytes_u32().unwrap();
+            }
+            for _ in 0..decoder.u16().unwrap() {
+                decoder.bytes_u16().unwrap();
+                decoder.bytes_u32().unwrap();
+            }
+            assert_eq!(decoder.bytes_u32().unwrap(), request.body, "body {size}");
+            decoder.finish().unwrap();
+
+            if size > INLINE_BODY_LIMIT {
+                // The large body is not copied a second time.
+                assert!(frame.head.len() < 1024, "body {size}");
+                assert_eq!(frame.body.as_ptr(), request.body.as_ptr());
+            } else {
+                // A small frame leaves in a single write.
+                assert!(frame.body.is_empty(), "body {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_frame_refuses_a_payload_over_the_frame_limit() {
+        let request = WorkerRequest {
+            body: vec![0; MAX_FRAME_LEN],
+            ..sample_request()
+        };
+        assert!(matches!(
+            encode_request_frame(1, &request),
+            Err(ProtocolError::FrameTooLarge(length)) if length > MAX_FRAME_LEN
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_request_frame_write_counts_bytes_across_both_parts() {
+        let request = WorkerRequest {
+            body: vec![7; INLINE_BODY_LIMIT + 1],
+            ..sample_request()
+        };
+        let frame = encode_request_frame(3, &request).unwrap();
+        let head = frame.head.len();
+
+        // Failing inside the body still reports the whole head as handed over,
+        // so the transaction is classified as possibly started.
+        let error = write_request_frame_tracked(&mut FailingWriter { accept: head + 5 }, &frame)
+            .await
+            .expect_err("a writer that fails inside the body must fail");
+        assert_eq!(error.transferred, head + 5);
+
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let read = tokio::spawn(async move { read_frame(&mut reader).await.unwrap() });
+        write_request_frame_tracked(&mut writer, &frame)
+            .await
+            .unwrap();
+        assert_eq!(read.await.unwrap(), encode_request(3, &request).unwrap());
     }
 
     #[test]

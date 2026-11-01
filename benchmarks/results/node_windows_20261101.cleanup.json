@@ -1,0 +1,10 @@
+{
+  "checked_at": "2026-11-01T14:10:49.084647+00:00",
+  "recorded_process_identities": 294,
+  "matching_live_identities": [],
+  "owned_temporary_roots": [],
+  "benchmark_port_8080_listening": false,
+  "all_recorded_binary_source_hashes_unchanged": true,
+  "termination_policy": "retained subprocess/worker process handles only; no name or snapshot-PID kill",
+  "retained_artifacts": "runtime cache, smoke evidence and logs retained; measured JSONL, metadata and logs persisted"
+}

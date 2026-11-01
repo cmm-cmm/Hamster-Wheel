@@ -2,7 +2,7 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=icon/hamster-wheel.ico");
+    println!("cargo:rerun-if-changed=icon/icons/hamster-wheel.ico");
     // A new commit changes the stamp below, so the build must not be cached
     // across one. HEAD moves on every commit, checkout and rebase.
     println!("cargo:rerun-if-changed=.git/HEAD");
@@ -48,7 +48,7 @@ fn build_stamp() -> String {
 fn windows_resource_script(build: &str) -> PathBuf {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("cargo sets the manifest"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let icon = manifest.join("icon/hamster-wheel.ico");
+    let icon = manifest.join("icon/icons/hamster-wheel.ico");
     let version = env::var("CARGO_PKG_VERSION").expect("cargo sets the package version");
     let description =
         env::var("CARGO_PKG_DESCRIPTION").unwrap_or_else(|_| "Hamster Wheel".to_owned());

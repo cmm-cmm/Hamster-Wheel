@@ -10,22 +10,35 @@ run, summed over the same processes: working set, which counts shared pages
 once per process, and private bytes (commit charge), which does not.
 
   python benchmarks/frankenphp_windows.py [--frankenphp PATH] [--oha PATH]
-      [--laravel APP] [--runs N] [--bin PATH] [--against PATH] [--only TEXT]
+      [--laravel APP | --laravel-source APP] [--runs N] [--bin PATH] [--against PATH] [--only TEXT]
+      [--php-dir PATH] [--duration SECONDS] [--output PATH]
       [GROUP ...]
 
 --against replaces FrankenPHP with a second Hamster binary, for an
 interleaved A/B between two builds.
 
-GROUP is baseline, static, worker, classic, laravel or all (the default;
-laravel only with --laravel). baseline answers 404 without a file or PHP on
+GROUP is baseline, static, worker, classic, laravel, heavy or all (the default;
+laravel only with an app; heavy is opt-in, not included in all). baseline answers 404 without a file or PHP on
 both servers: the cost of the HTTP layer alone. php-cgi on Windows serves one connection per process, so the
 classic cells start four php-cgi processes on four ports for Hamster, matching
 FrankenPHP's four PHP threads. FrankenPHP gets a php.ini written to a temporary
 directory through PHPRC, so no php.ini beside its executable is used. Build
 release first. Ports 8080 and 9101-9104 must be free.
+
+--php-dir selects an isolated PHP distribution without replacing the operator's
+runtime. --duration uses timed measured runs (warm-up remains request-counted)
+and waits for requests in flight at the deadline. --output stores every run,
+not just the console summary, for spread and latency/resource analysis.
+--laravel-source stages a trusted skeleton without its .env, storage, database
+or old caches; never point it at a real application with side-effecting boot
+providers. Heavy cells share their computation, verify bodies before/after,
+and report 200 goodput separately from intentional bounded-queue 503s.
 """
 import argparse
+import base64
 import ctypes
+import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -38,6 +51,7 @@ from ctypes import wintypes
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__))).replace("\\", "/")
 PHP_DIR = f"{REPO}/php/8.5"
+LOG_DIR = None
 FASTCGI_PORTS = (9101, 9102, 9103, 9104)
 CREATE_NO_WINDOW = 0x08000000
 SITE = "http://127.0.0.1:8080, http://localhost:8080"
@@ -162,9 +176,12 @@ def write(path, text):
     return path
 
 
-def wait_for_port(port, seconds=60):
+def wait_for_port(port, seconds=60, process=None):
     deadline = time.time() + seconds
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"server exited before readiness: code=0x{process.returncode & 0xffffffff:08X}, "
+                               f"log={getattr(process, 'benchmark_log', None)}")
         try:
             socket.create_connection(("127.0.0.1", port), 0.2).close()
             return
@@ -185,6 +202,14 @@ def wait_for_free(port, seconds=15):
 
 
 def start(command, environment=None):
+    if LOG_DIR:
+        fd, path = tempfile.mkstemp(prefix=os.path.basename(command[0]) + "-",
+                                    suffix=".log", dir=LOG_DIR)
+        with os.fdopen(fd, "wb") as log:
+            process = subprocess.Popen(command, env=environment, stdout=log,
+                                       stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW)
+        process.benchmark_log = path
+        return process
     return subprocess.Popen(command, env=environment, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
 
@@ -202,15 +227,32 @@ def stop(process):
     process.wait(15)
 
 
-def load(oha, path, requests, concurrency, method, body):
-    command = [oha, "--no-tui", "--output-format", "json", "-n", str(requests),
+def load(oha, path, requests, concurrency, method, body, duration=None):
+    command = [oha, "--no-tui", "--output-format", "json",
                "-c", str(concurrency), "-m", method]
+    command += (["-z", f"{duration}s", "-w"] if duration else ["-n", str(requests)])
     if body is not None:
-        command += ["-d", body]
+        command += (["-D", body["file"]] if isinstance(body, dict) else ["-d", body])
     command.append(f"http://127.0.0.1:8080{path}")
     output = subprocess.run(command, check=True, capture_output=True, text=True,
                             creationflags=CREATE_NO_WINDOW).stdout
     return json.loads(output)
+
+
+def check_response(path, method, body, expected, verify_body):
+    payload = body
+    if isinstance(body, dict):
+        with open(body["file"], "rb") as handle:
+            payload = handle.read()
+    client = http.client.HTTPConnection("127.0.0.1", 8080, timeout=60)
+    try:
+        client.request(method, path, body=payload)
+        response = client.getresponse()
+        if response.status != expected or not verify_body(response.read()):
+            raise RuntimeError(f"body verification failed: {path}, status={response.status}")
+        return True
+    finally:
+        client.close()
 
 
 # --------------------------------------------------------------- configuration
@@ -253,7 +295,53 @@ LARAVEL_ENV = {
     "LOG_CHANNEL": "stderr",
     "LOG_LEVEL": "error",
     "HAMSTER_PMS_PROBE": "1",
+    "DB_CONNECTION": "sqlite",
+    "DB_DATABASE": ":memory:",
+    "DB_URL": "",
+    "QUEUE_CONNECTION": "sync",
 }
+
+
+def prepare_laravel(source, destination, ini):
+    """Clone a trusted skeleton, never its .env, storage, database or caches."""
+    source = os.path.abspath(source)
+    with open(os.path.join(source, "composer.lock"), encoding="utf-8") as handle:
+        lock = json.load(handle)
+    packages = {p["name"]: p["version"] for p in lock["packages"]}
+    if not all(name in packages for name in ("laravel/framework", "laravel/octane")):
+        raise RuntimeError("Laravel source must have installed framework and Octane")
+    os.makedirs(destination)  # must be a fresh directory owned by this run
+    for name in ("app", "config", "public", "resources", "vendor"):
+        shutil.copytree(os.path.join(source, name), f"{destination}/{name}")
+    for name in ("artisan", "composer.json", "composer.lock"):
+        shutil.copy(os.path.join(source, name), destination)
+    for name in ("bootstrap/cache", "routes", "database", "storage/logs",
+                 "storage/framework/cache/data", "storage/framework/sessions",
+                 "storage/framework/views"):
+        os.makedirs(f"{destination}/{name}", exist_ok=True)
+    shutil.copy(os.path.join(source, "bootstrap/app.php"), f"{destination}/bootstrap/app.php")
+    write(f"{destination}/bootstrap/providers.php",
+          "<?php return [App\\Providers\\AppServiceProvider::class];\n")
+    write(f"{destination}/routes/console.php", "<?php\n")
+    write(f"{destination}/routes/web.php", """<?php
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/', fn () => view('welcome'));
+Route::get('/login', fn () => response('login placeholder', 200))->name('login');
+""")
+    key = base64.b64encode(os.urandom(32)).decode("ascii")
+    write(f"{destination}/.env", f"APP_KEY=base64:{key}\nAPP_NAME=HamsterBenchmark\n"
+          + "".join(f'{k}="{v}"\n' for k, v in LARAVEL_ENV.items()))
+    environment = dict(os.environ, **LARAVEL_ENV, PHPRC=ini, PHP_INI_SCAN_DIR="")
+    for command in ("config:cache", "view:cache"):
+        result = subprocess.run([f"{PHP_DIR}/php.exe", "-c", ini, "artisan", command],
+                                cwd=destination, env=environment, capture_output=True,
+                                text=True, creationflags=CREATE_NO_WINDOW)
+        if result.returncode:
+            raise RuntimeError(f"Laravel {command}: {result.stdout}\n{result.stderr}")
+    print(json.dumps(dict(prepared_laravel={name: packages[name] for name in
+                      ("laravel/framework", "laravel/octane")},
+                          config_cached=True, views_cached=True)), flush=True)
+    return destination
 
 
 def php_ini(extension_dir, laravel):
@@ -307,9 +395,10 @@ def configs(directory, static_root, laravel, hamster_ini):
         env = "".join(f'{k} = "{v}"\n' for k, v in LARAVEL_ENV.items())
         hamster["laravel"] = (hamster_head("php_worker") + php.format(PHP_DIR, REPO, 4).replace(
             "fixtures/php-worker/worker.php", "fixtures/php-worker/laravel_worker.php")
+            + 'startup_timeout = 30\n'
             + f'[hosts.locations.php.env]\nHAMSTER_LARAVEL_PATH = "{laravel}"\n'
             f'PHPRC = "{hamster_ini}"\n{env}')
-        franken_env = "".join(f"\t\t\tenv {k} {v}\n" for k, v in LARAVEL_ENV.items())
+        franken_env = "".join(f"\t\t\tenv {k} {json.dumps(v)}\n" for k, v in LARAVEL_ENV.items())
         franken["laravel"] = caddyfile(
             "\tfrankenphp {\n\t\tnum_threads 5\n\t\tworker {\n"
             f"\t\t\tfile \"{laravel}/public/frankenphp-worker.php\"\n\t\t\tnum 4\n"
@@ -318,6 +407,17 @@ def configs(directory, static_root, laravel, hamster_ini):
             f"\troute {{\n\t\troot * \"{laravel}/public\"\n\t\tphp_server {{\n"
             "\t\t\tindex frankenphp-worker.php\n\t\t\ttry_files {path} frankenphp-worker.php\n"
             "\t\t}\n\t}\n")
+    heavy_root = f"{directory}/heavy"
+    os.makedirs(heavy_root)
+    shutil.copy(f"{REPO}/benchmarks/fixtures/heavy_franken.php", f"{heavy_root}/index.php")
+    shutil.copy(f"{REPO}/benchmarks/fixtures/heavy_workload.php", heavy_root)
+    hamster["heavy"] = (hamster_head("php_worker") + php.format(PHP_DIR, REPO, 4)
+                         .replace("fixtures/php-worker/worker.php",
+                                  "benchmarks/fixtures/heavy_worker.php"))
+    franken["heavy"] = caddyfile(
+        "\tfrankenphp {\n\t\tnum_threads 5\n\t\tworker {\n"
+        f'\t\t\tfile "{heavy_root}/index.php"\n\t\t\tnum 4\n\t\t}}\n\t}}\n',
+        f'\troot * "{heavy_root}"\n\tphp_server\n')
     return ({name: write(f"{directory}/{name}.toml", text) for name, text in hamster.items()},
             {name: write(f"{directory}/{name}.Caddyfile", text) for name, text in franken.items()})
 
@@ -325,46 +425,72 @@ def configs(directory, static_root, laravel, hamster_ini):
 # ----------------------------------------------------------------- measurement
 
 def measure(oha, command, environment, path, requests, concurrency, expected, method, body,
-            fastcgi, warmup):
+            fastcgi, warmup, duration=None, verify_body=None, launch=None, finish=None):
     for port in (8080,) + (FASTCGI_PORTS if fastcgi else ()):
         wait_for_free(port)
     cgis = []
     server = None
     try:
         if fastcgi:
-            cgi_environment = dict(os.environ, PHP_FCGI_MAX_REQUESTS="0")
+            cgi_environment = dict(environment or os.environ, PHP_FCGI_MAX_REQUESTS="0")
             for port in FASTCGI_PORTS:
                 cgis.append(start([f"{PHP_DIR}/php-cgi.exe", "-d", "output_buffering=0", "-b",
                                    f"127.0.0.1:{port}"], cgi_environment))
             for port in FASTCGI_PORTS:
                 wait_for_port(port)
-        server = start(command, environment)
+        server = (launch or start)(command, environment)
         roots = [server.pid] + [c.pid for c in cgis]
-        wait_for_port(8080)
+        wait_for_port(8080, process=server)
         time.sleep(0.5)
-        load(oha, path, warmup, min(concurrency, 8), method, body)
+        if verify_body is not None:
+            check_response(path, method, body, expected, verify_body)
+        warmed = load(oha, path, warmup, min(concurrency, 8), method, body)
+        if (sum(warmed.get("errorDistribution", {}).values()) or
+                warmed["statusCodeDistribution"].get(str(expected), 0) != warmup):
+            raise RuntimeError(f"warm-up failed: {warmed}")
         time.sleep(0.3)
         before = cpu(tree(roots))
-        result = load(oha, path, requests, concurrency, method, body)
+        load_started = time.perf_counter()
+        result = load(oha, path, requests, concurrency, method, body, duration)
+        load_wall_seconds = time.perf_counter() - load_started
         pids = tree(roots)
         samples = {pid: sample(pid) for pid in pids}
         seconds = sum(s[0] - before.get(pid, 0.0) for pid, s in samples.items())
         percentiles = result["latencyPercentiles"]
         own = samples.get(server.pid, (0.0,))[0] - before.get(server.pid, 0.0)
+        errors = sum(result.get("errorDistribution", {}).values())
+        completed = sum(result["statusCodeDistribution"].values())
+        attempts = completed + errors
+        if not attempts:
+            raise RuntimeError("measurement returned no requests")
         return dict(rps=result["summary"]["requestsPerSec"], p50=percentiles["p50"] * 1e3,
                     p95=percentiles["p95"] * 1e3, p99=percentiles["p99"] * 1e3,
-                    cpu_us=seconds * 1e6 / requests,
+                    cpu_us=seconds * 1e6 / attempts,
                     # The server process alone, without PHP children or php-cgi.
-                    server_cpu_us=own * 1e6 / requests,
+                    server_cpu_us=own * 1e6 / attempts,
                     ws_mib=sum(s[1] for s in samples.values()) / 2**20,
                     private_mib=sum(s[2] for s in samples.values()) / 2**20,
                     processes=len(pids),
-                    unexpected=requests - result["statusCodeDistribution"].get(str(expected), 0),
-                    errors=sum(result.get("errorDistribution", {}).values()))
+                    requests=attempts, seconds=result["summary"]["total"],
+                    load_wall_seconds=load_wall_seconds,
+                    client_summary=result["summary"],
+                    status_codes=result["statusCodeDistribution"],
+                    error_distribution=result.get("errorDistribution", {}),
+                    goodput_rps=result["statusCodeDistribution"].get(str(expected), 0)
+                    / result["summary"]["total"],
+                    cpu_us_per_success=(seconds * 1e6 /
+                                        result["statusCodeDistribution"][str(expected)])
+                    if result["statusCodeDistribution"].get(str(expected)) else None,
+                    recovered_after_load=check_response(path, method, body, expected, verify_body)
+                    if verify_body is not None else None,
+                    identities=[dict(pid=pid, created=created(pid)) for pid in pids],
+                    logs=[getattr(p, "benchmark_log", None) for p in [server] + cgis],
+                    unexpected=attempts - result["statusCodeDistribution"].get(str(expected), 0),
+                    errors=errors)
     finally:
         # Whatever failed, nothing this run started outlives it.
         if server is not None:
-            stop(server)
+            (finish or stop)(server)
         for cgi in cgis:
             stop(cgi)
         time.sleep(0.5)
@@ -392,10 +518,16 @@ PLAN = [
     ("laravel", "laravel /login W4 C16", "laravel", "laravel", "/login", 10000, 16, 200),
     ("laravel", "laravel welcome W4 C1", "laravel", "laravel", "/", 2000, 1, 200),
     ("laravel", "laravel welcome W4 C16", "laravel", "laravel", "/", 5000, 16, 200),
+    ("heavy", "CPU SHA256x20000 W4 C16", "heavy", "heavy", "/cpu", 5000, 16, 200),
+    ("heavy", "POST 1 MiB digest W4 C16", "heavy", "heavy", "/body", 5000, 16, 200,
+     "POST", {"fixture": "1m"}),
+    ("heavy", "hello overload W4 C64", "heavy", "heavy", "/hello", 50000, 64, 200),
+    ("heavy", "hello overload W4 C128", "heavy", "heavy", "/hello", 50000, 128, 200),
 ]
 
 
 def main():
+    global PHP_DIR, LOG_DIR
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("groups", nargs="*", default=["all"])
     parser.add_argument("--frankenphp",
@@ -403,13 +535,23 @@ def main():
     parser.add_argument("--oha", default=shutil.which("oha") or
                         os.path.expanduser("~/.cargo/bin/oha.exe"))
     parser.add_argument("--laravel")
+    parser.add_argument("--laravel-source", help="clone a trusted Laravel skeleton into this run's temp root")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--bin", default=f"{REPO}/target/x86_64-pc-windows-msvc/release/"
                                          "hamster-wheel.exe")
     parser.add_argument("--only", help="run only the cells whose name contains this text")
     parser.add_argument("--against", help="a second Hamster binary to run in place of "
                                           "FrankenPHP, for a build-against-build A/B")
+    parser.add_argument("--php-dir", default=PHP_DIR)
+    parser.add_argument("--duration", type=float, help="seconds per measured run")
+    parser.add_argument("--output", help="new JSONL evidence file; never overwritten")
+    parser.add_argument("--log-dir", help="retain per-process diagnostic logs (default: OUTPUT.logs)")
     args = parser.parse_args()
+    if args.laravel and args.laravel_source:
+        parser.error("choose --laravel OR --laravel-source")
+    if args.runs < 3 or (args.duration is not None and args.duration <= 0):
+        parser.error("use at least three runs and a positive duration")
+    PHP_DIR = os.path.abspath(args.php_dir).replace("\\", "/")
     frankenphp = os.path.abspath(args.frankenphp)
     # CreateProcess does not resolve a relative path written with '/'.
     args.bin = os.path.abspath(args.bin)
@@ -417,12 +559,26 @@ def main():
     laravel = os.path.abspath(args.laravel).replace("\\", "/") if args.laravel else None
     groups = args.groups
     if "all" in groups:
-        groups = ["baseline", "static", "worker", "classic"] + (["laravel"] if laravel else [])
-    if "laravel" in groups and not laravel:
-        parser.error("the laravel group needs --laravel")
+        groups = ["baseline", "static", "worker", "classic"] + (["laravel"] if laravel or args.laravel_source else [])
+    if "laravel" in groups and not (laravel or args.laravel_source):
+        parser.error("the laravel group needs --laravel or --laravel-source")
     for path in (args.bin, args.against or frankenphp, args.oha):
         if not os.path.isfile(path):
             parser.error(f"not found: {path}")
+    for group in groups:
+        if group not in {row[0] for row in PLAN}:
+            parser.error(f"unknown group: {group}")
+    if any(group in groups for group in ("worker", "classic", "laravel", "heavy")):
+        for name in ("php.exe", "php-cgi.exe"):
+            if not os.path.isfile(f"{PHP_DIR}/{name}"):
+                parser.error(f"not found: {PHP_DIR}/{name}")
+    if args.output:
+        # Reserve a new evidence file before starting any processes.
+        with open(args.output, "x", encoding="utf-8"):
+            pass
+    if args.log_dir or args.output:
+        LOG_DIR = os.path.abspath(args.log_dir or (args.output + ".logs"))
+        os.makedirs(LOG_DIR, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="hamster-vs-frankenphp-") as directory:
         directory = directory.replace("\\", "/")
@@ -434,10 +590,18 @@ def main():
                 handle.write(os.urandom(size))
         franken_ext = os.path.dirname(frankenphp).replace("\\", "/") + "/ext"
         for name, ext, laravel_ini in (("hamster-ini", f"{PHP_DIR}/ext", True),
+                                       ("hamster-minimal-ini", f"{PHP_DIR}/ext", False),
                                        ("franken-ini", franken_ext, False),
                                        ("franken-laravel-ini", franken_ext, True)):
             os.makedirs(f"{directory}/{name}")
-            write(f"{directory}/{name}/php.ini", php_ini(ext, laravel_ini))
+            write(f"{directory}/{name}/php.ini", php_ini(ext, laravel_ini and "laravel" in groups))
+        if args.laravel_source:
+            laravel = prepare_laravel(args.laravel_source, f"{directory}/laravel",
+                                      f"{directory}/hamster-ini/php.ini")
+        body_file = f"{directory}/request-1m.bin"
+        if "heavy" in groups:
+            with open(body_file, "wb") as handle:
+                handle.write(b"x" * 1024 * 1024)
         hamster, franken = configs(directory, static_root, laravel,
                                    f"{directory}/hamster-ini/php.ini")
         stub = None
@@ -453,31 +617,64 @@ def main():
                 if group not in groups or (args.only and args.only not in cell):
                     continue
                 method, body = (rest[0], rest[1]) if rest else ("GET", None)
+                verify_body = None
+                if group == "heavy":
+                    if isinstance(body, dict):
+                        body = {"file": body_file}
+                        expected_body = hashlib.sha256(b"x" * 1024 * 1024).hexdigest().encode()
+                    elif path == "/cpu":
+                        expected_body = b"a" * 64
+                        for _ in range(20_000):
+                            expected_body = hashlib.sha256(expected_body).hexdigest().encode()
+                    else:
+                        expected_body = b"Hello from PHP"
+                    verify_body = lambda received, expected_body=expected_body: received == expected_body
+                elif group == "laravel":
+                    verify_body = ((lambda received: received == b"login placeholder") if path == "/login"
+                                   else (lambda received: b"Laravel" in received))
                 warmup = 200 if group == "classic" else 1000
                 ini = "franken-laravel-ini" if group == "laravel" else "franken-ini"
                 if args.against:
                     # Two Hamster builds in the same cells: a direct A/B.
-                    other = ("against", ([args.against, "--config", hamster[ham]], None))
+                    other = ("against", ([args.against, "--config", hamster[ham]],
+                                         dict(os.environ, PHPRC=f"{directory}/hamster-ini" if group == "laravel"
+                                              else f"{directory}/hamster-minimal-ini",
+                                              PHP_INI_SCAN_DIR="")))
                 else:
                     other = ("frankenphp", ([frankenphp, "run", "--config", franken[fr]],
-                                            dict(os.environ, PHPRC=f"{directory}/{ini}")))
-                arms = {"hamster": ([args.bin, "--config", hamster[ham]], None),
+                                            dict(os.environ, PHPRC=f"{directory}/{ini}",
+                                                 PHP_INI_SCAN_DIR="")))
+                arms = {"hamster": ([args.bin, "--config", hamster[ham]],
+                                    dict(os.environ, PHPRC=f"{directory}/hamster-ini" if group == "laravel"
+                                         else f"{directory}/hamster-minimal-ini",
+                                         PHP_INI_SCAN_DIR="")),
                         other[0]: other[1]}
                 order = ["hamster", other[0], other[0], "hamster"] * args.runs
                 order = order[:2 * args.runs]
                 rows = {arm: [] for arm in arms}
-                for arm in order:
+                for sequence, arm in enumerate(order, 1):
                     command, environment = arms[arm]
                     rows[arm].append(measure(args.oha, command, environment, path, requests,
                                              concurrency, expected, method, body,
                                              group == "classic" and arm != "frankenphp",
-                                             warmup))
+                                             warmup, args.duration, verify_body))
+                    if args.output:
+                        with open(args.output, "a", encoding="utf-8") as evidence:
+                            evidence.write(json.dumps(dict(
+                                cell=cell, server=arm, sequence=sequence,
+                                concurrency=concurrency, warmup=warmup,
+                                target_seconds=args.duration, **rows[arm][-1])) + "\n")
                 for arm, runs in rows.items():
                     runs.sort(key=lambda r: r["rps"])
                     median = runs[len(runs) // 2]
                     print(json.dumps(dict(
-                        cell=cell, server=arm, requests=requests, concurrency=concurrency,
+                        cell=cell, server=arm, requests=[r["requests"] for r in runs],
+                        concurrency=concurrency,
                         rps=[round(r["rps"]) for r in runs],
+                        goodput_rps=sorted(round(r["goodput_rps"]) for r in runs),
+                        status_codes={code: sum(r["status_codes"].get(code, 0) for r in runs)
+                                      for code in sorted({code for r in runs for code in r["status_codes"]})},
+                        elapsed_seconds=[round(r["seconds"], 3) for r in runs],
                         **{k: round(median[k], 3) for k in ("p50", "p95", "p99", "cpu_us",
                                                             "server_cpu_us", "ws_mib",
                                                             "private_mib")},

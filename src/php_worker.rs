@@ -33,8 +33,8 @@ use crate::{
     handler::{HandlerResponse, simple_response},
     php_protocol::{
         MAX_HEADERS, ProtocolError, WorkerHttpVersion, WorkerRequest, WorkerResponse, decode_ready,
-        decode_response, decode_shutdown_ack, encode_request, encode_shutdown, read_frame,
-        write_frame, write_frame_tracked,
+        decode_response, decode_shutdown_ack, encode_request_frame, encode_shutdown, read_frame,
+        write_frame, write_request_frame_tracked,
     },
     response_body::ResponseBody,
     transport::ConnectionInfo,
@@ -692,8 +692,8 @@ impl PhpWorker {
             worker.state = WorkerState::Busy;
             let request_id = worker.next_request_id;
             worker.next_request_id = worker.next_request_id.wrapping_add(1).max(1);
-            let payload = match encode_request(request_id, request) {
-                Ok(payload) => payload,
+            let frame = match encode_request_frame(request_id, request) {
+                Ok(frame) => frame,
                 Err(error) => {
                     worker.state = WorkerState::Ready;
                     return Err(PhpWorkerError::Request(error.to_string()));
@@ -703,7 +703,7 @@ impl PhpWorker {
                 // Everything past a frame write that moved bytes is
                 // possibly-started: PHP may already be executing, so those
                 // failures must never be dispatched again.
-                if let Err(error) = write_frame_tracked(&mut worker.stdin, &payload).await {
+                if let Err(error) = write_request_frame_tracked(&mut worker.stdin, &frame).await {
                     return Err(TransactionFailure {
                         started: error.transferred > 0,
                         timed_out: false,

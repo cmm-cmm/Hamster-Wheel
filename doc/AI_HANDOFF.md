@@ -1,6 +1,165 @@
 # AI Handoff
 
-## Current: performance against FrankenPHP on Windows (2026-10-19)
+## Current: Node.js Windows performance supplement (2026-11-01)
+
+Owner requested a separate record for evaluation/targets:
+`doc/PERFORMANCE_TARGETS_WINDOWS_NODE_20261101.md`. It preserves measured
+baseline/spread/resources, distinguishes observed results from proposed
+targets, and defines evidence/guardrails for judging future improvements.
+Node parity is an aspirational reference, not a new release gate or approved
+architecture change. This recording pass changed docs only; no new tests or
+measurements, no production optimization. Raw results remain unchanged.
+
+Read `benchmarks/results/node_windows_20261101.md` and assessment section 10.
+New driver `benchmarks/node_windows.py`, core HTTP/cluster fixture, no npm or
+production code change. Shared measurement has optional launch/finish hooks;
+existing FrankenPHP behavior/tests unchanged. Node 26.10.0 already installed,
+PHP isolated 8.5.12-1 NTS, oha 1.16.0. Nine cells, H N N H H N, three fresh
+trees/arm, 1000 warm-up and 10-second oha -w; 54 runs, 6,431,035 requests,
+zero transport/unexpected status errors, 54 pre/post response checks passed.
+Hello W1/C1 H/N median 2455/7572; Hello W4/C32 12733/30594; JSON 13215/36084;
+CPU hash chain 384/96; POST 1 MiB 792/1061. Full spread/latency/CPU/RAM in report.
+
+IMPORTANT: PHP frame-write changes in src/php_protocol.rs and src/php_worker.rs
+already existed when this pass started; preserved and release rebuilt.
+New release SHA256 D1E2B14CF48611844762B5C1B3CC6D13EEAD8DA0D87825A6803071FC63F74163.
+Do not combine old FrankenPHP numbers into a new three-way same-binary table,
+or attribute old/new changes to frame optimization. Raw metadata records binary
+and source hashes, unchanged through the matrix. No production modifications
+by the Node pass. No benchmark ran concurrently with Cargo build/test work.
+
+Node cluster includes primary + N workers even W1; 404/static have one Node
+HTTP worker vs default multithreaded Tokio. Not equal CPU quotas/features;
+not standalone Node, Express/Laravel parity, best tuning or equivalent admission.
+Whole-tree CPU/RAM includes all descendants. Hamster POST host ~68% CPU, CPU
+hash host ~6%: profile Hello C1/POST with control before choosing primitives.
+Old cold Laravel preflight 504 remains unexplained. Runtime PHP in php/8.5
+still 8.5.10, not silently replaced. No Linux performance qualification here.
+
+PASS: current release build/fmt/strict MSVC all-target/all-feature Clippy;
+fresh Windows default tests 317 passed, 0 failed, 145 ignored (not run);
+protocol subset 8, Python driver tests 10, Node syntax/PHP fixture lints and
+diff check. No ignored PHP lifecycle or Cargo bench-link rerun in this pass.
+Cleanup audit JSON: all 294 recorded matrix/smoke PID+creation identities
+gone, zero owned temp roots/listening benchmark port, hashes unchanged.
+Logs/raw/cache intentionally retained. No unrelated services/data/global env
+changed, no commit/tag/push/merge/release. Existing dirty tree preserved.
+
+## Previous: performance assessment + Laravel/heavy PHP supplement (2026-11-01)
+
+Read `doc/PERFORMANCE_ASSESSMENT_WINDOWS_20261101.md` (Vietnamese assessment,
+FACT/INFERENCE/HYPOTHESIS and scoped proposals), then
+`benchmarks/results/frankenphp_windows_20261101_laravel_heavy.md` for full
+method/spread/resources and raw links. No Rust production/protocol change.
+The preceding icon/release baseline and its immutable raw data remain intact.
+Assessment section 9 now explicitly records the assistant's overall judgment,
+proposed order (cold-first-request diagnosis, POST/Laravel profiling, fixed-rate
+overload), candidate acceptance criteria and non-negotiable safety invariants.
+These are recommendations, NOT Owner-approved production changes.
+
+Supplement: 24 heavy runs + 24 Laravel runs, three processes/arm, 10 seconds
+sending after warm-up; pre/post body/digest checks all passed. Heavy: 1,162,908
+attempts = 573,648 HTTP 200 + 589,260 controlled 503, no transport errors/other
+statuses. CPU SHA256×20000 W4/C16 median H/F 235/223 RPS; POST exactly 1 MiB to
+digest 514/146; Hello C64 6916/3885; C128 successful goodput 3810/3580.
+All 503s were Hamster C128, not 23k PHP executions/s. Goodput at C128 falls
+under rejection storm; mixed-status P99 cannot describe accepted requests.
+CPU-heavy Hamster process ~5% of total CPU; large POST ~69%: profile before
+choosing allocation/copy/pipe optimization. Do not remove bounded admission.
+
+Laravel skeleton copied from trusted `www/laravel` into the driver's temp
+root WITHOUT original .env/storage/database/bootstrap caches; framework
+12.69.2, Octane 2.20.0, config/view caches rebuilt, OPcache, array cache/session,
+SQLite :memory:, no PMS/MySQL/Redis. 110,490 measured HTTP 200, no transport
+errors. `/login` C1 H/F 119/156 RPS and C16 617/451 have wide spread. Welcome
+C1 H/F 229/255: all three F runs faster; C16 753/722. Don't claim universal
+worker superiority or qualify business/auth/database workloads from this.
+
+Initial combined attempt aborted BEFORE timed rows on Hamster preflight 504:
+cause UNKNOWN, no transparent retry, not declared fixed by later success.
+Next diagnostic H served correct response, F never reached readiness. A bug
+introduced in this pass's new empty-env handling was proven with real Caddy
+adapt: `env DB_URL` fails, `env DB_URL ""` passes. Values now quoted; not a
+FrankenPHP native crash. Valid before/after JSON is persisted beside results;
+an earlier malformed scratch parser probe is not causal evidence. Diagnostic
+quarter-second row is orchestration-only, NOT performance data.
+
+Driver now has --laravel-source, opt-in heavy group, file-supplied large body,
+minimal/framework INI isolation, goodput/status breakdown, body pre/post checks,
+retained stdout/stderr logs and early process-exit readiness diagnostic.
+Seven driver regressions + three PHP fixture lints passed; prior Windows
+314/default + release identity/fmt/strict Clippy evidence is unchanged (145
+ignored not rerun). Runtime package cache remains isolated; repository PHP
+still 8.5.10, NOT silently upgraded. No original app/service/firewall/global
+environment changes, no commit/tag/push/merge/release or Linux measurement.
+
+Proposed next pass, not Owner-approved implementation: isolate cold first-
+request 504 and measurement drift; profile POST 1 MiB and framework C1 phases;
+fixed-arrival-rate overload with per-status latency. Static index-vs-explicit
+file is a cheap separate falsification experiment. No speculative dispatcher,
+protocol, cache or adaptive-pool rewrite. Cleanup verified: all 604 distinct
+recorded PID/creation identities (baseline, supplements and diagnostic) no
+longer match live processes; zero fixture-path processes, benchmark listening
+ports or owned temp roots. Logs/tools remain in ignored cache. Release SHA-256
+is unchanged: AF03B0A8E4FD7F7BDBF2C9D1ECA8C8EBC2E988AA7971C4A730C227307F822877.
+
+## Previous: new icon and PHP 8.5.12-1 Windows comparison (2026-11-01)
+
+Owner supplied the Concept 02 asset tree, removing the old root icon files.
+`build.rs` now uses `icon/icons/hamster-wheel.ico`; preserve all Owner assets
+and deletions. MSVC release built successfully. The release identity suite
+passes 3/3, including a new test comparing all seven embedded icon images to
+the source ICO (SDK normalizes unspecified planes from zero to one).
+Windows operations docs point to the new asset. No request-path production
+code changed.
+
+The full native Windows benchmark COMPLETED: 78 measured runs, 13 cells,
+3 fresh-process runs/arm, H F F H H F, 10 seconds sending requests per run,
+3,834,582 measured requests, zero transport errors/unexpected statuses.
+`benchmarks/results/frankenphp_windows_20261101.md` records artifacts, method,
+RPS min/median/max, median latency/CPU/WS/private bytes and interpretation.
+Raw matrix and separate W4/C4 repeat JSONL are beside it. The 0.25-second smoke
+is orchestration-only, NOT performance data. The small static fixture is 23 B
+on Windows (CRLF), although the raw driver's old label still says 22 B.
+
+Runtime tools are isolated under ignored `target/tools/benchmark-20261101/`:
+official checksum-
+verified PHP 8.5.12-1 NTS, FrankenPHP 1.13.4 (PHP 8.5.12, Caddy 2.11.7),
+oha 1.16.0. FrankenPHP's php8ts.dll matches the official 8.5.12-1 TS ZIP;
+its own Brotli DLLs differ. Operator/system PHP and Services were not changed;
+repository `php/8.5/php.exe` remains 8.5.10, not silently patched by this pass.
+
+Driver additions: isolated `--php-dir`, `--duration` with oha `-w`, exclusive
+`--output` per-run evidence, actual-request CPU denominator, checked warm-up,
+scratch INI environments for both arms. Three mock driver tests pass.
+No process-name/tree kill; only started subprocess objects are terminated.
+
+FACT: main-matrix worker Hello W1 median 1519 / 867 RPS H/F; W4/C32 6979 /
+5148; static-small C32 3092 / 3052 (near parity). Classic JSON 3602 / 1716
+has a huge FrankenPHP spread (1119–5039), so its median ratio is not a stable
+speedup. No optimization or regression against older PHP 8.5.10 rows is claimed.
+One F W4/C4 row elapsed 39.645 seconds with no errors; retain it, do not discard.
+The first matrix did not retain full oha timing. Added complete summary/outer
+monotonic timing for a narrow unchanged-workload repeat: six fresh runs,
+250,755 requests, zero errors; all elapsed ~10 s / wall ~10.1 s, max request
+35.95 ms. Long interval not reproduced, throughput variance remains large in
+both arms; cause NOT established. Do not blame a server from this alone.
+FrankenPHP 1.13.4 `num_threads` counts non-worker threads; the preserved driver
+sets W+1 in addition to W workers, not W+1 total. RAM includes those spare
+threads; this is not a best-tuned/minimum-memory comparison. W4 Hamster has
+lower private bytes but higher summed WS here, not universally lower RAM.
+
+PASS: fmt, strict MSVC all-target/all-feature Clippy, default Windows 314 passed
+(145 ignored, not run), release identity 3/3, driver mocks 3/3 and diff check.
+Final audit: no matches for 306 recorded PID/creation identities, zero fixture
+processes/temp roots/listening benchmark ports. Tools/archives/logs remain in
+ignored cache; raw JSONL is persisted under benchmarks/results. No services,
+firewall, unrelated data or global environment changes. No commit/tag/push/
+merge/release. Next measurement work, if Owner wants precise performance
+claims: stabilize the shared host and correlate full client/server timing;
+do not optimize from the noisy classic/W4 medians. No Linux measurement here.
+
+## Previous: performance against FrankenPHP on Windows (2026-10-19)
 
 Owner direction: no release work for now; close the measured gap to
 FrankenPHP. Windows first. Numbers and method: `doc/BENCHMARKS.md`, *Hamster

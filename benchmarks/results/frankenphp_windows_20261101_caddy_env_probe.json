@@ -1,0 +1,12 @@
+[
+  {
+    "directive": "env DB_URL",
+    "exit": 1,
+    "stderr": "{\"level\":\"error\",\"ts\":1793526660.9301088,\"msg\":\"parsing caddyfile tokens for 'frankenphp': wrong argument count or unexpected line ending after 'DB_URL', at C:/Users/cmmph/AppData/Local/Temp/hamster-caddy-env-gn2y_zrs/Caddyfile:9\"}\n"
+  },
+  {
+    "directive": "env DB_URL \"\"",
+    "exit": 0,
+    "stderr": "{\"level\":\"warn\",\"ts\":1793526661.176995,\"logger\":\"caddyfile\",\"msg\":\"Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies\",\"file\":\"C:/Users/cmmph/AppData/Local/Temp/hamster-caddy-env-gn2y_zrs/Caddyfile\",\"line\":5}\n"
+  }
+]

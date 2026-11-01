@@ -1,0 +1,6 @@
+PHP worker pool localhost/ worker 22576 ready after 197.007 ms
+PHP worker pool localhost/ worker 12236 ready after 188.668 ms
+PHP worker pool localhost/ worker 10100 ready after 198.455 ms
+PHP worker pool localhost/ worker 17848 ready after 194.255 ms
+Request body memory budget 67108864 bytes
+Hamster Wheel listening on http://127.0.0.1:8080

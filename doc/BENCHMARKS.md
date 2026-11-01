@@ -2488,3 +2488,108 @@ The driver now stops only the process it started and counts a descendant only
 if it was created after its parent. The two cells' memory and CPU are not
 reported; their RPS is unaffected. Not yet re-run with the fixed driver: the
 full A/B against `4d933fc`, and those two cells.
+
+## Native Windows comparison — PHP 8.5.12-1 and new icon (2026-11-01)
+
+The current 0.8.0 MSVC release artifact embeds Owner's Concept 02 icon.
+This is a new performance baseline, **not an A/B of that icon or PHP update**.
+No production request path was changed in this pass. Full method, artifact
+hashes, every cell's RPS min/median/max, median P50/P95/P99, server-tree CPU,
+working set/private bytes and raw evidence are in
+[the measured report](../benchmarks/results/frankenphp_windows_20261101.md).
+
+Windows 11 Home 10.0.26300, i5-1235U / 12 logical CPUs; Hamster uses isolated
+official PHP 8.5.12-1 NTS; FrankenPHP 1.13.4 / Caddy 2.11.7 uses PHP 8.5.12
+TS (PHP DLL matches the official Windows -1 archive). oha 1.16.0, loopback
+HTTP/1.1 keep-alive. Thirteen cells, three fresh processes per arm ordered
+H F F H H F, 1,000 warm-up requests (200 classic), ten seconds generating
+measured requests and `-w` to drain the last requests. **3,834,582 requests,
+zero errors/unexpected statuses.** The small static file is actually 23 B
+(CRLF); the raw driver's legacy label is 22 B. Selected median RPS:
+
+| Cell | Hamster | FrankenPHP |
+| --- | ---: | ---: |
+| static small C1 / C32 | 1390 / 3092 | 1142 / 3052 |
+| static 1 MiB C8 | 1367 | 819 |
+| worker Hello W1 C1 | 1519 | 867 |
+| worker Hello W4 C32 | 6979 | 5148 |
+| classic JSON, four slots, C16 | 3602 | 1716 |
+
+Do not infer a stable classic speedup: FrankenPHP's three classic JSON runs
+span **1119–5039**, crossing Hamster's 3313–3622 range. W4 also varies widely,
+and static-small C32 is near parity. A retained F W4/C4 outlier took 39.645 s
+to complete its requests; a six-run, unchanged-workload repeat with full client
+summary/outer timing did not reproduce that interval (250,755 more requests,
+zero errors), but did reproduce broad throughput variation. Its cause is
+unresolved, not attributed to FrankenPHP. See both separate raw records;
+the repeat does not replace the outlier. This shared-host run cannot support
+precise universal speedup claims or direct percentages against the older
+8.5.10/other host-state rows. No framework, fault/retry, TLS or Linux
+qualification is implied. Operator/system PHP and Services were not replaced.
+
+### Supplemental Laravel / heavy PHP / overload (2026-11-01)
+
+[Full results and method](../benchmarks/results/frankenphp_windows_20261101_laravel_heavy.md),
+[technical assessment and proposed next work](PERFORMANCE_ASSESSMENT_WINDOWS_20261101.md).
+The same release/runtime/host, three fresh processes per arm, warm-up and
+10-second measured sending windows. Laravel is a disposable 12.69.2 + Octane
+2.20.0 skeleton with config/views cached, OPcache, array session/cache and
+in-memory SQLite, not PMS or a business/database workload. Heavy CPU/body
+functions are shared across the adapters and checked before/after each load.
+
+| Cell | Hamster median successful RPS | FrankenPHP median successful RPS |
+| --- | ---: | ---: |
+| Laravel `/login` W4 C1 / C16 | 119 / 617 | 156 / 451 |
+| Laravel Welcome W4 C1 / C16 | 229 / 753 | 255 / 722 |
+| SHA256×20000 W4 C16 | 235 | 223 |
+| POST 1 MiB → digest W4 C16 | 514 | 146 |
+| Hello W4 C64 | 6916 | 3885 |
+| Hello W4 C128 | 3810 | 3580 |
+
+Laravel: 110,490 measured HTTP 200; heavy matrix: 573,648 HTTP 200 plus 589,260
+controlled 503, no transport errors/other statuses. All 503s were Hamster C128:
+total ~23k HTTP responses/s is **not** PHP goodput. Its goodput drops from C64;
+the closed-loop client increases offered load when rejections are fast, so
+use a fixed-arrival-rate experiment before changing admission policy. Mixed
+200/503 latency is not successful-request latency.
+
+Do not inherit Hello's advantage for frameworks: Welcome C1's three Hamster
+runs (190–233 RPS) were below FrankenPHP's (251–260); `/login` still has broad
+overlap/noise. Preserve initial failed preparation evidence: first Hamster
+Laravel preflight 504 remains unexplained; the driver-generated empty Caddy
+environment argument was separately reproduced/fixed and is not a backend
+crash. No runtime optimization was made from these measurements. The full
+report carries min/median/max, latency/CPU/memory and the persisted raw runs.
+
+### 2026-11-01 — Windows Node.js core HTTP supplement
+
+[Full method, spread, latency/CPU/RAM and interpretation](../benchmarks/results/node_windows_20261101.md),
+[54 raw runs](../benchmarks/results/node_windows_20261101.jsonl),
+[runtime/binary/source identities](../benchmarks/results/node_windows_20261101.jsonl.meta.json).
+Node 26.10.0 core HTTP/cluster, isolated PHP 8.5.12-1 NTS, release MSVC Hamster,
+oha 1.16.0, same Windows i5-1235U host. Nine cells, three fresh process trees
+per arm, H N N H H N, 1000-request warm-up and ten seconds sending with -w.
+6,431,035 expected responses (3,477,322 HTTP 200; 2,953,713 HTTP 404), zero
+transport/unexpected status errors; all 54 pre/post response checks passed.
+
+Median expected-status RPS H/N: 404 C1 10467/8253, C32 52534/26894; static
+23 B C32 4368/4081, 1 MiB C8 1523/1149; Hello W1/C1 2455/7572, W4/C32
+12733/30594; JSON W4/C32 13215/36084; SHA256x20000 W4/C16 384/96;
+POST 1 MiB digest W4/C16 792/1061. Report retains every run and independent
+median percentiles/resources; Node POST throughput is higher but median
+P95/P99 are worse. Do not claim one winner for all workloads or percentiles.
+
+The current checkout already had PHP frame-write changes before the Node
+pass. Release rebuilt to SHA256
+D1E2B14CF48611844762B5C1B3CC6D13EEAD8DA0D87825A6803071FC63F74163,
+different from the earlier FrankenPHP rows. No direct three-way same-binary
+comparison or attribution of old/new differences to that change is valid.
+This pass changed benchmark tooling/docs, not production runtime code.
+
+Node includes a cluster primary + N workers even W1; 404/static use one Node
+HTTP worker vs Hamster's default multithread Tokio. CPU quotas, safety
+policies, admission and process boundaries are not equivalent. Both sides
+serve identical success bodies, but 404 differs (Hamster 9 B, Node empty).
+Node static is a fixture allowlist, not a qualified general-purpose server.
+Lower Hamster end RAM here is not a peak/leak result or a minimum-Node claim.
+No Laravel-to-Node framework equivalence or Linux result is asserted.

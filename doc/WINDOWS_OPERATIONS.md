@@ -17,11 +17,15 @@ with an explicit deployment config:
 .\target\x86_64-pc-windows-msvc\release\hamster-wheel.exe --config D:\site\hamster.toml
 ```
 
-Windows builds embed `icon/hamster-wheel.ico` into the executable through
+Windows builds embed `icon/icons/hamster-wheel.ico` (the current Concept 02
+multi-resolution Windows asset) into the executable through
 `build.rs` and `embed-resource` (build-time only, scoped to `hamster-wheel`).
 Install the Windows SDK resource compiler alongside the MSVC build tools;
 missing/invalid resources fail the Windows build rather than silently omit
-the icon. Other target platforms skip resource compilation.
+the icon. `tests/build_identity.rs` compares every embedded image with the ICO
+source, in addition to checking the version resource. Other target platforms
+skip resource compilation. Existing Explorer shortcuts/icon caches can retain
+an old image; the executable resource is the build's source of truth.
 
 The checked-in `hamster.toml` is a development example. Relative roots, PHP
 paths, and certificate paths in an explicit config resolve beside that config

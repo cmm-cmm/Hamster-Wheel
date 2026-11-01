@@ -48,6 +48,71 @@ fn wide(value: &str) -> Vec<u16> {
         .collect()
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryExW(file: *const u16, file_handle: isize, flags: u32) -> isize;
+    fn FindResourceW(module: isize, name: *const u16, kind: *const u16) -> isize;
+    fn LoadResource(module: isize, resource: isize) -> isize;
+    fn LockResource(resource: isize) -> *const u8;
+    fn SizeofResource(module: isize, resource: isize) -> u32;
+    fn FreeLibrary(module: isize) -> i32;
+}
+
+#[test]
+fn the_executable_embeds_every_image_from_the_current_application_icon() {
+    // Read resources without executing the image or keeping it locked after
+    // the test. Check the actual bytes, not just the presence of any old icon.
+    struct ResourceModule(isize);
+    impl Drop for ResourceModule {
+        fn drop(&mut self) {
+            unsafe { FreeLibrary(self.0) };
+        }
+    }
+    let file = wide(env!("CARGO_BIN_EXE_hamster-wheel"));
+    let module = ResourceModule(unsafe { LoadLibraryExW(file.as_ptr(), 0, 0x02 | 0x20) });
+    assert_ne!(module.0, 0, "load executable resources");
+    let resource = |kind: u16, id: u16| -> Vec<u8> {
+        // MAKEINTRESOURCE: integer identifiers, not dereferenced string pointers.
+        let found = unsafe {
+            FindResourceW(
+                module.0,
+                id as usize as *const u16,
+                kind as usize as *const u16,
+            )
+        };
+        assert_ne!(found, 0, "missing resource type={kind} id={id}");
+        let size = unsafe { SizeofResource(module.0, found) } as usize;
+        let loaded = unsafe { LoadResource(module.0, found) };
+        assert_ne!(loaded, 0, "load icon resource");
+        let bytes = unsafe { LockResource(loaded) };
+        assert!(!bytes.is_null(), "lock icon resource");
+        unsafe { std::slice::from_raw_parts(bytes, size) }.to_vec()
+    };
+    let icon = include_bytes!("../icon/icons/hamster-wheel.ico");
+    let group = resource(14, 1); // RT_GROUP_ICON
+    assert_eq!(&group[..6], &icon[..6], "icon header/image count changed");
+    let count = u16::from_le_bytes([icon[4], icon[5]]) as usize;
+    assert!(
+        count > 1,
+        "the application icon should contain multiple sizes"
+    );
+    for index in 0..count {
+        let source = &icon[6 + index * 16..6 + (index + 1) * 16];
+        let entry = &group[6 + index * 14..6 + (index + 1) * 14];
+        assert_eq!(&entry[..4], &source[..4], "image dimensions/colors differ");
+        // The SDK resource compiler normalizes the ICO's unspecified (zero)
+        // color-plane count to one. The image payload must still be identical.
+        let source_planes = u16::from_le_bytes(source[4..6].try_into().unwrap());
+        let compiled_planes = u16::from_le_bytes(entry[4..6].try_into().unwrap());
+        assert_eq!(compiled_planes, source_planes.max(1));
+        assert_eq!(&entry[6..12], &source[6..12], "image format/length differs");
+        let id = u16::from_le_bytes(entry[12..14].try_into().unwrap());
+        let length = u32::from_le_bytes(source[8..12].try_into().unwrap()) as usize;
+        let offset = u32::from_le_bytes(source[12..16].try_into().unwrap()) as usize;
+        assert_eq!(resource(3, id), &icon[offset..offset + length]); // RT_ICON
+    }
+}
+
 /// The whole version resource of `path`, or `None` when it has none.
 fn version_resource(path: &str) -> Option<Vec<u8>> {
     let file = wide(path);
