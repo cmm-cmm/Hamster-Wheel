@@ -412,3 +412,22 @@ không xác định toàn bộ 5 s ở failed run. Mục tiêu cold-request chuy
 **REPRODUCED / PARTIALLY LOCALIZED / NOT FIXED**, không đóng bởi steady-state
 success. Startup budget 30 s và request deadline 5 s vẫn độc lập; không tăng
 timeout hoặc prewarm route ngầm để làm kết quả đẹp. Không đo Linux lượt này.
+
+## 12. Phân tích riêng Laravel và proposal
+
+[File đề xuất](LARAVEL_WINDOWS_PERFORMANCE_ANALYSIS_PROPOSAL_20261101.md)
+đối chiếu source/raw và bổ sung hai probe semantic/lifecycle, không đo lại
+throughput hoặc sửa production. Laravel không thua mọi cell: `/login` C1
+−15%, Welcome C1/C16 ~−4/−5% có spread overlap; `/login` C16 +47%.
+
+**FACT mới:** Symfony Response::send trên FrankenPHP đã gửi đủ response cho
+client khi callback tail còn bị giữ ở marker gate. Hamster commit sau mọi
+cleanup. Octane script cap mặc định 1000 độc lập engine max_requests=0;
+4.200 request khi không đặt MAX_REQUESTS tạo 8 bootstrap / 4 end events ở
+đúng 1000, zero errors. Driver cũ chưa ghim/ghi effective cap. Không gán
+ngược số restart cho từng historical row hoặc xóa số đo trước.
+
+**INFERENCE:** khác điểm HTTP completion và lifetime có thể ảnh hưởng cách
+đọc C1/tail/CPU, chưa lượng hóa được phần gap do từng yếu tố. Cần pin control
+và reuse Gate 2 phase profiling trước khi chọn primitive. Không dùng việc
+bỏ cleanup/commit gate để thu hẹp RPS. Cold 504 vẫn riêng một nhánh chưa đóng.

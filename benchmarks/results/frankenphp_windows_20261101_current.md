@@ -286,3 +286,15 @@ Version probe `frankenphp php-cli -v` trả lỗi unsupported với PHP 8.5 ở
 artifact này; dùng `frankenphp version` và bundled `php.exe -n -v` để ghi
 identity. Đây không phải lỗi serving hoặc một failed measured run. Release
 build còn warning `compile_validated` unused đã có trước, không sửa/ẩn nó.
+
+## Follow-up: điều kiện diễn giải Laravel
+
+[Phân tích/proposal mới](../../doc/LARAVEL_WINDOWS_PERFORMANCE_ANALYSIS_PROPOSAL_20261101.md)
+xác nhận bằng source và local probes: response completion của Symfony trên
+FrankenPHP có thể đi trước callback tail; Hamster commit sau cleanup. Octane
+PHP worker script mặc định MAX_REQUESTS=1000, khác engine `max_requests=0`;
+driver chưa ghim cap hoặc ghi effective value/recycle counts của những row
+trên. Số liệu vẫn là observed performance của cấu hình đã chạy, chưa cô lập
+adapter overhead tại cùng generation lifetime/response boundary. Không sửa
+raw hoặc gán ngược số recycle cho historical rows. Các probe mới không tạo
+throughput score; cần controlled settings và phase profiling trước tối ưu.

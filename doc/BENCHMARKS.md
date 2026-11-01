@@ -2623,3 +2623,21 @@ Three diagnostic-only fresh H4 trees on one scratch app gave 200 in
 120 additional files each. This localizes a slow first framework path in
 the probe, NOT the root cause of the original five-second failure. Default
 request_timeout stayed five seconds. No production optimization/fix made.
+
+### 2026-11-01 — Laravel analysis: response boundary and script-lifetime controls
+
+[Analysis/proposal](LARAVEL_WINDOWS_PERFORMANCE_ANALYSIS_PROPOSAL_20261101.md),
+[probe evidence](../benchmarks/results/laravel_windows_analysis_20261101_probes.json).
+No new throughput score. A marker-gated Symfony Response::send probe on the
+actual FrankenPHP runtime delivered the full response before callback tail
+completion. H's response commit follows all Octane/external cleanup. The
+boundary difference is confirmed; its share of measured latency is not.
+
+The Octane 2.20 PHP worker script defaults MAX_REQUESTS to 1000, independently
+of engine max_requests=0. Runtime control with unset MAX_REQUESTS and 4200
+Laravel requests produced 8 starts / 4 script ends at exactly 1000, all 200.
+The prior driver did not pin the script cap or record historical effective env/
+recycle counts. Preserve historical RPS as observed configurations; do not
+interpret them as an isolated adapter comparison at equal generation lifetime.
+Pin/record the cap for future controls. Zero is not OFF in that script's loop.
+Probe statuses/counters are lifecycle evidence, not an additional benchmark.

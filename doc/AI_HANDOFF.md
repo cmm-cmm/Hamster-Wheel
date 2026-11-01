@@ -1,6 +1,46 @@
 # AI Handoff
 
-## Current: FrankenPHP current-binary retest + cold Laravel 504 (2026-11-01)
+## Current: Laravel Windows causal analysis/proposal (2026-11-01)
+
+Read `doc/LARAVEL_WINDOWS_PERFORMANCE_ANALYSIS_PROPOSAL_20261101.md`.
+Owner asked why Laravel trails FrankenPHP and for a proposal file. Analysis
+does not assume a universal deficit: login C1 -15%, Welcome C1/C16 ~-4/-5%
+with overlapping spread, login C16 +47%. No new throughput matrix or production
+optimization. Existing dirty changes and benchmark raw preserved.
+HEAD advanced externally to c9ff7ed during this pass; no Git write was
+performed by the agent. Current analysis additions remain for Owner review.
+
+Two new local semantic/lifecycle probes (raw + archived source under
+`benchmarks/results/laravel_windows_analysis_20261101_probes.*`):
+1. Actual Symfony Response::send on FrankenPHP 1.13.4 completed full HTTP 200
+   before a marker-gated callback tail was released. Runtime exposes
+   fastcgi_finish_request; source Octane responds before terminate/sandbox tail.
+   H stages through Octane/required external cleanup (finally unwind follows
+   flush in the PHP loop). Boundary difference is confirmed, fraction of
+   the real C1 gap explained is NOT measured. Keep H's commit guarantee.
+2. Octane 2.20 script MAX_REQUESTS defaults 1000, independent of engine
+   max_requests=0. With MAX_REQUESTS unset in child env, 4200 Laravel GETs:
+   4200 x 200, zero errors, 8 bootstrap tokens / 4 end events at exactly 1000.
+   F PID stable across thread/script restarts; PID is not generation identity.
+   Existing driver did not pin this cap. Historical effective env/recycle
+   counts were not captured: do not invent per-row counts or rewrite RPS.
+
+Proposal: pin experimental cap high and record effective settings/bootstrap
+tokens before controlled phase profiling. MAX_REQUESTS=0 is NOT OFF for this
+Octane script (loop would execute zero times). No driver setting changed in
+this analysis pass. Reuse existing Gate 2 sampled profiler; historical direct
+adapter 4-5% of PHP time is context, not a current decomposition. Separate cold
+gateway investigation from warm C1/response-boundary costs. No cleanup removal,
+early-commit change, protocol redesign or speculative IPC rewrite proposed.
+
+Runtime probes passed assertions, source/vendor hashes unchanged; cleanup
+audit confirms four recorded PID/creation identities gone, no probe temp root
+or listener on 18080. App clones/markers/configs removed; logs/tools in ignored
+cache, source/raw archived for review. No global env/service/data change, no
+commit/tag/push/merge/release, no Linux verification or full Rust gate rerun
+for this documentation/analysis-only pass.
+
+## Previous: FrankenPHP current-binary retest + cold Laravel 504 (2026-11-01)
 
 Read `benchmarks/results/frankenphp_windows_20261101_current.md` and assessment
 section 11. FrankenPHP 1.13.4 / PHP 8.5.12 ZTS / Caddy 2.11.7 vs isolated PHP

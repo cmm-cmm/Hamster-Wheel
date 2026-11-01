@@ -1,0 +1,16 @@
+{
+  "checked_at": "2026-11-01T15:19:11.075547+00:00",
+  "recorded_process_identities": 4,
+  "matching_live_identities": [],
+  "remaining_temp_roots": [],
+  "port_18080_listening": false,
+  "original_source_hashes_unchanged": {
+    "www/laravel/composer.lock": true,
+    "www/laravel/vendor/laravel/octane/bin/frankenphp-worker.php": true,
+    "www/laravel/vendor/symfony/http-foundation/Response.php": true,
+    "benchmarks/frankenphp_windows.py": true
+  },
+  "archived_probe_sha256": "ed92ce4c0516a0dbaebf43a17b08f1b937ac97356fd3c65ed2c2bb1ca755a6db",
+  "no_production_changes": true,
+  "retained_artifacts": "archived probe source and JSON evidence; logs/tools in ignored cache; scratch app and marker/config files cleaned"
+}
